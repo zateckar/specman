@@ -28,15 +28,16 @@ So, in practice:
 | behaviour of an existing area | the requirements in `openspec/specs/<capability>/spec.md` |
 | add, rename, move or delete a file under `src/` | that capability's `## Source` list |
 | something large enough to argue about | a folder under `openspec/changes/`, before writing code |
-| why a thing is done this way, with evidence | `README.md` |
+| why a thing is done this way, with evidence | that capability's `## Purpose`, and the *because* in its scenarios |
 | what is not built, or a lesson learned | `PLAN.md` |
+| how to run or deploy it | `README.md` — kept brief; it points into `openspec/`, it does not repeat it |
 
 A hook prints which specification governs each file you edit, and a second one runs the
 full check when a turn ends. Neither is a substitute for running `npm test`.
 
 ## The standing rules
 
-Written up with their evidence in `README.md`; repeated here because each was paid for.
+Each is a requirement in the specification it governs; repeated here because each was paid for.
 
 - **Deterministic first, model second.** Anything that must hold is enforced in code. The
   served models drop instructions, so a rule that lives only in the prompt is a rule that

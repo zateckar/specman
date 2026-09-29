@@ -8,9 +8,6 @@ view that shows the whole application at once, and it is also the artefact an ar
 take away: the notation is ArchiMate's, not an approximation of it, and the file it exports
 is the one every ArchiMate tool reads.
 
-See `README.md`, *The diagram*, *Routing: why the lines are where they are*, and *Reading
-it, and taking it away*.
-
 ## Source
 
 - `src/lib/server/llm/architecture.ts`

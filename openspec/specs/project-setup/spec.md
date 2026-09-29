@@ -8,8 +8,6 @@ time and teaches them that most of the document is box-ticking — which is when
 answering carelessly. A handful of questions at creation produce a **profile** that decides
 which chapters this application actually needs.
 
-See `README.md`, *Only asking what this application needs*.
-
 ## Source
 
 - `src/routes/+page.server.ts`

@@ -11,8 +11,6 @@ interview — one rule said a booking cannot be cancelled on the reserved day, a
 blocking a car cancels bookings inside the blocked period, which can include that day. Two
 rules written in different turns, each sound alone.
 
-See `README.md`, *Checking the document as a whole*.
-
 ## Source
 
 - `src/lib/server/llm/verification.ts`

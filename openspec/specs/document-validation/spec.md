@@ -6,8 +6,6 @@ Deterministic checks that answer "is this well formed?" — never "is this right
 no gateway call, so they run on every load, and judgement is left to the verification pass
 which costs several.
 
-See `README.md`, *Requirements: the checkable half of a chapter*.
-
 ## Source
 
 - `src/lib/server/llm/validation.ts`

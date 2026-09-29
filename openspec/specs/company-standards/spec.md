@@ -11,8 +11,6 @@ needs to deviate.
 This capability carries the project's sharpest safety rule: **the seeded standards are
 examples, not policy, and ship switched off.**
 
-See `README.md`, *Only asking what this application needs*.
-
 ## Source
 
 - `src/lib/server/db/default-standards.ts`

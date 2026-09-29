@@ -9,8 +9,6 @@ machine, and nothing else in the document would show which parts. Every decision
 carries its source, and the user can tell their own choices apart from the defaults chosen
 on their behalf.
 
-See `README.md`, *Decisions, and who made them*.
-
 ## Source
 
 - `src/lib/server/llm/decisions.ts`

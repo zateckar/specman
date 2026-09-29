@@ -102,12 +102,14 @@ should not have to reconstruct it. `REMOVED` carries the name and one line sayin
 
 ## What belongs where
 
-- **`openspec/specs/`** — behaviour. What the application does, in terms a reviewer can
-  check against the running thing.
-- **`README.md`** — the reasoning. Why the gateway is treated as it is, why the router
-  reserves corridors, what went wrong before. Prose, evidence, tables.
+- **`openspec/specs/`** — behaviour, and the reason for it. What the application does, in
+  terms a reviewer can check against the running thing. The `## Purpose` says why the
+  capability exists; each scenario's **THEN** says *because*.
+- **`README.md`** — the front door. What Specman is, how to run it, where to read on. Brief
+  on purpose: it points into `openspec/` and does not repeat it.
 - **`PLAN.md`** — what is not built yet, and the lessons carried forward.
 - **Code comments** — why this line, not what it does.
 
-A requirement in `specs/` that explains itself at length is in the wrong file: state the
-rule, and link the reasoning to the README section that argues for it.
+A requirement that explains itself at length is still wrong: state the rule in one sentence,
+and put the evidence in the scenario that would fail without it. A scenario is a reason
+somebody can check; a paragraph is a reason somebody has to believe.

@@ -10,8 +10,6 @@ works out the difference and moves the prose.
 Two rules govern everything here: **reconciliation never destroys written work**, and
 **anything that cannot be placed confidently stays where it is**.
 
-See `README.md`, *Splitting a chapter up* and *The split moves the prose with it*.
-
 ## Source
 
 - `src/lib/server/llm/subchapters.ts`

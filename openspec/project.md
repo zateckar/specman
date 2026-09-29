@@ -44,7 +44,7 @@ authenticates nobody; never put it in front of anything real.
 ## Conventions that are not negotiable
 
 These are the rules the codebase has paid for. Each one exists because its absence caused
-a failure that reached a user, and each is written up in `README.md` with the evidence.
+a failure that reached a user, and each is a requirement in the specification it governs.
 
 - **Deterministic first, model second.** Anything that must hold is enforced in code; the
   prompt is the first layer only. The served models drop instructions, so a rule that lives

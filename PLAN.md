@@ -20,7 +20,7 @@ copied.
 - **No rigid phase gates.** Users jump between chapters by design. Artefacts stay editable.
 - **Long output rides the text stream, never a tool argument.** Every new structured
   artefact below is a streamed block parsed by `ChapterStreamParser`, for the reasons in
-  the README's gateway section. Tool arguments stay small.
+  `openspec/specs/llm-gateway/`. Tool arguments stay small.
 - **Deterministic first, model second.** Anything that must hold is enforced in code, with
   the prompt as the first layer only. See `reconcileAssessment` for the pattern.
 
@@ -39,8 +39,8 @@ Each stage ships something usable on its own.
 Item 1 is foundational — 2, 4, 5, 6 and 7 all key off it. Item 11 is infrastructure for 4.
 
 **Stage A is built.** `requirements` table, the `<requirement>` block, server-assigned
-refs, scope tiers, deterministic validation, and chapter goals. See the README sections
-*Requirements: the checkable half of a chapter* and *Who asks, who decides*. Two things
+refs, scope tiers, deterministic validation, and chapter goals. See the `requirements`,
+`document-validation` and `guided-interview` specifications. Two things
 learned in the building, both now covered by tests:
 
 - A fixed character window for holding back a partial tag was not enough once opening tags
@@ -52,8 +52,8 @@ learned in the building, both now covered by tests:
   a per-chunk regex could not do.
 
 **Stage B is built.** Decisions with provenance, derived chapter status, `decisions.md` in
-the repository, and requirement-level change review. See the README section *Decisions, and
-who made them*. The finding worth carrying forward:
+the repository, and requirement-level change review. See the `decisions` and `change-review`
+specifications. The finding worth carrying forward:
 
 - **The system prompt has a budget, and it is now spent.** Adding the requirement and
   decision rules diluted the closing instructions enough that a turn came back having
@@ -65,7 +65,7 @@ who made them*. The finding worth carrying forward:
   a deterministic guard rather than another paragraph.
 
 **Stage C is built.** `mapWithLimit`, the four-way verification pass, `VERIFICATION.md`, and
-the check on the review page. See the README section *Checking the document as a whole*.
+the check on the review page. See the `document-verification` specification.
 
 On its first real run it found a genuine contradiction that had survived the entire
 interview: one rule said a booking cannot be cancelled on the reserved day, another said
@@ -83,7 +83,7 @@ Two things to watch:
   Structural errors from `validateDocument` are the gate.
 
 **Stage D is built.** Governance triage, the standards store, and brownfield projects. See
-the README section *Only asking what this application needs*.
+the `project-setup` and `company-standards` specifications.
 
 - **Standards ship switched off, and must stay that way.** They are examples, not policy.
   An active standard is copied into every application it applies to, where it reads as
@@ -97,8 +97,8 @@ the README section *Only asking what this application needs*.
   the assistant's context entirely.
 
 **Stage E is built — all twelve items are done.** `spec/` is written into the repository on
-approval, and `/projects/<id>/export` offers the same as one document. See the README
-section *Handing it to a developer*.
+approval, and `/projects/<id>/export` offers the same as one document. See the
+`developer-handoff` specification.
 
 One deliberate departure from this plan: it said structural errors should *gate* the export.
 They do not. They are stated at the top of `AGENTS.md` instead, because refusing to write
@@ -109,13 +109,13 @@ is honesty: the caveats travel with the bundle and cannot be separated from it.
 ## Beyond the original twelve
 
 **Sub-chapters, agent-arranged.** The agent proposes the whole arrangement declaratively and
-`reconcileSections` works out the difference, never destroying written work. See the README
-section *Splitting a chapter up*.
+`reconcileSections` works out the difference, never destroying written work. See the
+`document-structure` specification.
 
 **The layered diagram.** Three ArchiMate bands, capabilities as application services, drawn
 from a model derived in two calls. See *The diagram*.
 
-The lesson from this round, now a table in the README's gateway section: **`max_tokens` is
+The lesson from this round, now a requirement in `llm-gateway`: **`max_tokens` is
 working room for reasoning, not the size of the answer.** The diagram needed 12000 to emit a
 few hundred bytes, and at 4000 returned zero characters while looking exactly like a parser
 bug. Three features have now failed this way. The tell is an output-token count landing
@@ -128,8 +128,7 @@ rather than merely possible.
 
 **A readable diagram, and one that leaves.** Orthogonal routing through reserved corridors,
 proper ArchiMate notation, zoom / fit / full screen / drag-to-pan, and export as an ArchiMate
-Open Exchange File. See the README sections *Routing: why the lines are where they are* and
-*Reading it, and taking it away*.
+Open Exchange File. See the `architecture-diagram` specification.
 
 The lesson from this round: **an invariant test proves what it says and nothing more.** "No
 connector passes underneath a box" passed while four routes ran along `x = 0` — outside every
@@ -137,8 +136,7 @@ band, off the edge of the picture, and genuinely clear of every box. The check w
 the property it checked was not the whole property. Bounds are now asserted separately, and
 the same question is worth asking of the other guards: what does this test *not* say?
 
-**Splitting a chapter now moves its prose.** See the README section *The split moves the
-prose with it*.
+**Splitting a chapter now moves its prose.** See the `document-structure` specification.
 
 The lesson here is about instructions to the model that quietly never fire. The prompt said
 "split first, then fill the parts in on later turns" — a sensible sequence that could not
@@ -151,7 +149,7 @@ model to remember. The same test applies to anything else phrased as "later" in 
 
 **Specman now has a specification of its own.** `openspec/` holds it in OpenSpec format:
 `specs/` is what the code does today, one folder per capability, and `changes/` is what
-someone proposes it should do instead. See the README section *Specman's own specification*.
+someone proposes it should do instead. See `openspec/AGENTS.md`.
 
 The reason it is worth the file count is the same reason `reconcileAssessment` exists.
 Documentation that must be kept current by remembering is documentation that goes stale —
@@ -166,8 +164,8 @@ one a rule that existed only in somebody's memory of it.
 
 ## Where to go next
 
-Nothing in this plan is outstanding. The remaining gaps are in the README's *Not built yet*,
-and each is a candidate for the first folder under `openspec/changes/`:
+Nothing in this plan is outstanding. These are the gaps, and each is a candidate for the
+first folder under `openspec/changes/`:
 
 - **GitHub host** — the seam exists (`createRepo` / `push` / `openPullRequest`), the UI
   already says "pull request", and the user has signalled intent. Needs a token, a base URL
@@ -175,6 +173,8 @@ and each is a candidate for the first folder under `openspec/changes/`:
 - **Streaming the verification run** if the ~80-second request proves too long behind a
   proxy.
 - **Deleting a project** — currently only possible from the database and `data/repos/`.
+- **Importing an ArchiMate file back.** The export is one-way: a model edited in Archi cannot
+  be brought back in, and the next *Draw again* would overwrite it in any case.
 
 ### Known limits, written down so they are not rediscovered
 
@@ -374,7 +374,7 @@ unknown and vary by backend, so a single whole-document call is fragile.
 
 ## 4. Verification pass *(L)*
 
-Already listed as unbuilt in the README; both source projects independently confirm it
+Already listed as unbuilt under *Where to go next*; both source projects independently confirm it
 matters. GSD's verifier checks requirement coverage, decision coverage, and goal alignment.
 
 Checks, per chapter in parallel then once across the document:

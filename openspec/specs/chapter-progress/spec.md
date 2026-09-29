@@ -13,8 +13,6 @@ The invariant, enforced in code rather than in a prompt:
 
 > **A chapter is complete exactly when nothing is left to ask.**
 
-See `README.md`, *The invariant: complete means nothing left to ask*.
-
 ## Source
 
 - `src/lib/server/llm/questions.ts`

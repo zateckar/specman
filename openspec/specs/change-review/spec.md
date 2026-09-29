@@ -7,8 +7,6 @@ becomes part of the document. Reviewing is done as **rules, not lines**: a prose
 non-technical reader nothing useful, whereas "three requirements added, one changed, one
 removed" is a sentence they can act on.
 
-See `README.md`, *Decisions, and who made them*.
-
 ## Source
 
 - `src/lib/server/proposals.ts`

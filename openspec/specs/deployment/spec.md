@@ -8,7 +8,7 @@ things that lose a company's design documents — an unmounted data directory an
 published wider than the gateway in front of it — are both one line of configuration made by
 someone who had no way of knowing.
 
-See `README.md`, *Running it somewhere else*, and `PLAN.md`, *Known limits*.
+See `PLAN.md`, *Known limits*.
 
 ## Source
 

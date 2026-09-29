@@ -8,8 +8,6 @@ records what was settled. Everything structured the assistant produces rides the
 rather than a tool argument, because truncation inside a tool call is a hard 400 with no
 usable content.
 
-See `README.md`, *The gateway*, and *Who asks, who decides*.
-
 ## Source
 
 - `src/lib/server/llm/agent.ts`

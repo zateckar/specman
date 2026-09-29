@@ -7,8 +7,6 @@ no notation, decisions explained. That is the right audience for the interview a
 one for construction. The bundle is the other view of the same content, materialised into the
 application's own repository so anyone who clones it gets the current version.
 
-See `README.md`, *Handing it to a developer*.
-
 ## Source
 
 - `src/lib/server/llm/export.ts`

@@ -8,8 +8,6 @@ the part a later coherence pass can check for contradictions. Requirements are s
 `SHALL` and `WHEN`/`THEN` form because that structure is what makes them testable, and shown
 as plain sentences because the user never meets the notation.
 
-See `README.md`, *Requirements: the checkable half of a chapter*.
-
 ## Source
 
 - `src/lib/server/llm/requirements.ts`

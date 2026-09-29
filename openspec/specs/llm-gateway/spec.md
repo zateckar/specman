@@ -12,8 +12,6 @@ What any particular installation runs behind that gateway — which models, rout
 which of them misbehave — is configuration, not behaviour, and is deliberately not recorded
 here or anywhere else in this repository.
 
-See `README.md`, *The gateway: what you need to know before changing the agent*.
-
 ## Source
 
 - `src/lib/server/env.ts`
@@ -69,6 +67,20 @@ reasoning model emits them and no caller wants them in the document.
 #### Scenario: The reasoning model answers
 - **WHEN** a response contains both thinking and text blocks
 - **THEN** only the text reaches the caller
+
+### Requirement: A call's budget covers its reasoning
+Every call SHALL be given a `max_tokens` large enough for the model's reasoning as well as
+its answer, because a model that thinks before it writes spends the same budget on both.
+
+#### Scenario: A call returns nothing
+- **WHEN** the result is empty and the output-token count sits exactly on the ceiling
+- **THEN** the budget is the cause, not the parser — three features failed this way while
+  looking like logic bugs, one returning zero characters at 4000 that works at 12000
+
+#### Scenario: A tool call runs out mid-argument
+- **WHEN** the budget ends inside a tool argument
+- **THEN** the gateway answers 400 with nothing usable, so tool calls get a generous floor
+  and long output is never put in a tool argument at all
 
 ### Requirement: Concurrent work is capped
 Fan-out across chapters SHALL run through a concurrency-limited runner rather than issuing
