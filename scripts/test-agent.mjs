@@ -1713,18 +1713,50 @@ console.log('\n--- one writer at a time, per repository ---');
 }
 
 {
-	// Waiting for ever would wedge an application until restart, so a holder that
-	// hangs has its turn failed. It is released, NOT stopped — see `lock.ts`.
+	// Failing the caller cannot cancel its writes. Ownership survives timeout.
 	const locks = createLocks(20);
 	let message = '';
+	let settle;
+	const gate = new Promise((resolve) => { settle = resolve; });
+	let active = 0;
+	let maximum = 0;
 
 	await locks
-		.run('/repos/booking', () => new Promise(() => {}))
+		.run('/repos/booking', async () => {
+			maximum = Math.max(maximum, ++active);
+			await gate;
+			active--;
+		})
 		.catch((cause) => (message = cause.message));
 
 	check('a hung holder times out rather than blocking for ever', message.includes('Timed out'), true);
 	check('and names the repository it was waiting on', message.includes('/repos/booking'), true);
-	check('the next turn can proceed', await locks.run('/repos/booking', async () => 'ok'), 'ok');
+	check('the timed-out writer retains ownership', locks.pending, 1);
+	let started = false;
+	const next = locks.run('/repos/booking', async () => {
+		started = true;
+		maximum = Math.max(maximum, ++active);
+		active--;
+		return 'ok';
+	});
+	await new Promise(setImmediate);
+	check('the next writer waits for actual settlement', started, false);
+	check('other repositories proceed while the timed-out writer continues', await locks.run('/repos/fleet', async () => 'independent'), 'independent');
+	settle();
+	check('the next writer proceeds after settlement', await next, 'ok');
+	check('timeout never allows overlapping writers', maximum, 1);
+	check('all settled queues are removed', locks.pending, 0);
+}
+
+{
+	const locks = createLocks(20);
+	let reject;
+	await locks.run('/repos/booking', () => new Promise((_, fail) => { reject = fail; })).catch(() => {});
+	const next = locks.run('/repos/booking', async () => 'recovered');
+	reject(new Error('late failure'));
+	check('late rejection releases ownership without an unhandled rejection', await next, 'recovered');
+	await locks.run('/repos/booking', () => { throw new Error('synchronous failure'); }).catch(() => {});
+	check('a synchronous throw also releases ownership', await locks.run('/repos/booking', async () => 'ok'), 'ok');
 }
 
 console.log('\n--- reading the turn back in the browser ---');

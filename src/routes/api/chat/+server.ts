@@ -5,6 +5,8 @@ import {
 	chapterRequirements,
 	deleteRequirement,
 	distributeSectionContent,
+	documentRevision,
+	DocumentConflict,
 	getChapter,
 	getProject,
 	projectChapters,
@@ -12,7 +14,8 @@ import {
 	recentMessages,
 	saveDecision,
 	saveRequirement,
-	updateChapterState
+	updateChapterState,
+	withDocumentRevision
 } from '$lib/server/db';
 import { effectiveStatus, toDecisionDraft, unconfirmed } from '$lib/server/llm/decisions';
 import { toRequirementDraft } from '$lib/server/llm/requirements';
@@ -58,9 +61,11 @@ export const POST: RequestHandler = async ({ request, locals }) => {
 
 	const project = getProject(projectId);
 	if (!project) throw error(404, 'No such project');
+	const revision = documentRevision(project.id);
 
 	const chapters = projectChapters(project.id);
 	const active = chapterKey ? (getChapter(project.id, chapterKey) ?? null) : null;
+	const activeRequirements = active ? chapterRequirements(project.id, active.key) : [];
 
 	const history = recentMessages(project.id, chapterKey, 16).map((m) => ({
 		role: m.role,
@@ -69,10 +74,7 @@ export const POST: RequestHandler = async ({ request, locals }) => {
 
 	addMessage(project.id, chapterKey, 'user', message);
 
-	// A colleague with this document open should be able to see that someone is
-	// writing into it. Ordering the repository writes stopped them corrupting each
-	// other; it cannot stop the second description of a chapter replacing the
-	// first, and being able to see it happening is what lets a person avoid that.
+	// Presence explains ongoing work; the revision guard prevents stale writes.
 	const watcher = locals.user;
 	presence.setWriting(project.id, watcher.id, true, Date.now());
 
@@ -100,7 +102,7 @@ export const POST: RequestHandler = async ({ request, locals }) => {
 						project,
 						chapters,
 						active,
-						active ? chapterRequirements(project.id, active.key) : []
+						activeRequirements
 					),
 					messages: conversation,
 					maxTokens: 6000
@@ -133,113 +135,121 @@ export const POST: RequestHandler = async ({ request, locals }) => {
 				//     written by the same reply. It used to run last, which is what the
 				//     comment claimed it did not, and any such write was dropped.
 				const touched: string[] = [];
-				let splitParent: string | null = null;
+				const documentEvents: Array<[string, unknown]> = [];
+				withDocumentRevision(project.id, revision, () => {
+					const send = (event: string, data: unknown) => documentEvents.push([event, data]);
+					let splitParent: string | null = null;
 
-				const plan = parser.blocksOf('subchapters').at(-1);
-				if (plan && active && active.is_dynamic && !active.parent_key) {
-					const planned = parseSectionPlan(plan.body);
-					if (planned.length > 0) {
-						const result = applySectionPlan(project.id, active, planned);
-						splitParent = active.key;
-						if (result.changed) {
-							send('sections', { parent: active.key, created: result.created });
-							if (!touched.includes(active.key)) touched.push(active.key);
+					const plan = parser.blocksOf('subchapters').at(-1);
+					if (plan && active && active.is_dynamic && !active.parent_key) {
+						const planned = parseSectionPlan(plan.body);
+						if (planned.length > 0) {
+							const result = applySectionPlan(project.id, active, planned);
+							splitParent = active.key;
+							if (result.changed) {
+								send('sections', { parent: active.key, created: result.created });
+								if (!touched.includes(active.key)) touched.push(active.key);
+							}
 						}
 					}
-				}
 
-				// --- Persist any chapters the agent rewrote.
-				for (const [key, markdown] of parser.drafts) {
-					const target = getChapter(project.id, key);
-					if (!target) {
-						console.warn(`[chat] agent wrote unknown chapter "${key}" — ignoring`);
-						continue;
-					}
-					const clean = normalizeChapterMarkdown(markdown, target.title);
-					updateChapterState(project.id, key, { contentMd: clean });
-					touched.push(key);
-					send('chapter', { key, markdown: clean });
-				}
-
-				// --- Requirements the agent settled this turn. After the chapters, so a
-				//     requirement can arrive alongside the prose that explains it.
-				for (const block of parser.blocksOf('requirement')) {
-					const draft = toRequirementDraft(block.attrs, block.body);
-					if (!draft) continue;
-
-					const key = draft.chapterKey ?? active?.key;
-					if (!key || !getChapter(project.id, key)) {
-						console.warn(`[chat] requirement for unknown chapter "${key}" — ignoring`);
-						continue;
-					}
-
-					if (draft.remove) {
-						if (draft.ref && deleteRequirement(project.id, draft.ref)) {
-							send('requirement', { ref: draft.ref, chapterKey: key, removed: true });
+					// --- Persist any chapters the agent rewrote.
+					for (const [key, markdown] of parser.drafts) {
+						const target = getChapter(project.id, key);
+						if (!target) {
+							console.warn(`[chat] agent wrote unknown chapter "${key}" — ignoring`);
+							continue;
 						}
+						const clean = normalizeChapterMarkdown(markdown, target.title);
+						updateChapterState(project.id, key, { contentMd: clean });
+						touched.push(key);
+						send('chapter', { key, markdown: clean });
+					}
+
+					// --- Requirements the agent settled this turn. After the chapters, so a
+					//     requirement can arrive alongside the prose that explains it.
+					for (const block of parser.blocksOf('requirement')) {
+						const draft = toRequirementDraft(block.attrs, block.body);
+						if (!draft) continue;
+
+						const key = draft.chapterKey ?? active?.key;
+						if (!key || !getChapter(project.id, key)) {
+							console.warn(`[chat] requirement for unknown chapter "${key}" — ignoring`);
+							continue;
+						}
+
+						if (draft.remove) {
+							if (draft.ref && deleteRequirement(project.id, draft.ref)) {
+								send('requirement', { ref: draft.ref, chapterKey: key, removed: true });
+							}
+							if (!touched.includes(key)) touched.push(key);
+							continue;
+						}
+
+						const saved = saveRequirement(project.id, {
+							ref: draft.ref,
+							chapterKey: key,
+							statement: draft.statement,
+							scope: draft.scope,
+							scenarios: draft.scenarios,
+							existing: draft.existing
+						});
+						send('requirement', { ...saved, removed: false });
 						if (!touched.includes(key)) touched.push(key);
-						continue;
 					}
 
-					const saved = saveRequirement(project.id, {
-						ref: draft.ref,
-						chapterKey: key,
-						statement: draft.statement,
-						scope: draft.scope,
-						scenarios: draft.scenarios,
-						existing: draft.existing
-					});
-					send('requirement', { ...saved, removed: false });
-					if (!touched.includes(key)) touched.push(key);
-				}
-
-				// --- A chapter that has just been split still holds everything that was
-				//     written before it was split, so the prose is filed into the sections
-				//     that now own it. After the drafts, so it is whatever the chapter says
-				//     now that gets filed, not what it said when the turn began.
-				if (splitParent) {
-					const moved = distributeSectionContent(project.id, splitParent);
-					for (const section of moved.filled) {
-						send('chapter', { key: section.key, markdown: section.markdown });
-						if (!touched.includes(section.key)) touched.push(section.key);
+					// --- A chapter that has just been split still holds everything that was
+					//     written before it was split, so the prose is filed into the sections
+					//     that now own it. After the drafts, so it is whatever the chapter says
+					//     now that gets filed, not what it said when the turn began.
+					if (splitParent) {
+						const moved = distributeSectionContent(project.id, splitParent);
+						for (const section of moved.filled) {
+							send('chapter', { key: section.key, markdown: section.markdown });
+							if (!touched.includes(section.key)) touched.push(section.key);
+						}
+						if (moved.parentMd !== null) {
+							send('chapter', { key: splitParent, markdown: moved.parentMd });
+						}
 					}
-					if (moved.parentMd !== null) {
-						send('chapter', { key: splitParent, markdown: moved.parentMd });
+
+					// --- Decisions settled this turn, with who settled them.
+					for (const block of parser.blocksOf('decision')) {
+						const draft = toDecisionDraft(block.attrs, block.body);
+						if (!draft) continue;
+
+						const key = draft.chapterKey ?? active?.key;
+						if (!key || !getChapter(project.id, key)) continue;
+
+						const saved = saveDecision(project.id, {
+							chapterKey: key,
+							statement: draft.statement,
+							rationale: draft.rationale,
+							source: draft.source
+						});
+						send('decision', saved);
+						if (!touched.includes(key)) touched.push(key);
 					}
-				}
 
-				// --- Decisions settled this turn, with who settled them.
-				for (const block of parser.blocksOf('decision')) {
-					const draft = toDecisionDraft(block.attrs, block.body);
-					if (!draft) continue;
-
-					const key = draft.chapterKey ?? active?.key;
-					if (!key || !getChapter(project.id, key)) continue;
-
-					const saved = saveDecision(project.id, {
-						chapterKey: key,
-						statement: draft.statement,
-						rationale: draft.rationale,
-						source: draft.source
-					});
-					send('decision', saved);
-				}
-
-				// --- A chapter the agent wrote in passing is no longer empty, whatever
-				//     else is true of it. Cheap correction — no extra gateway call.
-				for (const key of touched) {
-					if (key === active?.key) continue;
-					const written = getChapter(project.id, key);
-					if (written?.status === 'empty') {
-						updateChapterState(project.id, key, { status: 'in_progress' });
-						send('state', { key, status: 'in_progress', openQuestions: written.open_questions });
+					// --- A chapter the agent wrote in passing is no longer empty, whatever
+					//     else is true of it. Cheap correction — no extra gateway call.
+					for (const key of touched) {
+						if (key === active?.key) continue;
+						const written = getChapter(project.id, key);
+						if (written?.status === 'empty') {
+							updateChapterState(project.id, key, { status: 'in_progress' });
+							send('state', { key, status: 'in_progress', openQuestions: written.open_questions });
+						}
 					}
-				}
 
-				// --- Re-assess completeness of the chapter in focus.
+				});
+				for (const [event, data] of documentEvents) send(event, data);
+
+				// --- Re-assess completeness against its own captured revision.
 				const assessKey = active?.key ?? touched[0];
 				if (assessKey) {
 					const chapter = getChapter(project.id, assessKey);
+					const assessmentRevision = documentRevision(project.id);
 					if (chapter) {
 						const assessment = reconcileAssessment(
 							await assessChapter({
@@ -254,20 +264,26 @@ export const POST: RequestHandler = async ({ request, locals }) => {
 						if (assessment) {
 							// Store the assessor's verdict; the status the user sees is derived
 							// from it, so confirming an assumption takes effect at once.
-							updateChapterState(project.id, assessKey, {
-								status: assessment.status,
-								openQuestions: assessment.openQuestions
-							});
+							try {
+								withDocumentRevision(project.id, assessmentRevision, () => updateChapterState(project.id, assessKey, {
+									status: assessment.status,
+									openQuestions: assessment.openQuestions
+								}));
+								if (!touched.includes(assessKey)) touched.push(assessKey);
 
-							const pending = unconfirmed(
-								projectDecisions(project.id).filter((d) => d.chapter_key === assessKey)
-							).length;
+								const pending = unconfirmed(
+									projectDecisions(project.id).filter((d) => d.chapter_key === assessKey)
+								).length;
 
-							send('state', {
-								key: assessKey,
-								status: effectiveStatus(assessment.status, pending),
-								openQuestions: assessment.openQuestions
-							});
+								send('state', {
+									key: assessKey,
+									status: effectiveStatus(assessment.status, pending),
+									openQuestions: assessment.openQuestions
+								});
+							} catch (cause) {
+								if (!(cause instanceof DocumentConflict)) throw cause;
+								send('error', { message: 'The document changed during completeness checking. The newer chapter state was kept.' });
+							}
 						}
 					}
 				}
@@ -305,7 +321,7 @@ export const POST: RequestHandler = async ({ request, locals }) => {
 				console.error('[chat] turn failed:', cause);
 				send('error', {
 					message:
-						cause instanceof Error
+						cause instanceof DocumentConflict ? cause.message : cause instanceof Error
 							? `The assistant could not respond: ${cause.message}`
 							: 'The assistant could not respond.'
 				});

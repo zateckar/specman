@@ -1,5 +1,6 @@
 <script lang="ts">
 	import { renderMarkdown } from '$lib/safe-markdown';
+	import { invalidateAll } from '$app/navigation';
 
 	interface ChapterView {
 		key: string;
@@ -64,13 +65,23 @@
 		);
 	}
 
+	let decisionError = $state('');
 	async function confirm(id: number) {
-		await fetch('/api/decisions', {
-			method: 'POST',
-			headers: { 'content-type': 'application/json' },
-			body: JSON.stringify({ projectId, id, action: 'confirm' })
-		});
-		decisions = decisions.map((d) => (d.id === id ? { ...d, status: 'confirmed' } : d));
+		decisionError = '';
+		try {
+			const response = await fetch('/api/decisions', {
+				method: 'POST',
+				headers: { 'content-type': 'application/json' },
+				body: JSON.stringify({ projectId, id, action: 'confirm' })
+			});
+			if (!response.ok) {
+				const body = await response.json();
+				throw new Error(body.message ?? 'Your choice could not be recorded.');
+			}
+			await invalidateAll();
+		} catch (cause) {
+			decisionError = cause instanceof Error ? cause.message : 'Your choice could not be recorded.';
+		}
 	}
 
 	// "What must always be true" — the checkable half of a chapter. WHEN/THEN is
@@ -117,6 +128,7 @@
 </script>
 
 <aside>
+	{#if decisionError}<p role="alert">{decisionError}</p>{/if}
 	<header>
 		<h2>{projectName}</h2>
 		<a class="handoff" href="/projects/{projectId}/diagram">Diagram</a>

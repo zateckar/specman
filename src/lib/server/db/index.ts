@@ -64,6 +64,7 @@ export function db(): DatabaseSync {
 	instance = new DatabaseSync(path);
 	instance.exec(SCHEMA);
 	addMissingColumns(instance);
+	installDocumentRevisionTriggers(instance);
 	seedDefaultTemplate(instance);
 	seedStandards(instance);
 	backfillGoals(instance);
@@ -71,6 +72,71 @@ export function db(): DatabaseSync {
 	backfillSectionContent(instance);
 
 	return instance;
+}
+
+/** Database triggers also cover section planning and direct SQL migrations. */
+function installDocumentRevisionTriggers(database: DatabaseSync): void {
+	database.exec(`CREATE TRIGGER IF NOT EXISTS document_revision_insert_guard
+		BEFORE INSERT ON projects
+		WHEN typeof(NEW.document_revision) <> 'integer' OR NEW.document_revision < 0
+			OR NEW.document_revision > 9007199254740991
+		BEGIN SELECT RAISE(ABORT, 'Invalid document revision'); END;
+		CREATE TRIGGER IF NOT EXISTS document_revision_update_guard
+		BEFORE UPDATE OF document_revision ON projects
+		WHEN typeof(NEW.document_revision) <> 'integer' OR NEW.document_revision <= OLD.document_revision
+			OR NEW.document_revision > 9007199254740991
+		BEGIN SELECT RAISE(ABORT, 'Document revision must increase within the safe integer range'); END;`);
+	for (const table of ['chapters', 'requirements', 'decisions']) {
+		for (const event of ['INSERT', 'UPDATE', 'DELETE']) {
+			const row = event === 'DELETE' ? 'OLD' : 'NEW';
+			database.exec(`CREATE TRIGGER IF NOT EXISTS document_${table}_${event}
+				AFTER ${event} ON ${table} BEGIN
+				UPDATE projects SET document_revision = document_revision + 1 WHERE id = ${row}.project_id;
+				${event === 'UPDATE' ? `UPDATE projects SET document_revision = document_revision + 1
+					WHERE id = OLD.project_id AND OLD.project_id <> NEW.project_id;` : ''}
+				END;`);
+		}
+	}
+	database.exec(`CREATE TRIGGER IF NOT EXISTS document_project_metadata
+		AFTER UPDATE OF name, description, kind, profile, template_id ON projects BEGIN
+		UPDATE projects SET document_revision = document_revision + 1 WHERE id = NEW.id;
+		END;`);
+}
+
+export class DocumentConflict extends Error {
+	constructor() {
+		super('The document changed while the assistant was working. Your message is saved, but these proposed changes were not applied. Reload the document before trying again.');
+		this.name = 'DocumentConflict';
+	}
+}
+
+export function documentRevision(projectId: number): number {
+	const project = getProject(projectId);
+	if (!project) throw new Error('No such project');
+	if (!Number.isSafeInteger(project.document_revision) || project.document_revision < 0) {
+		throw new Error('Invalid document revision');
+	}
+	return project.document_revision;
+}
+
+/** No await or UI events may occur inside this transaction. */
+export function withDocumentRevision<T>(projectId: number, expected: number, work: () => T): T {
+	const database = db();
+	database.exec('BEGIN IMMEDIATE');
+	try {
+		const changed = database.prepare(`UPDATE projects SET document_revision = document_revision + 1
+			WHERE id = ? AND document_revision = ?`).run(projectId, expected);
+		if (!changed.changes) throw new DocumentConflict();
+		const result = work();
+		if (result && typeof (result as { then?: unknown }).then === 'function') {
+			throw new Error('Document updates must be synchronous');
+		}
+		database.exec('COMMIT');
+		return result;
+	} catch (cause) {
+		database.exec('ROLLBACK');
+		throw cause;
+	}
 }
 
 /**
@@ -982,18 +1048,29 @@ export interface VerificationRow {
 	project_id: number;
 	issues: unknown[];
 	checked: string[];
+	failed: string[];
+	document_revision: number | null;
+	stale: boolean;
 	created_at: string;
 }
 
 export function saveVerification(
 	projectId: number,
 	issues: unknown[],
-	checked: string[]
+	checked: string[],
+	failed: string[] = [],
+	revision: number | null = null
 ): VerificationRow {
 	const database = db();
-	database
-		.prepare('INSERT INTO verifications (project_id, issues, checked) VALUES (?, ?, ?)')
-		.run(projectId, JSON.stringify(issues), JSON.stringify(checked));
+	if (revision === null) {
+		database.prepare('INSERT INTO verifications (project_id, issues, checked, failed) VALUES (?, ?, ?, ?)')
+			.run(projectId, JSON.stringify(issues), JSON.stringify(checked), JSON.stringify(failed));
+	} else {
+		const saved = database.prepare(`INSERT INTO verifications (project_id, issues, checked, failed, document_revision)
+			SELECT id, ?, ?, ?, document_revision FROM projects WHERE id = ? AND document_revision = ?`)
+			.run(JSON.stringify(issues), JSON.stringify(checked), JSON.stringify(failed), projectId, revision);
+		if (!saved.changes) throw new DocumentConflict();
+	}
 
 	return latestVerification(projectId)!;
 }
@@ -1008,6 +1085,8 @@ export function latestVerification(projectId: number): VerificationRow | undefin
 		...row,
 		issues: parseJson<unknown[]>(row.issues as string, []),
 		checked: parseJson<string[]>(row.checked as string, []),
+		failed: parseJson<string[]>(row.failed as string, []),
+		stale: row.document_revision == null || row.document_revision !== getProject(projectId)?.document_revision,
 		created_at: asIsoTime(row.created_at as string)
 	} as VerificationRow;
 }

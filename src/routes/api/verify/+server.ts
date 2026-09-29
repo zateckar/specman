@@ -1,10 +1,11 @@
 import { error, json } from '@sveltejs/kit';
 import {
 	getProject,
+	documentRevision,
+	DocumentConflict,
 	projectChapters,
 	projectDecisions,
-	projectRequirements,
-	saveVerification
+	projectRequirements
 } from '$lib/server/db';
 import { verifyDocument } from '$lib/server/llm/verification';
 import { summariseIssues } from '$lib/server/llm/issues';
@@ -25,6 +26,7 @@ export const POST: RequestHandler = async ({ request, locals }) => {
 
 	const project = getProject(projectId);
 	if (!project) throw error(404, 'No such project');
+	const revision = documentRevision(project.id);
 
 	const result = await verifyDocument({
 		chapters: projectChapters(project.id),
@@ -32,17 +34,23 @@ export const POST: RequestHandler = async ({ request, locals }) => {
 		decisions: projectDecisions(project.id)
 	});
 
-	const saved = saveVerification(project.id, result.issues, result.checked);
-
-	// Record it in the repository too, so the pull request carries the check.
-	await writeVerification(project, result.issues, result.checked).catch((cause) => {
-		console.error('[verify] could not record the check in version control:', cause);
-	});
+	// Publish only if the input document still exists at the captured revision.
+	let saved;
+	try {
+		saved = await writeVerification(project, result.issues, result.checked, result.failed, revision);
+	} catch (cause) {
+		if (cause instanceof DocumentConflict) throw error(409, 'The document changed during the check. Run it again to check the current document.');
+		throw cause;
+	}
 
 	return json({
 		issues: result.issues,
 		checked: result.checked,
-		summary: summariseIssues(result.issues),
+		failed: result.failed,
+		stale: saved.stale,
+		summary: saved.stale ? 'The document changed after this check. Run it again.' : result.failed.length
+			? 'Check incomplete. ' + (result.issues.length ? summariseIssues(result.issues) : 'No findings from completed checks.')
+			: summariseIssues(result.issues),
 		assumptionsOutstanding: result.assumptionsOutstanding,
 		created_at: saved.created_at
 	});

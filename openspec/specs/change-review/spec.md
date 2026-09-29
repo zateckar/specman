@@ -16,6 +16,47 @@ removed" is a sentence they can act on.
 
 ## Requirements
 
+### Requirement: Authorized approval survives interruption
+Approval SHALL journal its immutable reviewed revisions before merging and recover pending
+work before subsequent repository writes, closing the proposal only after merge evidence exists.
+
+#### Scenario: Crash after authorization or merge
+- **WHEN** the next startup or repository write finds pending approval
+- **THEN** it resumes that exact authorized revision and closes the proposal without opening it for new changes
+
+#### Scenario: Unexpected working-tree changes
+- **WHEN** pending recovery finds dirty files outside the generated bundle
+- **THEN** it blocks further repository writes and reports recovery needs attention
+
+#### Scenario: An unfinished merge has a clean tree
+- **WHEN** Git still records unfinished merge work despite a clean porcelain status
+- **THEN** recovery and new writes are blocked until that merge state is resolved
+
+#### Scenario: Crash during bundle generation
+- **WHEN** the merge was recorded but bundle completion was interrupted
+- **THEN** recovery rebuilds from the saved merge revision and repeated recovery produces no extra changes
+
+### Requirement: Approval identifies the reviewed revision
+Review prose diffs and requirement deltas SHALL use immutable proposal and main commits,
+and approval SHALL validate both commits and the proposal identity inside the repository
+lock before merging that commit.
+
+#### Scenario: The proposal advances after review
+- **WHEN** another turn commits after the review page loads
+- **THEN** approval returns a conflict with instructions to review the new changes and leaves main unchanged
+
+#### Scenario: Approval queues behind a writer
+- **WHEN** a queued approval's reviewed revision changes before it acquires ownership
+- **THEN** approval rejects it after acquiring the lock
+
+#### Scenario: The approved base or open proposal changes
+- **WHEN** main advances or a replacement proposal is opened after review
+- **THEN** the old form cannot approve the current proposal
+
+#### Scenario: A form has no revision
+- **WHEN** approval receives missing or malformed revision fields
+- **THEN** it returns a conflict asking the user to reload the review
+
 ### Requirement: Conversation accumulates on one open proposal
 There SHALL be at most one open proposal per application, and every turn's changes SHALL be
 committed to it.
@@ -39,8 +80,8 @@ write to that repository while the branch is being moved.
 
 #### Scenario: The merge fails
 - **WHEN** approval cannot complete
-- **THEN** the repository is released and the proposal stays open, so the change is still
-  there to approve rather than half-merged
+- **THEN** ownership is released when work settles and the authorized intent remains
+  recoverable, so subsequent repository writes resume it before accepting new changes
 
 ### Requirement: A change that was not recorded says so
 When a turn's changes cannot be written to the repository, the user SHALL be told that the
@@ -90,12 +131,32 @@ branch.
 - **THEN** the merge still stands and the failure is logged, rather than the approval being
   lost
 
+#### Scenario: Newer answers are not yet committed
+- **WHEN** the database contains a newer revision while an earlier proposal is approved
+- **THEN** the developer bundle uses the proposal's committed export snapshot, and the newer
+  answers remain pending rather than reaching main without review
+
+#### Scenario: A proposal predates export snapshots
+- **WHEN** an older working branch is approved
+- **THEN** its bundle is reconstructed from its committed manifest and chapter files,
+  with a warning about metadata the older format did not retain, never from live database content
+
+#### Scenario: A failed commit left files in the working tree
+- **WHEN** approval finds staged, modified or untracked files
+- **THEN** it reports that the changes need to be recorded and leaves the proposal open,
+  so the bundle commit cannot sweep those unreviewed files onto main
+
 ### Requirement: What was checked travels with the change
 A verification result and the pending decisions SHALL be visible on the review page.
 
 #### Scenario: Reviewing a change
 - **WHEN** decisions made on the user's behalf are unconfirmed, or a check flagged something
 - **THEN** the reviewer sees both before approving
+
+#### Scenario: A check did not cover the whole document
+- **WHEN** any verification calls failed
+- **THEN** the review names the unavailable coverage and offers a retry, alongside findings
+  from successful calls, instead of claiming that nothing was flagged
 
 ### Requirement: Approval is never blocked by a model's opinion
 Approval SHALL proceed regardless of verification findings and structural validation

@@ -8,7 +8,7 @@ import {
 } from '$lib/server/db';
 import { effectiveStatus, pendingByChapter } from '$lib/server/llm/decisions';
 import { validateDocument } from '$lib/server/llm/validation';
-import { openProposal, proposalDiff } from '$lib/server/proposals';
+import { openProposal, proposalDiff, reviewRevision } from '$lib/server/proposals';
 import { stripChapterHeading } from '$lib/server/markdown';
 import type { PageServerLoad } from './$types';
 
@@ -24,7 +24,7 @@ export const load: PageServerLoad = async ({ params, url }) => {
 	let pendingChanges = false;
 	if (proposal) {
 		try {
-			pendingChanges = (await proposalDiff(project, proposal)).trim().length > 0;
+			pendingChanges = (await proposalDiff(project, await reviewRevision(project, proposal))).trim().length > 0;
 		} catch {
 			pendingChanges = false;
 		}

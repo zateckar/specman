@@ -22,6 +22,18 @@ usable content.
 
 ## Requirements
 
+### Requirement: A delayed reply cannot replace newer document state
+Chat document mutations SHALL compare the captured project revision and apply atomically,
+retaining the transcript and reporting a conflict when the document has changed.
+
+#### Scenario: Two replies share a starting revision
+- **WHEN** one finishes after the other has saved changes
+- **THEN** its chapter, requirement, decision and section mutations are rejected together
+
+#### Scenario: Completeness becomes stale
+- **WHEN** document changes occur while the completeness assessor is running
+- **THEN** its verdict cannot replace the newer status or open questions
+
 ### Requirement: A turn is two independent calls
 A conversation turn SHALL be a streamed prose call and a separate structured assessment
 call, so that no long output is ever carried in a tool argument.
@@ -55,7 +67,8 @@ blocks in the streamed text, and SHALL remove them from what the user sees.
 
 ### Requirement: A turn finishes whether or not anyone is watching
 A turn SHALL run to completion once it has begun, and failing to deliver an event to the
-browser SHALL NOT stop the work.
+browser SHALL NOT stop the work; a gateway generation failure SHALL leave existing chapter
+content unchanged and report the failure instead of saving a partial draft.
 
 #### Scenario: The tab is closed mid-turn
 - **WHEN** the browser disconnects while the assistant is replying
@@ -71,6 +84,11 @@ browser SHALL NOT stop the work.
 - **WHEN** an event cannot be serialised
 - **THEN** it is raised rather than counted as a disconnected browser, because a defect in
   what we send and a reader who left must not be handled the same way
+
+#### Scenario: Generation stops partway through a draft
+- **WHEN** the gateway reports an error or an incomplete response after returning chapter text
+- **THEN** the user sees an error, their submitted answer remains stored, and the partial
+  draft does not replace the chapter or reach the proposal
 
 ### Requirement: A turn belongs to the document, not to the pane showing it
 A turn in progress SHALL survive the user opening a different chapter, and when it finishes

@@ -18,6 +18,41 @@ gives it one.
 
 ## Requirements
 
+### Requirement: Document revisions cover every persisted model input
+Storage SHALL migrate existing projects to a monotonic document revision and invalidate
+snapshots on chapter, requirement, decision and project-context changes, including section planning.
+
+#### Scenario: An older project is opened
+- **WHEN** its schema lacks document revisions
+- **THEN** the revision column and mutation triggers are installed while preserving its content
+
+#### Scenario: A guarded update fails
+- **WHEN** any part of a reply's synchronous transaction raises
+- **THEN** all its mutations and revision changes roll back together
+
+#### Scenario: A counter would rewind or overflow
+- **WHEN** a write cannot advance the revision as an exact safe integer
+- **THEN** storage rejects it without saving unversioned document changes
+
+### Requirement: Verification and recovery migrations preserve evidence
+Storage SHALL preserve old reports with unknown input revisions and install a durable
+approval journal with at most one unfinished intent per project.
+
+#### Scenario: An old report is read
+- **WHEN** it predates revision capture
+- **THEN** it remains available as stale coverage rather than being treated as current
+
+#### Scenario: Startup finds an unfinished approval
+- **WHEN** the journal contains pending work
+- **THEN** recovery is attempted before startup document commits, and every later writer checks it independently
+
+### Requirement: Verification failures survive schema upgrades
+Existing databases SHALL gain a failed-coverage column without losing stored verification results.
+
+#### Scenario: A database predates coverage reporting
+- **WHEN** the application starts against an older verifications table
+- **THEN** the column is added with an empty default, preserving the old result without guessing which old calls failed
+
 ### Requirement: The schema is applied idempotently on boot
 The server SHALL apply the schema on every boot using statements that do nothing when the
 object already exists, so a fresh database and an existing one take the same path.

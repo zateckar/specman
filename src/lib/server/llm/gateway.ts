@@ -65,13 +65,14 @@ const MAX_ATTEMPTS = 4;
 const MIN_TOOL_MAX_TOKENS = 1500;
 
 export class GatewayError extends Error {
-	constructor(
-		message: string,
-		readonly status: number,
-		readonly body: string,
-		readonly retryable: boolean
-	) {
+	readonly status: number;
+	readonly body: string;
+	readonly retryable: boolean;
+	constructor(message: string, status: number, body: string, retryable: boolean) {
 		super(message);
+		this.status = status;
+		this.body = body;
+		this.retryable = retryable;
 		this.name = 'GatewayError';
 	}
 }
@@ -174,6 +175,7 @@ export class GatewayProvider implements LlmProvider {
 
 		let servedBy = body.model;
 		let outputTokens = 0;
+		let completed = false;
 
 		const reader = response.body.getReader();
 		const decoder = new TextDecoder();
@@ -185,6 +187,7 @@ export class GatewayProvider implements LlmProvider {
 				if (done) break;
 
 				buffer += decoder.decode(value, { stream: true });
+				buffer = buffer.replace(/\r\n/g, '\n');
 
 				// SSE frames are separated by a blank line.
 				let split: number;
@@ -196,7 +199,11 @@ export class GatewayProvider implements LlmProvider {
 						if (!line.startsWith('data:')) continue;
 
 						const payload = line.slice(5).trim();
-						if (!payload || payload === '[DONE]') continue;
+						if (!payload) continue;
+						if (payload === '[DONE]') {
+							completed = true;
+							continue;
+						}
 
 						let event: Record<string, any>;
 						try {
@@ -205,7 +212,11 @@ export class GatewayProvider implements LlmProvider {
 							continue; // Ignore malformed frames rather than killing the stream.
 						}
 
-						if (event.type === 'message_start' && event.message?.model) {
+						if (event.type === 'error') {
+							throw new GatewayError('The gateway interrupted its response.', 200, payload, false);
+						} else if (event.type === 'message_stop') {
+							completed = true;
+						} else if (event.type === 'message_start' && event.message?.model) {
 							servedBy = event.message.model;
 						} else if (event.type === 'content_block_delta') {
 							const delta = event.delta ?? {};
@@ -216,15 +227,22 @@ export class GatewayProvider implements LlmProvider {
 								yield { type: 'thinking', text: delta.thinking };
 							}
 						} else if (event.type === 'message_delta') {
+							if (event.delta?.stop_reason === 'max_tokens') {
+								throw new GatewayError('The gateway ran out of room before completing its response.', 200, payload, false);
+							}
 							outputTokens = event.usage?.output_tokens ?? outputTokens;
 						}
 					}
 				}
 			}
+		} catch (cause) {
+			await reader.cancel().catch(() => {});
+			throw cause;
 		} finally {
 			reader.releaseLock();
 		}
 
+		if (!completed) throw new GatewayError('The gateway response ended before it was complete.', 200, '', false);
 		console.info(`[llm] stream served by ${servedBy} (${outputTokens} output tokens)`);
 		yield { type: 'done', servedBy, outputTokens };
 	}

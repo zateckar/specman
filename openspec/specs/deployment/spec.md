@@ -58,7 +58,7 @@ The published image SHALL contain a working `git` binary.
   that a Node runtime is the whole runtime
 
 ### Requirement: An image is published only if the documentation agrees with the code
-The build SHALL run the tests and the documentation check before publishing, and SHALL NOT
+The build SHALL run the tests, documentation check and Lean protocol proofs before publishing, and SHALL NOT
 publish from a proposal.
 
 #### Scenario: A change whose specification was not updated
@@ -70,6 +70,10 @@ publish from a proposal.
 - **WHEN** it is opened
 - **THEN** the image is built but not pushed, so the build is proved without publishing from
   a branch nobody has reviewed
+
+#### Scenario: A protocol proof fails
+- **WHEN** the pinned Lean compiler rejects a proof or its axiom audit
+- **THEN** the test job fails and the image job cannot start
 
 ### Requirement: The port is published where only the proxy can reach it
 The deployment SHALL restrict who can reach the application's port.

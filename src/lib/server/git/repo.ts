@@ -6,6 +6,8 @@ import { stripChapterHeading } from '../markdown';
 import { effectiveStatus, pendingByChapter } from '../llm/decisions';
 import { createLocks } from '../llm/lock';
 import { chapterPath } from '../llm/subchapters';
+import type { ExportInput } from '../llm/export';
+import { validateDocument } from '../llm/validation';
 
 /**
  * One Git repository per application.
@@ -127,7 +129,7 @@ const SCOPE_HEADING: Record<string, string> = {
  * what a developer or a coding agent reads, and the markers are what make a
  * requirement testable rather than decorative.
  */
-function renderRequirements(requirements: Requirement[]): string {
+function renderRequirements(requirements: Pick<ExportInput['requirements'][number], 'ref' | 'scope' | 'statement' | 'scenarios'>[]): string {
 	if (requirements.length === 0) return '';
 
 	const sections: string[] = [];
@@ -345,12 +347,65 @@ function writeDecisionLog(repoPath: string, chapters: Chapter[], decisions: Deci
  * that is a normal state, not a failure.
  */
 export async function manifestOnMain(repoPath: string): Promise<Record<string, any> | null> {
+	return manifestOnBranch(repoPath, MAIN_BRANCH);
+}
+
+export async function manifestOnBranch(repoPath: string, branch: string): Promise<Record<string, any> | null> {
 	try {
-		const raw = await git(repoPath).show([`${MAIN_BRANCH}:specman.manifest.json`]);
+		const raw = await git(repoPath).show([`${branch}:specman.manifest.json`]);
 		return JSON.parse(raw);
 	} catch {
 		return null;
 	}
+}
+
+/** Read a single committed revision, including proposals written before snapshots existed. */
+export async function specInputOnBranch(repoPath: string, branch: string): Promise<ExportInput> {
+	const g = git(repoPath);
+	const revision = (await g.revparse([branch])).trim();
+	const files = (await g.raw(['ls-tree', '-r', '--name-only', revision])).split('\n');
+	if (files.includes('specman.export.json')) {
+		return JSON.parse(await g.show([`${revision}:specman.export.json`])) as ExportInput;
+	}
+
+	// Older manifests did not record every export field. Preserve their committed
+	// prose and rules, and flag the missing metadata rather than consulting SQLite.
+	const manifest = JSON.parse(await g.show([`${revision}:specman.manifest.json`]));
+	const requirements: ExportInput['requirements'] = (manifest.requirements ?? []).map((r: Record<string, any>) => ({
+		ref: r.ref, chapter_key: r.chapter, statement: r.statement, scope: r.scope,
+		scenarios: r.scenarios ?? [], source: r.source ?? 'agent', existing: r.existing ?? 0
+	}));
+	const decisions: ExportInput['decisions'] = (manifest.decisions ?? []).map((d: Record<string, any>) => ({
+		chapter_key: d.chapter, statement: d.statement, rationale: d.rationale ?? '',
+		source: d.decided_by, status: d.status
+	}));
+	const chapters: ExportInput['chapters'] = await Promise.all(manifest.chapters.map(async (c: Record<string, any>, position: number) => {
+		let prose = stripChapterHeading(await g.show([`${revision}:${c.file}`]), c.title).trim();
+		const questions: string[] = c.open_questions ?? [];
+		const questionTail = questions.length ? `### Open questions\n\n${questions.map((q) => `- ${q}`).join('\n')}` : '';
+		if (questionTail && prose.endsWith(questionTail)) prose = prose.slice(0, -questionTail.length).trimEnd();
+		const rules = renderRequirements(requirements.filter((r) => r.chapter_key === c.key)).trim();
+		if (rules && prose.endsWith(rules)) prose = prose.slice(0, -rules.length).trimEnd();
+		const goal = c.goal ? `_${c.goal}_` : '';
+		if (goal && prose.startsWith(goal)) prose = prose.slice(goal.length).trimStart();
+		const skipped = /^_Not needed for this application\. (.*)_$/s.exec(prose);
+		if (prose === '_This chapter has not been written yet._' || /^_Written as \d+ parts:_\n/.test(prose)) prose = '';
+		const prefix = c.parent ? /^docs\/\d+-(\d+)-/.exec(c.file) : /^docs\/(\d+)-/.exec(c.file);
+		const recordedPosition = prefix ? (c.parent ? Number(prefix[1]) - 1 : Number(prefix[1]) / 10) : position;
+		return {
+			key: c.key, title: c.title, goal: c.goal ?? '', status: c.status,
+			content_md: skipped ? '' : prose, position: recordedPosition, parent_key: c.parent ?? '',
+			applicable: skipped ? 0 : 1, skip_reason: skipped?.[1] ?? '', open_questions: questions
+		};
+	}));
+	return {
+		project: { name: manifest.project, description: '', kind: 'new' },
+		chapters, requirements, decisions,
+		problems: [
+			...validateDocument({ chapters: chapters.filter((c) => c.applicable !== 0), requirements, decisions }),
+			{ severity: 'warning', message: 'This older proposal did not record the application description, application type, or which requirements describe existing behaviour. Confirm those with the requester before building.' }
+		]
+	};
 }
 
 /**
@@ -394,6 +449,9 @@ export async function commitAll(
 	const g = git(repoPath);
 	if (!(await hasChanges(repoPath))) return null;
 	await g.add('.');
+	// Git can normalize rewritten line endings back to the existing index.
+	// Only the staged diff determines whether a commit actually exists.
+	if (!(await g.diff(['--cached', '--name-only'])).trim()) return null;
 	const result = await g.commit(message);
 	return result.commit || null;
 }
@@ -422,9 +480,33 @@ export async function checkoutBranch(repoPath: string, branch: string): Promise<
  * `specman.manifest.json` and `spec/` stay out. They restate the same facts for
  * machines, and a reviewer reading their diff would be reading everything twice.
  */
-export async function diffAgainstMain(repoPath: string, branch: string): Promise<string> {
+export async function resolveRevision(repoPath: string, ref: string): Promise<string> {
+	return (await git(repoPath).revparse(['--verify', `${ref}^{commit}`])).trim();
+}
+
+export async function revisionIsAncestor(repoPath: string, ancestor: string, descendant: string): Promise<boolean> {
+	return (await git(repoPath).raw(['rev-list', '--count', `${descendant}..${ancestor}`])).trim() === '0';
+}
+
+/** Recovery can replace its generated bundle, but must not sweep other files in. */
+export async function recoveryTreeSafe(repoPath: string, allowBundle: boolean): Promise<boolean> {
+	// Porcelain status can be clean while Git still has an unfinished merge.
+	if (['MERGE_HEAD', 'index.lock'].some((name) => existsSync(join(repoPath, '.git', name)))) return false;
+	const status = await git(repoPath).status();
+	if (status.isClean()) return true;
+	return allowBundle && await currentBranch(repoPath) === MAIN_BRANCH &&
+		status.files.every((file) => file.path.startsWith('spec/')) &&
+		status.renamed.every((file) => file.from.startsWith('spec/') && file.to.startsWith('spec/'));
+}
+
+export async function onlyBundleChanged(repoPath: string, from: string, to: string): Promise<boolean> {
+	const paths = (await git(repoPath).diff(['--name-only', from, to])).trim();
+	return !paths || paths.split('\n').every((path) => path.startsWith('spec/'));
+}
+
+export async function diffAgainstMain(repoPath: string, branch: string, base = MAIN_BRANCH): Promise<string> {
 	return git(repoPath).diff([
-		`${MAIN_BRANCH}...${branch}`,
+		`${base}...${branch}`,
 		'--',
 		'docs/',
 		'README.md',

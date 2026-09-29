@@ -22,14 +22,15 @@ First boot creates an `admin` account from `ADMIN_PASSWORD`, only while there ar
 | | |
 |---|---|
 | `npm test` | unit tests **and** the documentation check |
+| `npm run verify` | protocol proofs with Lean 4.34.1; see [formal/README.md](formal/README.md) |
 | `npm run check` | type check |
 | `npm run build` | production build |
 | `node scripts/proxy-sim.mjs` | stand in for the authenticating gateway, to sign in locally |
 
 ## Deploying it
 
-The image `ghcr.io/zateckar/specman` is built by GitHub Actions, and only after the tests and
-the documentation check pass.
+The image `ghcr.io/zateckar/specman` is built by GitHub Actions, and only after the tests,
+documentation check and Lean protocol proofs pass.
 
 ```bash
 cp .env.example .env

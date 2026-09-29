@@ -23,7 +23,7 @@ export const GET: RequestHandler = async ({ url, cookies }) => {
 		if (cause instanceof OidcNameCollision) {
 			throw error(
 				409,
-				'Someone already uses that name for a password account here. ' +
+				'Someone already uses that name for a different account here. ' +
 					'Ask an administrator to sort it out — signing in again will not help.'
 			);
 		}

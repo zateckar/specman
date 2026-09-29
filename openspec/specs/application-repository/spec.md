@@ -14,6 +14,14 @@ change can be reviewed as a requirement-level delta without parsing the prose.
 
 ## Requirements
 
+### Requirement: Export inputs travel with the document revision
+Each document commit SHALL include the complete export inputs in specman.export.json,
+including prose, application type, applicability, requirement provenance and decisions.
+
+#### Scenario: Approval overlaps a database update
+- **WHEN** a proposal is approved after another turn saved newer answers
+- **THEN** the bundle can be built from the committed snapshot without reading mutable database content
+
 ### Requirement: An application has a repository from the start
 The repository and its first working branch SHALL exist before the first conversation turn.
 
@@ -49,7 +57,7 @@ A chapter file SHALL carry its requirements below its prose, separated from it.
 - **THEN** they appear under their own heading, with the scenarios that make them testable
 
 ### Requirement: A repository has one writer at a time
-Operations that write to an application's repository SHALL be ordered, so that a checkout,
+Within one server process, operations that write to an application's repository SHALL be ordered, so that a checkout,
 the files it is followed by, and the commit that records them cannot be interleaved with
 another write to the same repository.
 
@@ -65,6 +73,18 @@ another write to the same repository.
 - **WHEN** one of them raises
 - **THEN** the repository is released, because one failure must not wedge an application
   until the server is restarted
+
+#### Scenario: The caller times out while Git continues writing
+- **WHEN** a write exceeds the caller deadline but its work has not settled
+- **THEN** the caller receives an error and subsequent writes to that repository wait for settlement
+
+#### Scenario: Other repositories during timeout
+- **WHEN** one repository has a timed-out writer
+- **THEN** writes to different repository keys continue independently
+
+#### Scenario: Settlement after timeout
+- **WHEN** the timed-out work completes or rejects
+- **THEN** the next queued writer proceeds and the failure cannot escape as an unhandled rejection
 
 ### Requirement: A commit names the branch it expects
 Committing SHALL state the branch it is meant to run on, and SHALL fail rather than commit
@@ -86,6 +106,10 @@ the branch the caller named.
 #### Scenario: The same document is written twice
 - **WHEN** nothing differs
 - **THEN** no commit is created and the caller is told so
+
+#### Scenario: Staging normalizes unchanged content
+- **WHEN** rewriting files changes their working-tree line endings but staging produces an empty diff
+- **THEN** committing returns no commit rather than failing with nothing to commit
 
 #### Scenario: Nothing to commit, on the wrong branch
 - **WHEN** the tree is unchanged and the repository is not on the expected branch

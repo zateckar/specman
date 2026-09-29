@@ -41,31 +41,24 @@ name what is wrong rather than restating the document. If nothing is wrong,
 reply with nothing at all. Do not invent problems to look thorough.`;
 
 async function collectFindings(system: string, prompt: string): Promise<Issue[]> {
-	try {
-		let text = '';
-		for await (const event of gateway.streamChat({
-			system,
-			messages: [{ role: 'user', content: prompt }],
-			// The served model reasons before writing, and thinking tokens come out
-			// of the same budget — too small a ceiling yields an empty answer.
-			maxTokens: 3000
-		})) {
-			if (event.type === 'text') text += event.text;
-		}
-
-		const parser = new ChapterStreamParser();
-		parser.push(text);
-		parser.end();
-
-		return parser
-			.blocksOf('finding')
-			.map((block) => toIssue(block.attrs, block.body))
-			.filter((issue): issue is Issue => issue !== null);
-	} catch (error) {
-		// One unlucky call must not lose the other eleven.
-		console.warn('[verify] a check failed:', error);
-		return [];
+	let text = '';
+	for await (const event of gateway.streamChat({
+		system,
+		messages: [{ role: 'user', content: prompt }],
+		// Reasoning and output consume the same budget.
+		maxTokens: 3000
+	})) {
+		if (event.type === 'text') text += event.text;
 	}
+
+	const parser = new ChapterStreamParser();
+	parser.push(text);
+	parser.end();
+
+	return parser
+		.blocksOf('finding')
+		.map((block) => toIssue(block.attrs, block.body))
+		.filter((issue): issue is Issue => issue !== null);
 }
 
 function describeRequirements(requirements: Requirement[]): string {
@@ -171,6 +164,8 @@ export interface VerificationResult {
 	issues: Issue[];
 	/** Chapters that were checked, for reporting what the run covered. */
 	checked: string[];
+	/** Chapter keys whose calls failed; whole-document identifies the cross-check. */
+	failed: string[];
 	/** True when at least one chapter had unconfirmed assumptions. */
 	assumptionsOutstanding: number;
 }
@@ -184,23 +179,40 @@ export async function verifyDocument(args: {
 
 	// A chapter set aside by the triage was never in scope, so it is not a gap.
 	const inScope = chapters.filter((c) => c.applicable !== 0);
+	const scopedKeys = new Set(inScope.map((c) => c.key));
+	const scopedRequirements = requirements.filter((r) => scopedKeys.has(r.chapter_key));
+	const scopedDecisions = decisions.filter((d) => scopedKeys.has(d.chapter_key));
 	const worthChecking = inScope.filter(
 		(c) => c.content_md.trim() || requirements.some((r) => r.chapter_key === c.key)
 	);
 
-	const perChapter = await mapWithLimit(worthChecking, CONCURRENCY, (chapter) =>
-		checkChapter({
-			chapter,
-			requirements: requirements.filter((r) => r.chapter_key === chapter.key),
-			decisions: decisions.filter((d) => d.chapter_key === chapter.key)
-		})
-	);
+	const perChapter = await mapWithLimit(worthChecking, CONCURRENCY, async (chapter) => {
+		try {
+			const issues = await checkChapter({
+				chapter,
+				requirements: requirements.filter((r) => r.chapter_key === chapter.key),
+				decisions: decisions.filter((d) => d.chapter_key === chapter.key)
+			});
+			return { key: chapter.key, failed: false, issues };
+		} catch (cause) {
+			console.warn(`[verify] check of ${chapter.key} failed:`, cause);
+			return { key: chapter.key, failed: true, issues: [] as Issue[] };
+		}
+	});
 
-	const across = await checkAcrossChapters({ chapters: inScope, requirements });
+	const failed = perChapter.filter((result) => result.failed).map((result) => result.key);
+	let across: Issue[] = [];
+	try {
+		across = await checkAcrossChapters({ chapters: inScope, requirements: scopedRequirements });
+	} catch (cause) {
+		console.warn('[verify] whole-document check failed:', cause);
+		failed.push('whole-document');
+	}
 
 	return {
-		issues: mergeIssues([...perChapter.flat(), ...across]),
-		checked: worthChecking.map((c) => c.key),
-		assumptionsOutstanding: unconfirmed(decisions).length
+		issues: mergeIssues([...perChapter.flatMap((result) => result.issues), ...across]),
+		checked: perChapter.filter((result) => !result.failed).map((result) => result.key),
+		failed,
+		assumptionsOutstanding: unconfirmed(scopedDecisions).length
 	};
 }

@@ -175,6 +175,18 @@ CREATE TABLE IF NOT EXISTS proposals (
   created_at TEXT NOT NULL DEFAULT (datetime('now')),
   merged_at  TEXT
 );
+
+CREATE TABLE IF NOT EXISTS approval_intents (
+  proposal_id       INTEGER PRIMARY KEY REFERENCES proposals(id) ON DELETE CASCADE,
+  project_id        INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+  proposal_revision TEXT NOT NULL,
+  main_revision     TEXT NOT NULL,
+  merge_revision    TEXT,
+  phase             TEXT NOT NULL CHECK (phase IN ('prepared', 'merged', 'complete')),
+  created_at        TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE UNIQUE INDEX IF NOT EXISTS approval_active_per_project
+ON approval_intents(project_id) WHERE phase <> 'complete';
 `;
 
 /**
@@ -183,6 +195,9 @@ CREATE TABLE IF NOT EXISTS proposals (
  * an explicit ALTER — guarded, because SQLite has no `ADD COLUMN IF NOT EXISTS`.
  */
 export const ADDED_COLUMNS: Array<{ table: string; column: string; definition: string }> = [
+	{ table: 'projects', column: 'document_revision', definition: 'INTEGER NOT NULL DEFAULT 0' },
+	{ table: 'verifications', column: 'document_revision', definition: 'INTEGER' },
+	{ table: 'verifications', column: 'failed', definition: `TEXT NOT NULL DEFAULT '[]'` },
 	{ table: 'messages', column: 'options', definition: `TEXT NOT NULL DEFAULT '[]'` },
 	{ table: 'template_chapters', column: 'goal', definition: `TEXT NOT NULL DEFAULT ''` },
 	{ table: 'chapters', column: 'goal', definition: `TEXT NOT NULL DEFAULT ''` },

@@ -1,5 +1,6 @@
 import { error, json } from '@sveltejs/kit';
-import { confirmDecision, deleteDecision, getDecision, getProject } from '$lib/server/db';
+import { getDecision, getProject } from '$lib/server/db';
+import { recordDecision } from '$lib/server/proposals';
 import type { RequestHandler } from './$types';
 
 /**
@@ -21,11 +22,17 @@ export const POST: RequestHandler = async ({ request, locals }) => {
 
 	const decision = getDecision(id);
 	if (!decision || decision.project_id !== project.id) throw error(404, 'No such decision');
+	if (action !== 'confirm' && action !== 'discard') throw error(400, 'Unknown decision action');
 
-	if (action === 'discard') {
-		deleteDecision(project.id, id);
-		return json({ id, discarded: true });
+	try {
+		await recordDecision(project, id, action);
+	} catch (cause) {
+		console.error('[decisions] could not record the decision:', cause);
+		const applied = action === 'discard' ? !getDecision(id) : getDecision(id)?.status === 'confirmed';
+		throw error(503, applied
+			? 'Your choice is saved, but it could not be added to the application’s history. It will be included when the next change is recorded.'
+			: 'Your choice has not been recorded. The repository could not finish its pending work. Check the document before trying again.');
 	}
 
-	return json(confirmDecision(project.id, id));
+	return json(action === 'discard' ? { id, discarded: true } : getDecision(id));
 };

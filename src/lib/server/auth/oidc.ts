@@ -44,18 +44,20 @@ export async function authorizationUrl(state: string, codeVerifier: string): Pro
 }
 
 /**
- * A company account whose name collides with a local password account.
+ * An unfamiliar company identity whose name is already in use.
  *
  * Distinct from an ordinary sign-in failure because the operator's fix is
  * different: this one is resolved by renaming or removing the local account, not
  * by trying again.
  */
 export class OidcNameCollision extends Error {
-	constructor(readonly username: string) {
+	readonly username: string;
+	constructor(username: string) {
 		super(
-			`A local account named "${username}" already exists and signs in with a password. ` +
+			`An account named "${username}" already exists with a different identity. ` +
 				'Refusing to adopt it from single sign-on.'
 		);
+		this.username = username;
 		this.name = 'OidcNameCollision';
 	}
 }
@@ -96,19 +98,17 @@ export async function completeLogin(
 	// it as proof of identity means whoever the directory calls "admin" inherits
 	// the bootstrap administrator account — an account nobody granted them.
 	//
-	// So a name match is adopted only when the local account has no password of
-	// its own, which is to say it was provisioned by this very flow and is being
-	// re-linked. An account that can be signed into with a password belongs to
-	// whoever knows that password, and is never taken over from here.
+	// Passwordless accounts also have owners. A recycled name or a name shared
+	// with the proxy must not link a new subject to their permissions.
 	const local = db()
-		.prepare('SELECT id, password_hash FROM users WHERE username = ?')
-		.get(username) as { id: number; password_hash: string | null } | undefined;
+		.prepare('SELECT id FROM users WHERE username = ?')
+		.get(username);
 
-	if (local?.password_hash) throw new OidcNameCollision(username);
+	if (local) throw new OidcNameCollision(username);
 
-	let userId = local?.id;
-
-	if (!userId) {
+	const database = db();
+	database.exec('BEGIN');
+	try {
 		// Always an ordinary user. Company sign-in establishes who someone is; it
 		// does not say what they may do here. Administrator rights are granted by
 		// an administrator, on the people page, and never arrive in a token.
@@ -118,13 +118,15 @@ export async function completeLogin(
 				 VALUES (?, ?, 0, 'oidc')`
 			)
 			.run(username, displayName);
-		userId = (db().prepare('SELECT last_insert_rowid() AS id').get() as { id: number }).id;
+		const userId = (database.prepare('SELECT last_insert_rowid() AS id').get() as { id: number }).id;
+		database
+			.prepare('INSERT INTO oidc_identities (user_id, issuer, subject) VALUES (?, ?, ?)')
+			.run(userId, issuer, subject);
+		database.exec('COMMIT');
 		console.info(`[oidc] registered "${username}" as a new user`);
+		return getUser(userId)!;
+	} catch (cause) {
+		database.exec('ROLLBACK');
+		throw cause;
 	}
-
-	db()
-		.prepare('INSERT OR IGNORE INTO oidc_identities (user_id, issuer, subject) VALUES (?, ?, ?)')
-		.run(userId, issuer, subject);
-
-	return getUser(userId)!;
 }

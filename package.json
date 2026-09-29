@@ -13,7 +13,8 @@
     "preview": "vite preview",
     "check": "svelte-kit sync && svelte-check --tsconfig ./tsconfig.json",
     "docs": "node scripts/check-docs.mjs",
-    "test": "node scripts/test-agent.mjs && node --import ./scripts/ts-resolve.mjs scripts/test-repo.mjs && node scripts/check-docs.mjs"
+    "verify": "node scripts/check-formal.mjs && node scripts/test-formal.mjs",
+    "test": "node scripts/test-agent.mjs && node --import ./scripts/ts-resolve.mjs scripts/test-repo.mjs && node --import ./scripts/ts-resolve.mjs scripts/test-server.mjs && node scripts/check-docs.mjs"
   },
   "devDependencies": {
     "@sveltejs/adapter-node": "^5.2.12",

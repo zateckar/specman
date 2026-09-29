@@ -21,7 +21,7 @@ env:
 
 jobs:
   test:
-    name: Tests and documentation check
+    name: Tests, documentation and protocol proofs
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -32,6 +32,15 @@ jobs:
           cache: npm
 
       - run: npm ci
+
+      - name: Install the pinned Lean toolchain
+        run: |
+          curl -sSfL https://elan.lean-lang.org/elan-init.sh -o "$RUNNER_TEMP/elan-init.sh"
+          sh "$RUNNER_TEMP/elan-init.sh" -y --default-toolchain "$(cat formal/lean-toolchain)"
+          echo "$HOME/.elan/bin" >> "$GITHUB_PATH"
+
+      - name: Check protocol proofs and their axioms
+        run: npm run verify
 
       # `scripts/test-repo.mjs` drives the real repository module against a real
       # temporary repository, so this job needs git — the runner has it.

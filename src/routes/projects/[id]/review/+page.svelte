@@ -1,5 +1,6 @@
 <script lang="ts">
-	let { data } = $props();
+	import { untrack } from 'svelte';
+	let { data, form } = $props();
 
 	interface Line {
 		text: string;
@@ -53,8 +54,17 @@
 		message: string;
 	}
 
-	let issues = $state<IssueView[]>((data.verification?.issues ?? []) as IssueView[]);
-	let checkedAt = $state<string | null>(data.verification?.created_at ?? null);
+	let issues = $state<IssueView[]>(untrack(() => (data.verification?.issues ?? []) as IssueView[]));
+	let checkedAt = $state<string | null>(untrack(() => data.verification?.created_at ?? null));
+	let failedChecks = $state<string[]>(untrack(() => data.verification?.failed ?? []));
+	let staleCheck = $state(untrack(() => data.verification?.stale ?? false));
+	let decisionError = $state('');
+	$effect(() => {
+		issues = (data.verification?.issues ?? []) as IssueView[];
+		checkedAt = data.verification?.created_at ?? null;
+		failedChecks = data.verification?.failed ?? [];
+		staleCheck = data.verification?.stale ?? false;
+	});
 
 	const ISSUE_LABEL: Record<string, string> = {
 		contradiction: 'These disagree',
@@ -77,6 +87,8 @@
 			const result = await response.json();
 			issues = result.issues;
 			checkedAt = result.created_at;
+			failedChecks = result.failed;
+			staleCheck = result.stale;
 		} catch (cause) {
 			checkError = cause instanceof Error ? cause.message : 'The check could not be run.';
 		} finally {
@@ -85,12 +97,21 @@
 	}
 
 	async function decide(id: number, action: 'confirm' | 'discard') {
-		await fetch('/api/decisions', {
-			method: 'POST',
-			headers: { 'content-type': 'application/json' },
-			body: JSON.stringify({ projectId: data.project.id, id, action })
-		});
-		location.reload();
+		decisionError = '';
+		try {
+			const response = await fetch('/api/decisions', {
+				method: 'POST',
+				headers: { 'content-type': 'application/json' },
+				body: JSON.stringify({ projectId: data.project.id, id, action })
+			});
+			if (!response.ok) {
+				const body = await response.json();
+				throw new Error(body.message ?? 'Your choice could not be recorded.');
+			}
+			location.reload();
+		} catch (cause) {
+			decisionError = cause instanceof Error ? cause.message : 'Your choice could not be recorded.';
+		}
 	}
 </script>
 
@@ -98,6 +119,8 @@
 	<a class="back" href="/projects/{data.project.id}">← Back to {data.project.name}</a>
 
 	<h1>Review changes</h1>
+	{#if decisionError}<p class="check-error" role="alert">{decisionError}</p>{/if}
+	{#if form?.message}<p class="check-error" role="alert">{form.message}</p>{/if}
 
 	{#if !data.proposal || lines.length === 0}
 		<div class="card empty">
@@ -115,6 +138,9 @@
 				</p>
 			</div>
 			<form method="POST" action="?/approve">
+				<input type="hidden" name="proposalId" value={data.reviewed?.proposalId} />
+				<input type="hidden" name="proposalRevision" value={data.reviewed?.proposalRevision} />
+				<input type="hidden" name="mainRevision" value={data.reviewed?.mainRevision} />
 				<button type="submit" class="primary">Approve and merge</button>
 			</form>
 		</div>
@@ -150,7 +176,11 @@
 					<h2>Does it all hold together?</h2>
 					<p class="sub">
 						{#if checkedAt}
-							Last checked {new Date(checkedAt).toLocaleString()} · {issues.length === 0
+							Last checked {new Date(checkedAt).toLocaleString()} · {staleCheck
+								? 'document changed since this check'
+								: failedChecks.length > 0
+								? 'check incomplete'
+								: issues.length === 0
 								? 'nothing flagged'
 								: `${issues.length} thing${issues.length === 1 ? '' : 's'} flagged`}
 						{:else}
@@ -166,6 +196,15 @@
 
 			{#if checkError}
 				<p class="check-error">{checkError}</p>
+			{/if}
+			{#if staleCheck}
+				<p class="check-error" role="alert">These findings describe an older document. Run the check again to cover the current changes.</p>
+			{/if}
+			{#if failedChecks.length > 0}
+				<p class="check-error" role="alert">
+					Could not check: {failedChecks.map((key) => key === 'whole-document' ? 'agreement across chapters' : data.chapterTitles[key] ?? key).join(', ')}.
+					Run the check again to cover these parts. Findings from successful checks are shown below.
+				</p>
 			{/if}
 
 			{#each issues as issue}

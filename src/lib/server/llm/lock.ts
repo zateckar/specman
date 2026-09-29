@@ -9,10 +9,9 @@
  * which is the one thing the review step exists to prevent.
  *
  * This is the ordering. It is not the whole guard — see `commitAll`, which
- * states the branch it expects — because ordering makes the race unlikely and
- * the assertion makes it *detectable*, and only the second still holds if
- * Specman is ever run behind more than one process. This map is per-process;
- * that limitation is in `PLAN.md`.
+ * states the branch it expects. Ordering prevents overlapping writers in this
+ * process; the assertion detects some interference from outside it. This map
+ * is per-process; that limitation is in `PLAN.md`.
  *
  * Deliberately free of imports so `npm test` can load it directly.
  */
@@ -28,12 +27,9 @@ export interface Locks {
  * @param timeoutMs How long one holder may take before its turn is failed. Zero
  *   disables it.
  *
- *   A timed-out holder is *released, not stopped* — nothing here can cancel a
- *   git process mid-write — so the work it is doing may still be going on when
- *   the next holder starts. That is a deliberate trade: waiting for ever would
- *   wedge an application until the server restarts, whereas failing one turn is
- *   recoverable, and the branch assertion catches the case that would actually
- *   corrupt something.
+ *   Timeout fails the caller without releasing ownership. Only settlement of
+ *   work releases it: a timeout cannot cancel a git process mid-write. A truly
+ *   stuck writer therefore blocks this key until recovery or server restart.
  */
 export function createLocks(timeoutMs = 60_000): Locks {
 	// The value is the tail of the queue for that key: a promise that settles
@@ -54,13 +50,15 @@ export function createLocks(timeoutMs = 60_000): Locks {
 
 		if (previous) await previous;
 
-		try {
-			return await withTimeout(work(), timeoutMs, key);
-		} finally {
+		const finish = () => {
 			release();
 			// Only if nobody queued behind us, or we would drop their place.
 			if (tails.get(key) === tail) tails.delete(key);
-		}
+		};
+		// Promise scheduling also turns a synchronous throw into settlement.
+		const completion = Promise.resolve().then(work);
+		void completion.then(finish, finish);
+		return withTimeout(completion, timeoutMs, key);
 	}
 
 	return {

@@ -9,7 +9,7 @@ import {
 	userForSession
 } from '$lib/server/auth';
 import { db } from '$lib/server/db';
-import { commitStartupMigrations } from '$lib/server/proposals';
+import { commitStartupMigrations, recoverPendingApprovals } from '$lib/server/proposals';
 
 // Open the database and create the initial admin account on boot.
 db();
@@ -17,10 +17,9 @@ bootstrapAdmin();
 purgeExpiredSessions();
 reportProxyAuthPosture();
 
-// Opening the database may migrate a document; the repository is a second copy of
-// it and has to be told. Not awaited — it is git I/O for the rare project that
-// needed it, and nothing serving a request depends on it having finished.
-void commitStartupMigrations();
+// Recover durable approvals before recording startup migrations. Reads may
+// proceed meanwhile; each repository writer independently checks recovery too.
+void recoverPendingApprovals().then(() => commitStartupMigrations());
 
 const PUBLIC_ROUTES = ['/login', '/health'];
 

@@ -48,6 +48,8 @@ export interface Project {
 	profile: string;
 	/** `change` means the application already exists and is being modified. */
 	kind: 'new' | 'change';
+	/** Monotonic guard for asynchronous computations over the whole document. */
+	document_revision: number;
 }
 
 /** now = build it; later = agreed but not yet; out = explicitly not doing. */

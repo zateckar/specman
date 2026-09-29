@@ -30,6 +30,7 @@ commissions software, not one who builds it. Notation may be *stored* — `SHALL
 | `npm run check` | type-check (`svelte-check`) |
 | `npm test` | agent tests **and** the documentation check |
 | `npm run docs` | the documentation check on its own |
+| `npm run verify` | Lean 4.34.1 protocol proofs and axiom audit |
 | `npm run build` | production build |
 | `docker compose up -d` | run the published image; set `SPECMAN_IMAGE` first |
 | `GET /health` | liveness — 200 while storage is readable and writable |
@@ -75,6 +76,7 @@ src/lib/components/     the three panes and the diagram
 src/routes/             pages and the SSE/JSON endpoints
 openspec/               these specifications
 scripts/                tests, the documentation check, the proxy stand-in
+formal/                 Lean protocol models and their implementation mapping
 Dockerfile              the published image — note that it installs git
 docker-compose.yml      how it is meant to be run, with the reasoning inline
 .github/workflows/      tests gate the image build; a pull request never pushes

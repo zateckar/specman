@@ -2,10 +2,17 @@ import { writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import {
 	db,
+	documentRevision,
+	DocumentConflict,
+	confirmDecision,
+	deleteDecision,
+	getDecision,
 	getProject,
 	projectChapters,
 	projectDecisions,
 	projectRequirements,
+	saveVerification,
+	type VerificationRow,
 	projectsMigratedAtStartup
 } from './db';
 import type { Project, Proposal } from './db/types';
@@ -15,7 +22,13 @@ import {
 	commitAll,
 	diffAgainstMain,
 	ensureRepo,
+	hasChanges,
 	mergeToMain,
+	resolveRevision,
+	revisionIsAncestor,
+	recoveryTreeSafe,
+	onlyBundleChanged,
+	specInputOnBranch,
 	withRepo,
 	writeDocument,
 	writeSpecBundle
@@ -74,6 +87,7 @@ function createProposal(projectId: number): Proposal {
  * reentrant — taking it again here would deadlock the turn against itself.
  */
 async function workingProposal(project: Project): Promise<Proposal> {
+	await recoverApproval(project);
 	await ensureRepo(project.repo_path, project.name);
 
 	const proposal = openProposal(project.id) ?? createProposal(project.id);
@@ -95,24 +109,41 @@ export async function ensureWorkingProposal(project: Project): Promise<Proposal>
  * turn moves the branch under files this one has already written.
  */
 export async function commitDocument(project: Project, message: string): Promise<string | null> {
-	return withRepo(project.repo_path, async () => {
-		const proposal = await workingProposal(project);
-		writeDocument(
-			project.repo_path,
-			project.name,
-			projectChapters(project.id),
-			projectRequirements(project.id),
-			projectDecisions(project.id)
-		);
-		const commit = await commitAll(project.repo_path, message, proposal.branch);
+	return withRepo(project.repo_path, () => commitWorkingDocument(project, message));
+}
 
-		if (commit) {
-			db()
-				.prepare("UPDATE proposals SET title = ? WHERE id = ? AND title = 'Design updates'")
-				.run(message.slice(0, 72), proposal.id);
-		}
+/** Caller holds the repository; capture the whole export before any further await. */
+async function commitWorkingDocument(project: Project, message: string): Promise<string | null> {
+	const proposal = await workingProposal(project);
+	const input = specInput(project);
+	writeDocument(
+		project.repo_path,
+		project.name,
+		projectChapters(project.id),
+		projectRequirements(project.id),
+		projectDecisions(project.id)
+	);
+	writeFileSync(join(project.repo_path, 'specman.export.json'), JSON.stringify(input, null, 2) + '\n', 'utf8');
+	const commit = await commitAll(project.repo_path, message, proposal.branch);
 
-		return commit;
+	if (commit) {
+		db()
+			.prepare("UPDATE proposals SET title = ? WHERE id = ? AND title = 'Design updates'")
+			.run(message.slice(0, 72), proposal.id);
+	}
+
+	return commit;
+}
+
+/** A decision change and its commit share the approval lock. */
+export async function recordDecision(project: Project, id: number, action: 'confirm' | 'discard'): Promise<void> {
+	await withRepo(project.repo_path, async () => {
+		await recoverApproval(project);
+		const decision = getDecision(id);
+		if (!decision || decision.project_id !== project.id) throw new Error('No such decision');
+		if (action === 'discard') deleteDecision(project.id, id);
+		else confirmDecision(project.id, id);
+		await commitWorkingDocument(project, action === 'discard' ? 'Discard a proposed decision' : 'Confirm a proposed decision');
 	});
 }
 
@@ -125,20 +156,31 @@ export async function commitDocument(project: Project, message: string): Promise
 export async function writeVerification(
 	project: Project,
 	issues: Array<{ kind: string; chapters: string[]; refs: string[]; message: string }>,
-	checked: string[]
-): Promise<string | null> {
+	checked: string[],
+	failed: string[],
+	expectedRevision: number
+): Promise<VerificationRow> {
 	return withRepo(project.repo_path, async () => {
 		const proposal = await workingProposal(project);
+		if (documentRevision(project.id) !== expectedRevision) throw new DocumentConflict();
+		const saved = saveVerification(project.id, issues, checked, failed, expectedRevision);
 
 		const titles = new Map(projectChapters(project.id).map((c) => [c.key, c.title]));
 		const lines: string[] = [
 			'# Check of the whole document',
 			'',
+			`Document revision: ${expectedRevision}.`,
+			'',
 			`${checked.length} chapter${checked.length === 1 ? '' : 's'} checked.`,
 			''
 		];
 
-		if (issues.length === 0) {
+		if (failed.length > 0) {
+			lines.push('**Check incomplete.** Some parts could not be checked:', '');
+			for (const key of failed) lines.push(`- ${key === 'whole-document' ? 'Agreement across chapters' : titles.get(key) ?? key}`);
+			lines.push('', 'Run the check again to cover these parts.', '');
+		}
+		if (issues.length === 0 && failed.length === 0) {
 			lines.push('Nothing was flagged. The document agrees with itself.');
 		} else {
 			for (const issue of issues) {
@@ -149,13 +191,33 @@ export async function writeVerification(
 			}
 		}
 
-		writeFileSync(join(project.repo_path, 'VERIFICATION.md'), lines.join('\n') + '\n', 'utf8');
-		return commitAll(project.repo_path, 'Record check of the whole document', proposal.branch);
+		try {
+			writeFileSync(join(project.repo_path, 'VERIFICATION.md'), lines.join('\n') + '\n', 'utf8');
+			await commitAll(project.repo_path, 'Record check of the whole document', proposal.branch);
+		} catch (cause) {
+			console.error('[verify] could not record the check in version control:', cause);
+		}
+		return { ...saved, stale: documentRevision(project.id) !== expectedRevision };
 	});
 }
 
-export async function proposalDiff(project: Project, proposal: Proposal): Promise<string> {
-	return diffAgainstMain(project.repo_path, proposal.branch);
+export interface ReviewedRevision {
+	proposalId: number;
+	proposalRevision: string;
+	mainRevision: string;
+}
+
+/** The prose diff and requirement delta use these immutable commits. */
+export async function reviewRevision(project: Project, proposal: Proposal): Promise<ReviewedRevision> {
+	const [proposalRevision, mainRevision] = await Promise.all([
+		resolveRevision(project.repo_path, proposal.branch),
+		resolveRevision(project.repo_path, MAIN_BRANCH)
+	]);
+	return { proposalId: proposal.id, proposalRevision, mainRevision };
+}
+
+export async function proposalDiff(project: Project, reviewed: ReviewedRevision): Promise<string> {
+	return diffAgainstMain(project.repo_path, reviewed.proposalRevision, reviewed.mainRevision);
 }
 
 /**
@@ -215,24 +277,133 @@ export function specInput(project: Project): ExportInput {
  * moment earlier would stage its chapters onto `main` — a change reaching the
  * approved document without anyone approving it.
  */
-export async function approveProposal(project: Project, proposal: Proposal): Promise<void> {
+export async function approveProposal(project: Project, proposal: Proposal, reviewed: ReviewedRevision): Promise<void> {
 	await withRepo(project.repo_path, async () => {
-		await mergeToMain(project.repo_path, proposal.branch);
-
-		// Refresh the build-ready bundle on main, so what a developer clones always
-		// matches the approved document rather than whatever was approved last time.
-		try {
-			writeSpecBundle(project.repo_path, buildSpecBundle(specInput(project)));
-			await commitAll(project.repo_path, 'Update the build-ready specification', MAIN_BRANCH);
-		} catch (cause) {
-			console.error('[proposals] could not write the specification bundle:', cause);
+		await recoverApproval(project);
+		if (reviewed.proposalId !== proposal.id || openProposal(project.id)?.id !== proposal.id) throw new StaleReview();
+		const current = await reviewRevision(project, proposal);
+		if (current.proposalRevision !== reviewed.proposalRevision || current.mainRevision !== reviewed.mainRevision) {
+			throw new StaleReview();
 		}
-
+		// A failed commit can leave files staged or untracked. The bundle commit
+		// stages the whole tree, so moving it to main must start from a clean tree.
+		if (await hasChanges(project.repo_path)) throw new UnrecordedChanges();
 		db()
-			.prepare("UPDATE proposals SET state = 'merged', merged_at = datetime('now') WHERE id = ?")
-			.run(proposal.id);
-		await checkoutBranch(project.repo_path, MAIN_BRANCH);
+			.prepare(`INSERT INTO approval_intents (proposal_id, project_id, proposal_revision, main_revision, phase)
+				VALUES (?, ?, ?, ?, 'prepared')`)
+			.run(proposal.id, project.id, reviewed.proposalRevision, reviewed.mainRevision);
+		try {
+			await recoverApproval(project);
+		} catch (cause) {
+			// Approval stands once its merge and marker are durable. Bundle recovery
+			// remains pending and subsequent writers must finish it before proceeding.
+			if (getProposal(proposal.id)?.state !== 'merged') throw cause;
+			console.error('[proposals] approved; specification bundle awaits recovery:', cause);
+		}
 	});
+}
+
+interface ApprovalIntent {
+	proposal_id: number;
+	project_id: number;
+	proposal_revision: string;
+	main_revision: string;
+	merge_revision: string | null;
+	phase: 'prepared' | 'merged' | 'complete';
+}
+
+export class ApprovalRecoveryBlocked extends Error {
+	constructor(detail: string) {
+		super(`An approved change is awaiting recovery. ${detail}`);
+		this.name = 'ApprovalRecoveryBlocked';
+	}
+}
+
+/** Caller owns the repository. No new branch/write may bypass this journal. */
+async function recoverApproval(project: Project): Promise<void> {
+	try {
+		await recoverApprovalWork(project);
+	} catch (cause) {
+		if (cause instanceof ApprovalRecoveryBlocked) throw cause;
+		throw new ApprovalRecoveryBlocked(cause instanceof Error ? cause.message : 'Recovery could not finish.');
+	}
+}
+
+async function recoverApprovalWork(project: Project): Promise<void> {
+	const intent = db().prepare(`SELECT * FROM approval_intents WHERE project_id = ? AND phase <> 'complete'`)
+		.get(project.id) as ApprovalIntent | undefined;
+	if (!intent) return;
+	if (!await recoveryTreeSafe(project.repo_path, intent.phase === 'merged')) {
+		throw new ApprovalRecoveryBlocked('The repository has unfinished Git work or unrecorded changes. Resolve them before retrying.');
+	}
+
+	if (intent.phase === 'prepared') {
+		let main = await resolveRevision(project.repo_path, MAIN_BRANCH);
+		if (!await revisionIsAncestor(project.repo_path, intent.proposal_revision, main)) {
+			if (main !== intent.main_revision) {
+				throw new ApprovalRecoveryBlocked('The approved base moved before merging. Restore the reviewed base before retrying.');
+			}
+			await mergeToMain(project.repo_path, intent.proposal_revision);
+			main = await resolveRevision(project.repo_path, MAIN_BRANCH);
+		}
+		if (!await revisionIsAncestor(project.repo_path, intent.main_revision, main)) {
+			throw new ApprovalRecoveryBlocked('The reviewed base is missing from main history.');
+		}
+		const database = db();
+		database.exec('BEGIN IMMEDIATE');
+		try {
+			database.prepare(`UPDATE proposals SET state = 'merged', merged_at = datetime('now') WHERE id = ?`)
+				.run(intent.proposal_id);
+			database.prepare(`UPDATE approval_intents SET phase = 'merged', merge_revision = ? WHERE proposal_id = ?`)
+				.run(main, intent.proposal_id);
+			database.exec('COMMIT');
+		} catch (cause) {
+			database.exec('ROLLBACK');
+			throw cause;
+		}
+		intent.merge_revision = main;
+		intent.phase = 'merged';
+	}
+
+	const main = await resolveRevision(project.repo_path, MAIN_BRANCH);
+	if (!intent.merge_revision || !await revisionIsAncestor(project.repo_path, intent.proposal_revision, main) ||
+		!await revisionIsAncestor(project.repo_path, intent.merge_revision, main) ||
+		!await onlyBundleChanged(project.repo_path, intent.merge_revision, main)) {
+		throw new ApprovalRecoveryBlocked('Main no longer matches the recorded merge.');
+	}
+	await checkoutBranch(project.repo_path, MAIN_BRANCH);
+	writeSpecBundle(project.repo_path, buildSpecBundle(await specInputOnBranch(project.repo_path, intent.merge_revision)));
+	await commitAll(project.repo_path, 'Update the build-ready specification', MAIN_BRANCH);
+	db().prepare(`UPDATE approval_intents SET phase = 'complete' WHERE proposal_id = ?`).run(intent.proposal_id);
+}
+
+/** Idempotent forward recovery; failures in one project do not hide the others. */
+export async function recoverPendingApprovals(): Promise<void> {
+	const rows = db().prepare(`SELECT DISTINCT project_id FROM approval_intents WHERE phase <> 'complete'`)
+		.all() as Array<{ project_id: number }>;
+	for (const { project_id } of rows) {
+		const project = getProject(project_id);
+		if (!project) continue;
+		try {
+			await withRepo(project.repo_path, () => recoverApproval(project));
+		} catch (cause) {
+			console.error(`[proposals] recovery blocked for project ${project_id}:`, cause);
+		}
+	}
+}
+
+export class StaleReview extends Error {
+	constructor() {
+		super('The proposal or approved document changed since this review. Review the updated changes before approving.');
+		this.name = 'StaleReview';
+	}
+}
+
+export class UnrecordedChanges extends Error {
+	constructor() {
+		super('Some changes have not reached the application’s history. Record another change before approving this proposal.');
+		this.name = 'UnrecordedChanges';
+	}
 }
 
 /**

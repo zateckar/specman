@@ -181,14 +181,29 @@ first folder under `openspec/changes/`:
 - **One process only.** A repository is kept to one writer at a time by a promise chain in
   `llm/lock.ts`, which lives in memory. Running Specman behind two instances — a second
   container, a restart overlapping the old one — silently stops the ordering from holding.
-  The branch assertion in `commitAll` still fires, so the damage is a failed turn rather than
-  a change landing on `main`, but the ordering itself would need a lock both processes can
+  The branch assertion in `commitAll` detects some interference but cannot prevent every
+  overlapping write. The ordering itself would need a lock both processes can
   see (a lock file, or a `git worktree` per writer). Treat "scale it out" as a change to
   `application-repository`, not a deployment detail.
-- **A timed-out repository holder is released, not stopped.** Nothing here can cancel a git
-  process mid-write. Waiting for ever would wedge an application until restart, so after 60
-  seconds the turn fails and the next one proceeds; the assertion is what stands between that
-  and an overlapping write.
+- **Timeout cannot cancel a repository writer.** After 60 seconds the caller fails, but
+  ownership remains until the underlying work settles. A permanently stuck writer blocks
+  its repository until recovery or restart. Other repositories continue independently.
+  The single-process protocol is proved in `formal/Lock.lean`; see `formal/README.md` for
+  the implementation mapping and assumptions.
+- **Formal coverage describes protocols, not the complete runtime.** Lean now checks
+  ownership, reviewed approval, optimistic document writes, journaled recovery, assessed
+  completion, verification coverage and identity linking. The TypeScript correspondence,
+  SQLite/Git durability, provider authentication, child-process termination and multiple
+  server processes remain assumptions or separate work; see `formal/README.md`.
+- **Conflicting model replies are rejected rather than combined.** Project-wide revisions
+  protect the context used to generate prose. User messages and reply text remain in the
+  transcript; the caller reloads before retrying. A completeness verdict that becomes stale
+  is skipped independently, preserving the already accepted prose and newer chapter status.
+- **Pending approvals recover before more Git writes.** A durable journal records the
+  authorized proposal and base. Recovery closes the proposal after checking Git evidence
+  and rebuilds its bundle from the saved merge. Dirty files, an unresolved merge or unavailable
+  storage can block the repository until an operator resolves them. Approvals predating this
+  journal have no recoverable authorization record.
 - **Proxy sign-in trusts a header.** `X-Forwarded-User` is a string the caller chose. It is
   safe only while the proxy overwrites it on every request *and* nothing else can reach the
   port. `PROXY_AUTH_TRUSTED_IPS` makes the second checkable here; the first is the proxy's
