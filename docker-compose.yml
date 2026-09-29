@@ -1,0 +1,78 @@
+# Specman, run the way it is meant to be run.
+#
+# Three lines here are load-bearing and are explained where they are: the port
+# binding, the volume, and ORIGIN. Everything else is ordinary.
+
+services:
+  specman:
+    # Published by .github/workflows/build.yml. Override SPECMAN_IMAGE to pin a
+    # version or a commit — the workflow tags every build with its long SHA, and
+    # `latest` only ever moves on the default branch.
+    image: ${SPECMAN_IMAGE:-ghcr.io/zateckar/specman:latest}
+    restart: unless-stopped
+
+    # LOOPBACK ONLY, DELIBERATELY.
+    #
+    # Specman signs people in from `X-Forwarded-User` when a gateway in front has
+    # already authenticated them. A header is a string the caller chose, so that
+    # is safe only while nothing but the gateway can reach this port. Change the
+    # left-hand side to 0.0.0.0 and anyone who can route to this host is whoever
+    # they say they are, including an administrator.
+    #
+    # If the gateway runs as a container, prefer removing this section entirely
+    # and putting both on the same Docker network: then the port is not published
+    # to the host at all, which is stronger than binding it narrowly.
+    ports:
+      - '127.0.0.1:3000:3000'
+
+    # EVERYTHING THAT MUST SURVIVE A RESTART.
+    #
+    # Both the SQLite database and every application's Git repository live here.
+    # Without this volume a new image silently discards every design document,
+    # and the first anyone knows of it is an empty list of applications.
+    volumes:
+      - specman-data:/app/data
+
+    # Secrets and gateway settings. Copy .env.example to .env and fill it in.
+    # This file is never baked into the image — see .dockerignore.
+    env_file:
+      - .env
+
+    environment:
+      # The address people type. SvelteKit rejects form submissions whose Origin
+      # does not match, so behind a gateway this must be the public URL, not the
+      # container's own port — otherwise sign-in and every form fails with a
+      # cross-site error that looks like nothing in particular.
+      ORIGIN: ${PUBLIC_URL:-http://localhost:3000}
+
+      # Also the public URL, and used for the OIDC redirect.
+      PUBLIC_URL: ${PUBLIC_URL:-http://localhost:3000}
+
+      DATABASE_PATH: data/specman.db
+
+      # Accept an identity the gateway has already authenticated. On by default;
+      # an installation with no gateway in front receives none of these headers,
+      # so leaving it on changes nothing there.
+      PROXY_AUTH_ENABLED: ${PROXY_AUTH_ENABLED:-true}
+
+      # Who may assert X-Forwarded-User. Empty means anyone who can reach the
+      # port, which is why the port is bound the way it is above.
+      #
+      # Getting this right is fiddly and worth the trouble: the address Specman
+      # sees is not the address the gateway thinks it has. A gateway on the host
+      # reaching 127.0.0.1:3000 arrives from the Docker bridge, not from
+      # 127.0.0.1. Set it, start the container, sign in once, and read the log:
+      # on refusal it prints the peer it actually saw, and on boot it prints what
+      # it trusts.
+      PROXY_AUTH_TRUSTED_IPS: ${PROXY_AUTH_TRUSTED_IPS:-}
+
+      # Where the gateway ends its own session. Without it, sign-out has nothing
+      # to offer someone the gateway signed in, because there is no session here.
+      PROXY_AUTH_LOGOUT_URL: ${PROXY_AUTH_LOGOUT_URL:-}
+
+    # The image defines its own healthcheck: it opens the database, so a volume
+    # that has gone missing or read-only reads as unhealthy rather than as a
+    # server cheerfully losing everything it is told.
+
+volumes:
+  specman-data:

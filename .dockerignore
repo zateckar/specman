@@ -1,0 +1,22 @@
+# Keep the build context to what is needed to build.
+#
+# `.env` and `data/` are first because this is the last place they can be kept
+# out of a published image: `.gitignore` stops them being committed, and nothing
+# else stops them being copied.
+.env
+.env.*
+!.env.example
+data/
+
+node_modules/
+build/
+.svelte-kit/
+.git/
+*.log
+
+# Not part of the application.
+.claude/
+openspec/
+README.md
+PLAN.md
+CLAUDE.md

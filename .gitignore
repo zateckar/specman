@@ -1,0 +1,14 @@
+# Secrets — never commit
+.env
+.env.*
+!.env.example
+
+# Local application state: SQLite database and per-application git repos
+data/
+
+node_modules/
+.svelte-kit/
+build/
+*.log
+.claude/
+.kilo/

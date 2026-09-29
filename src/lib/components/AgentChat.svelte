@@ -1,0 +1,443 @@
+<script lang="ts">
+	interface AnswerOption {
+		label: string;
+		recommended: boolean;
+	}
+
+	interface ChatTurn {
+		role: 'user' | 'assistant';
+		content: string;
+		options?: AnswerOption[];
+	}
+
+	/**
+	 * The conversation pane. It shows a turn and collects the next one; it does
+	 * not run one.
+	 *
+	 * Running the turn used to live here, and the component is replaced whenever
+	 * the chapter changes — so switching chapters mid-reply orphaned the work.
+	 * The page owns it now and survives the switch, which is the only place that
+	 * can be true.
+	 */
+	let {
+		projectId,
+		chapterKey,
+		chapterTitle,
+		written = false,
+		turns,
+		busy,
+		busyElsewhere = '',
+		saveState = 'saved',
+		errorMessage = '',
+		openQuestions,
+		onsend,
+		onask
+	}: {
+		projectId: number;
+		chapterKey: string | null;
+		chapterTitle: string;
+		/** Has prose already, even though nothing has been said about it here. */
+		written?: boolean;
+		turns: ChatTurn[];
+		busy: boolean;
+		/** Title of another chapter still being written, if there is one. */
+		busyElsewhere?: string;
+		saveState?: 'saved' | 'saving' | 'not-recorded';
+		errorMessage?: string;
+		openQuestions: string[];
+		onsend: (text: string) => void;
+		onask: (question: string) => void;
+	} = $props();
+
+	let input = $state('');
+	let scroller: HTMLDivElement | undefined = $state();
+
+	// Follow the reply as it streams, and land at the bottom on a chapter switch.
+	$effect(() => {
+		turns.length;
+		turns[turns.length - 1]?.content;
+		scrollDown();
+	});
+
+	// Only the newest agent turn offers its answers: older ones have been answered
+	// already, and leaving them clickable invites the user to answer twice.
+	const liveOptions = $derived(
+		!busy && turns[turns.length - 1]?.role === 'assistant'
+			? (turns[turns.length - 1].options ?? [])
+			: []
+	);
+
+	function scrollDown() {
+		requestAnimationFrame(() => {
+			if (scroller) scroller.scrollTop = scroller.scrollHeight;
+		});
+	}
+
+	function send(text: string) {
+		if (!text.trim() || busy) return;
+		input = '';
+		onsend(text);
+	}
+
+	// Clicking "Start" is the user asking to begin, so it reads as a user turn.
+	const startMessage = $derived(
+		!chapterKey
+			? "Let's review the document as a whole."
+			: written
+				? "Let's go through this chapter — check what's there and fill in what's missing."
+				: "Let's start this chapter."
+	);
+
+	function onKeydown(event: KeyboardEvent) {
+		if (event.key === 'Enter' && !event.shiftKey) {
+			event.preventDefault();
+			send(input);
+		}
+	}
+</script>
+
+<section>
+	<header>
+		<h2>{chapterTitle}</h2>
+		{#if busy}
+			<span class="thinking">Thinking…</span>
+		{:else if busyElsewhere}
+			<!-- A turn keeps running when the user moves on, so say where it is
+			     rather than leaving them wondering whether it was lost. -->
+			<span class="thinking">Still writing {busyElsewhere}…</span>
+		{/if}
+		<span class="spacer"></span>
+		<span class="saved" class:working={saveState !== 'saved'} class:adrift={saveState === 'not-recorded'}>
+			{#if saveState === 'saving'}Saving…
+			{:else if saveState === 'not-recorded'}Not yet in the history
+			{:else}All changes saved{/if}
+		</span>
+	</header>
+
+	<div class="scroll" bind:this={scroller}>
+		{#if turns.length === 0}
+			<div class="intro">
+				<p>
+					{#if chapterKey && written}
+						<!-- Written elsewhere: as part of a chapter that was later split, or in
+						     passing while another chapter was being discussed. Saying "nothing
+						     has been written" here would contradict the document alongside it. -->
+						<strong>{chapterTitle}</strong> is already written — we just haven't talked about
+						it here yet.
+					{:else if chapterKey}
+						Nothing has been written for <strong>{chapterTitle}</strong> yet.
+					{:else}
+						This is where we look at the document as a whole — how the chapters fit together,
+						and what still contradicts what.
+					{/if}
+				</p>
+				<button class="start" onclick={() => send(startMessage)} disabled={busy}>
+					{#if !chapterKey}Start a review{:else if written}Go through it{:else}Start this chapter{/if}
+				</button>
+				<p class="hint">
+					{#if chapterKey && written}
+						I'll check what is there with you and ask about anything still missing.
+					{:else if chapterKey}
+						I'll ask you a few questions and write the chapter from your answers. You can also
+						just tell me what you already know.
+					{:else}
+						Or ask me anything about the document.
+					{/if}
+				</p>
+			</div>
+		{/if}
+
+		{#each turns as turn, i (i)}
+			<div class="turn {turn.role}">
+				<div class="bubble">
+					{#if turn.content}
+						{turn.content}
+					{:else}
+						<span class="cursor">▊</span>
+					{/if}
+				</div>
+			</div>
+		{/each}
+
+		{#if liveOptions.length > 0}
+			<div class="options">
+				{#each liveOptions as option}
+					<button class="option" class:recommended={option.recommended} onclick={() => send(option.label)}>
+						<span class="label">{option.label}</span>
+						{#if option.recommended}<span class="tag">Recommended</span>{/if}
+					</button>
+				{/each}
+				<p class="own">…or type your own answer below.</p>
+			</div>
+		{/if}
+
+		{#if errorMessage}
+			<p class="error">{errorMessage}</p>
+		{/if}
+	</div>
+
+	{#if openQuestions.length > 0 && !busy}
+		<div class="pending">
+			<span class="pending-label">Still to decide — pick one to work through it:</span>
+			<div class="chips">
+				{#each openQuestions.slice(0, 3) as question}
+					<button class="chip" onclick={() => onask(question)}>{question}</button>
+				{/each}
+			</div>
+		</div>
+	{/if}
+
+	<div class="composer">
+		<textarea
+			bind:value={input}
+			onkeydown={onKeydown}
+			placeholder="Type your answer…"
+			rows="2"
+			disabled={busy}
+		></textarea>
+		<button class="send" onclick={() => send(input)} disabled={busy || !input.trim()}>Send</button>
+	</div>
+</section>
+
+<style>
+	section {
+		display: flex;
+		flex-direction: column;
+		height: 100%;
+		min-width: 0;
+		background: var(--panel);
+		border-right: 1px solid var(--line);
+	}
+
+	header {
+		display: flex;
+		align-items: center;
+		gap: 10px;
+		padding: 12px 16px;
+		border-bottom: 1px solid var(--line);
+		flex: 0 0 auto;
+	}
+
+	h2 {
+		font-size: 15px;
+		margin: 0;
+	}
+
+	.thinking {
+		font-size: 12px;
+		color: var(--ink-soft);
+	}
+
+	.spacer {
+		flex: 1;
+	}
+
+	.saved {
+		font-size: 12px;
+		color: var(--ok);
+		white-space: nowrap;
+	}
+
+	.saved.working {
+		color: var(--ink-soft);
+	}
+
+	.saved.adrift {
+		color: var(--warn);
+		font-weight: 600;
+	}
+
+	.scroll {
+		flex: 1;
+		overflow-y: auto;
+		padding: 16px;
+		display: flex;
+		flex-direction: column;
+		gap: 12px;
+	}
+
+	.intro {
+		color: var(--ink-soft);
+		font-size: 14px;
+	}
+
+	.start {
+		display: block;
+		margin: 14px 0 10px;
+		background: var(--accent);
+		color: #fff;
+		border: 0;
+		border-radius: 8px;
+		padding: 10px 18px;
+		font-weight: 600;
+		font-size: 14px;
+	}
+
+	.start:disabled {
+		opacity: 0.45;
+		cursor: default;
+	}
+
+	.hint {
+		font-size: 13px;
+		margin: 0;
+	}
+
+	.options {
+		display: flex;
+		flex-direction: column;
+		align-items: flex-start;
+		gap: 6px;
+		margin-top: 2px;
+	}
+
+	.option {
+		display: flex;
+		align-items: center;
+		gap: 8px;
+		max-width: 85%;
+		text-align: left;
+		background: var(--bg);
+		border: 1px solid var(--line);
+		border-radius: 10px;
+		padding: 8px 12px;
+		font-size: 13.5px;
+	}
+
+	.option:hover {
+		border-color: var(--accent);
+	}
+
+	.option.recommended {
+		border-color: var(--accent);
+		background: var(--accent-soft);
+	}
+
+	.tag {
+		font-size: 10px;
+		font-weight: 700;
+		text-transform: uppercase;
+		letter-spacing: 0.04em;
+		color: var(--ok);
+		white-space: nowrap;
+	}
+
+	.own {
+		font-size: 12.5px;
+		color: var(--ink-soft);
+		margin: 2px 0 0;
+	}
+
+	.pending {
+		padding: 0 16px 10px;
+		flex: 0 0 auto;
+	}
+
+	.pending-label {
+		display: block;
+		font-size: 11.5px;
+		text-transform: uppercase;
+		letter-spacing: 0.04em;
+		color: var(--warn);
+		margin-bottom: 6px;
+	}
+
+	.turn {
+		display: flex;
+	}
+
+	.turn.user {
+		justify-content: flex-end;
+	}
+
+	.bubble {
+		max-width: 85%;
+		padding: 9px 12px;
+		border-radius: 12px;
+		white-space: pre-wrap;
+		overflow-wrap: anywhere;
+		font-size: 14px;
+	}
+
+	.turn.assistant .bubble {
+		background: var(--bg);
+		border: 1px solid var(--line);
+		border-bottom-left-radius: 4px;
+	}
+
+	.turn.user .bubble {
+		background: var(--accent);
+		color: #fff;
+		border-bottom-right-radius: 4px;
+	}
+
+	.cursor {
+		opacity: 0.4;
+	}
+
+	.chips {
+		display: flex;
+		flex-wrap: wrap;
+		gap: 6px;
+	}
+
+	.chip {
+		background: var(--warn-soft);
+		border: 1px solid #eddcb8;
+		color: #6f4a0d;
+		border-radius: 14px;
+		padding: 5px 11px;
+		font-size: 12.5px;
+		text-align: left;
+	}
+
+	.chip:hover:not(:disabled) {
+		border-color: var(--warn);
+	}
+
+	.composer {
+		display: flex;
+		gap: 8px;
+		padding: 12px 16px;
+		border-top: 1px solid var(--line);
+		flex: 0 0 auto;
+	}
+
+	textarea {
+		flex: 1;
+		resize: none;
+		font: inherit;
+		padding: 8px 10px;
+		border: 1px solid var(--line);
+		border-radius: 8px;
+	}
+
+	textarea:focus {
+		outline: 2px solid var(--accent);
+		outline-offset: -1px;
+	}
+
+	.send {
+		align-self: flex-end;
+		background: var(--accent);
+		color: #fff;
+		border: 0;
+		border-radius: 8px;
+		padding: 9px 16px;
+		font-weight: 600;
+	}
+
+	.send:disabled {
+		opacity: 0.45;
+		cursor: default;
+	}
+
+	.error {
+		background: #fdecec;
+		border: 1px solid #f3c9c9;
+		color: #8c2020;
+		padding: 8px 10px;
+		border-radius: 7px;
+		font-size: 13px;
+	}
+</style>
