@@ -16,6 +16,7 @@ The invariant, enforced in code rather than in a prompt:
 ## Source
 
 - `src/lib/server/llm/questions.ts`
+- `src/lib/next-chapter.ts`
 - `src/lib/components/ChapterIndex.svelte`
 - `src/routes/projects/[id]/+page.server.ts`
 - `src/routes/projects/[id]/+page.svelte`
@@ -38,6 +39,39 @@ anything.
 #### Scenario: Detecting a question
 - **WHEN** the reply is written in any language the assistant works in
 - **THEN** detection keys on the question mark, which is common to all of them
+
+### Requirement: An invitation to move on is not an open question
+Reconciliation SHALL discard a question that names another chapter by its title, and SHALL
+complete a chapter when such questions were all that kept it open.
+
+#### Scenario: The finished chapter's reply suggests the next one
+- **WHEN** the reply says the chapter is done and asks "shall we look at Users and roles
+  next?", and the assessor files that question with a status of in progress
+- **THEN** the chapter is stored complete with nothing open, because nothing about it was
+  left to answer and no later turn would ever clear the question
+
+#### Scenario: A real question sits beside the invitation
+- **WHEN** the reply also asks something about this chapter
+- **THEN** that question is kept and the chapter stays in progress
+
+#### Scenario: The concept, not the chapter
+- **WHEN** a question uses a chapter's title in lower case, as in "which users and roles can
+  see a booking?"
+- **THEN** it is kept, because a chapter is named as a title and a concept is not
+
+### Requirement: The application offers the next chapter
+When the active chapter displays complete with nothing open, the chat SHALL offer the first
+unfinished chapter after it in reading order, wrapping to the start, skipping chapters set
+aside and chapters split into sections.
+
+#### Scenario: A chapter is finished
+- **WHEN** its status turns complete
+- **THEN** the chat offers the next unfinished chapter by name, because the choice is a rule
+  and leaving it to the assistant produced a question that kept the chapter open
+
+#### Scenario: Every chapter is finished
+- **WHEN** nothing is left unfinished
+- **THEN** the chat offers the whole-document review instead
 
 ### Requirement: A chapter resting on unconfirmed assumptions is not complete
 Displayed status SHALL be derived from the stored verdict together with the state of the

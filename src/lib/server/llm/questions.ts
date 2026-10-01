@@ -114,26 +114,52 @@ export function questionsInReply(reply: string): string[] {
 }
 
 /**
+ * True when the question names one of the given chapter titles.
+ *
+ * Case-sensitive on purpose: "Shall we look at Users and roles next?" refers to
+ * the chapter, "which users and roles can see this?" asks about the concept and
+ * is a real question for this chapter. A title is written as a title.
+ */
+export function namesChapter(question: string, titles: string[]): boolean {
+	return titles.some((title) => {
+		const phrase = title.trim().replace(/[.*+?^${}()|[\]\\]/g, '\\$&').replace(/\s+/g, '\\s+');
+		return phrase.length > 0 && new RegExp(`(?<![\\p{L}\\p{N}])${phrase}(?![\\p{L}\\p{N}])`, 'u').test(question);
+	});
+}
+
+/**
  * Reconcile the assessor's verdict with what the agent actually said.
  *
  * The assessor's own wording wins when it supplies questions; the reply is the
  * fallback, so a hanging question is never silently dropped.
+ *
+ * Except one kind. A finished chapter's reply tended to end "shall we look at
+ * Users and roles next?", the assessor dutifully filed it, and the invitation
+ * became an open question that kept the chapter in progress for good — nothing
+ * about the chapter was left to answer, so no later turn would clear it. A
+ * question naming another chapter is navigation, not something left to decide
+ * here. When it was the only thing keeping the chapter open, the chapter is
+ * complete: nothing is left to ask.
  */
 export function reconcileAssessment(
 	assessment: Assessment | null,
-	reply: string
+	reply: string,
+	otherChapterTitles: string[] = []
 ): Assessment | null {
-	const asked = questionsInReply(reply);
+	const isNavigation = (q: string) => namesChapter(q, otherChapterTitles);
+	const asked = questionsInReply(reply).filter((q) => !isNavigation(q));
 
 	if (!assessment) {
 		return asked.length ? { status: 'in_progress', openQuestions: asked } : null;
 	}
 
-	const openQuestions = assessment.openQuestions.length ? assessment.openQuestions : asked;
-	const status =
-		openQuestions.length > 0 && assessment.status === 'complete'
-			? 'in_progress'
-			: assessment.status;
+	const filed = assessment.openQuestions.filter((q) => !isNavigation(q));
+	const onlyNavigation = assessment.openQuestions.length > 0 && filed.length === 0;
+	const openQuestions = filed.length ? filed : asked;
+
+	let status = assessment.status;
+	if (openQuestions.length > 0 && status === 'complete') status = 'in_progress';
+	else if (openQuestions.length === 0 && onlyNavigation && status === 'in_progress') status = 'complete';
 
 	return { status, openQuestions };
 }

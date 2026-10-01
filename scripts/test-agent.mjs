@@ -13,7 +13,13 @@
  *
  *   npm test
  */
-import { parseOptions, questionsInReply, reconcileAssessment } from '../src/lib/server/llm/questions.ts';
+import {
+	namesChapter,
+	parseOptions,
+	questionsInReply,
+	reconcileAssessment
+} from '../src/lib/server/llm/questions.ts';
+import { nextChapter } from '../src/lib/next-chapter.ts';
 import { ChapterStreamParser } from '../src/lib/server/llm/blocks.ts';
 import {
 	nextRef,
@@ -163,6 +169,78 @@ check(
 );
 
 check('assessment call failed, nothing asked — no state change', reconcileAssessment(null, 'All done.'), null);
+
+console.log('\n--- an invitation to move on is not an open question ---');
+
+const others = ['Overview', 'Users and roles', 'What the application does', 'Security'];
+const movedOn = 'That covers everything this chapter needs. Shall we look at Users and roles next?';
+
+check(
+	'THE BUG: assessor filed the invitation and kept the chapter open',
+	reconcileAssessment(
+		{ status: 'in_progress', openQuestions: ['Shall we look at Users and roles next?'] },
+		movedOn,
+		others
+	),
+	{ status: 'complete', openQuestions: [] }
+);
+
+check(
+	'assessor says complete, reply only invites — the question is not extracted',
+	reconcileAssessment({ status: 'complete', openQuestions: [] }, movedOn, others),
+	{ status: 'complete', openQuestions: [] }
+);
+
+check(
+	'a real question beside the invitation still keeps the chapter open',
+	reconcileAssessment(
+		{ status: 'complete', openQuestions: [] },
+		'Nearly there. Who approves a booking? After that, shall we look at Security?',
+		others
+	),
+	{ status: 'in_progress', openQuestions: ['Who approves a booking?'] }
+);
+
+check(
+	'the concept in lower case is a real question, not a chapter name',
+	reconcileAssessment(
+		{ status: 'complete', openQuestions: ['Which users and roles can see a booking?'] },
+		'',
+		others
+	),
+	{ status: 'in_progress', openQuestions: ['Which users and roles can see a booking?'] }
+);
+
+check(
+	'unmet criteria with no questions stay in progress',
+	reconcileAssessment({ status: 'in_progress', openQuestions: [] }, movedOn, others),
+	{ status: 'in_progress', openQuestions: [] }
+);
+
+check('a title inside a longer word is not a match', namesChapter('Is it Overviewed?', others), false);
+check('a title across a line break still matches', namesChapter('Open What the\napplication does?', others), true);
+
+console.log('\n--- the chapter offered next ---');
+
+const index = [
+	{ key: 'overview', title: 'Overview', status: 'complete' },
+	{ key: 'users', title: 'Users and roles', status: 'complete' },
+	{ key: 'features', title: 'What the application does', status: 'in_progress' },
+	{ key: 'booking', title: 'Booking a car', status: 'empty', parent_key: 'features' },
+	{ key: 'blocking', title: 'Blocking a car', status: 'complete', parent_key: 'features' },
+	{ key: 'telemetry', title: 'Telemetry', status: 'empty', applicable: false },
+	{ key: 'security', title: 'Security', status: 'in_progress' }
+];
+
+check('skips finished chapters and the split container', nextChapter(index, 'users')?.key, 'booking');
+check('skips a chapter set aside', nextChapter(index, 'booking')?.key, 'security');
+check('wraps round to the start', nextChapter(index, 'security')?.key, 'booking');
+check('from the whole document, the first unfinished one', nextChapter(index, null)?.key, 'booking');
+check(
+	'nothing left — none offered',
+	nextChapter(index.map((c) => ({ ...c, status: 'complete' })), 'overview'),
+	null
+);
 
 console.log('\n--- answers offered alongside a question ---');
 

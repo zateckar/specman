@@ -92,6 +92,12 @@ documents written under the earlier rule.
 - **THEN** the boot sequence files the prose into those sections on the same terms as a
   split performed today
 
+#### Scenario: A reconciliation rule changes
+- **WHEN** a chapter holds open questions that only invite the user to another chapter,
+  filed before reconciliation discarded them
+- **THEN** the boot sequence removes them, and completes a chapter left in progress with
+  nothing else open, on the same terms as a turn reconciled today
+
 ### Requirement: A migration that changes a document reaches the repository
 Any document rewritten by a startup migration SHALL be written out and committed to its
 application's repository.

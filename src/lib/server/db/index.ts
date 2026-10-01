@@ -8,6 +8,7 @@ import { DEFAULT_STANDARDS } from './default-standards';
 import { chapterApplies, reasonForSkipping, toProfile, type Profile } from '../llm/profile';
 import { arrangeChapters, distributeContent, reconcileSections } from '../llm/subchapters';
 import { nextRef } from '../llm/requirements';
+import { namesChapter } from '../llm/questions';
 import type {
 	AnswerOption,
 	Chapter,
@@ -70,6 +71,7 @@ export function db(): DatabaseSync {
 	backfillGoals(instance);
 	backfillUserOrigins(instance);
 	backfillSectionContent(instance);
+	backfillNavigationQuestions(instance);
 
 	return instance;
 }
@@ -163,24 +165,67 @@ function backfillSectionContent(database: DatabaseSync): void {
 
 	for (const parent of parents) {
 		const moved = distributeSectionContent(parent.project_id, parent.key);
-		if (moved.filled.length > 0 && !migrated.includes(parent.project_id)) {
-			migrated.push(parent.project_id);
-		}
+		if (moved.filled.length > 0) noteMigrated(parent.project_id, 'Move the chapter into its sub-chapters');
 	}
 }
 
 /**
- * Projects whose prose the startup backfill moved.
+ * Invitations to move on, filed as open questions before reconciliation knew
+ * to discard them.
+ *
+ * A finished chapter's last reply suggested the next one as a question, and
+ * that question kept the chapter in progress for good: nothing about the
+ * chapter was left to answer, so no later turn would ever clear it. Fixing the
+ * reconciliation fixes new turns only. A chapter whose every open question was
+ * such an invitation was finished in the agent's own judgement, so it is
+ * completed; one with real questions besides keeps them and its status.
+ */
+function backfillNavigationQuestions(database: DatabaseSync): void {
+	const rows = database
+		.prepare(
+			`SELECT project_id, key, title, status, open_questions FROM chapters
+			  ORDER BY project_id`
+		)
+		.all() as Array<{ project_id: number; key: string; title: string; status: string; open_questions: string }>;
+
+	const update = database.prepare(
+		'UPDATE chapters SET status = ?, open_questions = ? WHERE project_id = ? AND key = ?'
+	);
+
+	for (const row of rows) {
+		const questions = parseJson<string[]>(row.open_questions, []);
+		if (questions.length === 0) continue;
+
+		const others = rows
+			.filter((c) => c.project_id === row.project_id && c.key !== row.key)
+			.map((c) => c.title);
+		const kept = questions.filter((q) => !namesChapter(q, others));
+		if (kept.length === questions.length) continue;
+
+		const status = kept.length === 0 && row.status === 'in_progress' ? 'complete' : row.status;
+		update.run(status, JSON.stringify(kept), row.project_id, row.key);
+		noteMigrated(row.project_id, 'Drop invitations to move on from open questions');
+	}
+}
+
+/**
+ * Projects a startup backfill rewrote, with what it did to each.
  *
  * The migration changes the database; the document also lives in a repository,
  * and until it is written there the two disagree — a user approving in that window
  * would merge a document whose sections still read "not written yet". Committing
  * is not this module's job, so the list is handed to whoever boots the server.
  */
-const migrated: number[] = [];
+const migrated = new Map<number, string[]>();
 
-export function projectsMigratedAtStartup(): number[] {
-	return [...migrated];
+function noteMigrated(projectId: number, what: string): void {
+	const done = migrated.get(projectId) ?? [];
+	if (!done.includes(what)) done.push(what);
+	migrated.set(projectId, done);
+}
+
+export function projectsMigratedAtStartup(): Array<{ projectId: number; summary: string }> {
+	return [...migrated].map(([projectId, done]) => ({ projectId, summary: done.join('; ') }));
 }
 
 /**

@@ -409,23 +409,23 @@ export class UnrecordedChanges extends Error {
 /**
  * Write out any document the startup migration rewrote.
  *
- * The migration moves prose between chapters in the database; the repository is
- * where the document is read from and merged, so it has to be told. Committing
- * the same content twice is a no-op — `commitAll` returns null when the tree is
+ * The migration rewrites chapters in the database; the repository is where the
+ * document is read from and merged, so it has to be told. Committing the same
+ * content twice is a no-op — `commitAll` returns null when the tree is
  * unchanged — so this is safe on every boot.
  */
 export async function commitStartupMigrations(): Promise<void> {
-	for (const id of projectsMigratedAtStartup()) {
-		const project = getProject(id);
+	for (const { projectId, summary } of projectsMigratedAtStartup()) {
+		const project = getProject(projectId);
 		if (!project) continue;
 
 		try {
-			const commit = await commitDocument(project, 'Move the chapter into its sub-chapters');
-			if (commit) console.info(`[proposals] recorded the migrated split for ${project.name}`);
+			const commit = await commitDocument(project, summary);
+			if (commit) console.info(`[proposals] recorded the startup migration for ${project.name}: ${summary}`);
 		} catch (cause) {
 			// The next conversation turn writes the document out anyway, so a failure
 			// here delays the repository catching up rather than losing anything.
-			console.error(`[proposals] could not record the migrated split for ${project.name}:`, cause);
+			console.error(`[proposals] could not record the startup migration for ${project.name}:`, cause);
 		}
 	}
 }

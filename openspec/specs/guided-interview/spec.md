@@ -141,6 +141,12 @@ The assistant SHALL ask only about the chapter in scope.
 - **THEN** it is not pursued as a question here, because answering adds the exchange to this
   chapter's conversation
 
+#### Scenario: The chapter is finished
+- **WHEN** every criterion is met and nothing is left to ask
+- **THEN** the assistant says so in one sentence and neither asks anything nor suggests
+  another chapter, because the application offers the next one and a suggestion phrased as a
+  question was filed as this chapter's open question
+
 ### Requirement: Each scope owns its conversation
 Messages SHALL be stored against the chapter they belong to, with the whole-document
 conversation stored against no chapter.

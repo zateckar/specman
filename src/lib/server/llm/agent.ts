@@ -326,8 +326,9 @@ ${active.open_questions.map((q) => `- ${q}`).join('\n') || '(nothing recorded)'}
    this conversation to ...". Switching chapters is the user's to do, by clicking
    the index.
 
-4. If this chapter is finished, your ENTIRE reply is one sentence saying so, plus
-   the chapter you suggest they open next. Ask nothing further.
+4. If this chapter is finished, your ENTIRE reply is one sentence saying so.
+   Ask nothing, and do not suggest another chapter — the application offers the
+   next one itself, and a question here keeps this chapter from completing.
 
 Write the blocks first, then your short reply. A status of "complete" is not
 final — new information reopens the chapter.`
@@ -407,7 +408,11 @@ person. Do not restate chapter content in them.
 Record ONLY questions about "${args.chapter.title}" as described under Purpose
 above. The assistant sometimes drifts and asks about a different part of the
 document; discard those rather than filing them here. If every question it asked
-belongs to another chapter, return an empty list.`;
+belongs to another chapter, return an empty list.
+
+An invitation to move on — "shall we look at another chapter next?" — is not an
+open question, does not count as asking the user anything, and does not keep
+this chapter in progress.`;
 
 	const recentTurns = args.conversation.slice(-6);
 

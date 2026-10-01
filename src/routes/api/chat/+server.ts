@@ -258,7 +258,11 @@ export const POST: RequestHandler = async ({ request, locals }) => {
 								conversation: [...conversation, { role: 'assistant', content: reply.trim() }],
 								latestReply: reply
 							}),
-							reply
+							reply,
+							// Read now, not at the start of the turn: a split this turn adds titles.
+							projectChapters(project.id)
+								.filter((c) => c.key !== assessKey)
+								.map((c) => c.title)
 						);
 
 						if (assessment) {

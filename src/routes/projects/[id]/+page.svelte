@@ -3,6 +3,7 @@
 	import AgentChat from '$lib/components/AgentChat.svelte';
 	import ChapterIndex from '$lib/components/ChapterIndex.svelte';
 	import DocumentPreview from '$lib/components/DocumentPreview.svelte';
+	import { nextChapter } from '$lib/next-chapter';
 	import { readFrames } from '$lib/sse';
 
 	type Status = 'empty' | 'in_progress' | 'complete';
@@ -28,6 +29,9 @@
 	// Only the active chapter's questions are offered, because answering one adds
 	// the exchange to that chapter's conversation. The index carries the totals.
 	const openQuestions = $derived(active ? active.open_questions : []);
+	// Offered once the active chapter is done, so finishing one is not a dead end.
+	const finished = $derived(active?.status === 'complete' && openQuestions.length === 0);
+	const next = $derived(finished ? nextChapter(chapters, data.activeKey) : null);
 
 	function applyChapter(key: string, markdown: string) {
 		chapters = chapters.map((c) => (c.key === key ? { ...c, content_md: markdown } : c));
@@ -274,6 +278,8 @@
 			{saveState}
 			{errorMessage}
 			{openQuestions}
+			{finished}
+			next={next ? { key: next.key, title: next.title } : null}
 			onsend={runTurn}
 			onask={askQuestion}
 		/>

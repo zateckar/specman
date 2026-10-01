@@ -30,6 +30,8 @@
 		saveState = 'saved',
 		errorMessage = '',
 		openQuestions,
+		finished = false,
+		next = null,
 		onsend,
 		onask
 	}: {
@@ -45,6 +47,10 @@
 		saveState?: 'saved' | 'saving' | 'not-recorded';
 		errorMessage?: string;
 		openQuestions: string[];
+		/** This chapter is complete with nothing left to ask. */
+		finished?: boolean;
+		/** The chapter to offer next — chosen by the application, not the agent. */
+		next?: { key: string; title: string } | null;
 		onsend: (text: string) => void;
 		onask: (question: string) => void;
 	} = $props();
@@ -184,6 +190,15 @@
 					<button class="chip" onclick={() => onask(question)}>{question}</button>
 				{/each}
 			</div>
+		</div>
+	{:else if finished && !busy}
+		<div class="finished">
+			<span class="finished-label">This chapter is complete.</span>
+			{#if next}
+				<a class="next" href="/projects/{projectId}?chapter={next.key}">Continue with {next.title} →</a>
+			{:else}
+				<a class="next" href="/projects/{projectId}">Every chapter is complete — review the whole document →</a>
+			{/if}
 		</div>
 	{/if}
 
@@ -340,6 +355,30 @@
 		letter-spacing: 0.04em;
 		color: var(--warn);
 		margin-bottom: 6px;
+	}
+
+	.finished {
+		display: flex;
+		flex-wrap: wrap;
+		align-items: center;
+		gap: 6px 12px;
+		padding: 0 16px 10px;
+		flex: 0 0 auto;
+	}
+
+	.finished-label {
+		font-size: 12.5px;
+		color: var(--ok);
+	}
+
+	.next {
+		background: var(--accent);
+		color: #fff;
+		border-radius: 8px;
+		padding: 7px 14px;
+		font-size: 13px;
+		font-weight: 600;
+		text-decoration: none;
 	}
 
 	.turn {
