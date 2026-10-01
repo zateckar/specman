@@ -20,6 +20,12 @@ import {
 	reconcileAssessment
 } from '../src/lib/server/llm/questions.ts';
 import { nextChapter } from '../src/lib/next-chapter.ts';
+import {
+	defaultSpokenLanguage,
+	describeDictationError,
+	joinDictation,
+	spokenText
+} from '../src/lib/dictation.ts';
 import { ChapterStreamParser } from '../src/lib/server/llm/blocks.ts';
 import {
 	nextRef,
@@ -241,6 +247,27 @@ check(
 	nextChapter(index.map((c) => ({ ...c, status: 'complete' })), 'overview'),
 	null
 );
+
+console.log('\n--- speaking an answer ---');
+
+check(
+	'final and provisional segments read as one answer',
+	spokenText([
+		{ transcript: 'The fleet office', isFinal: true },
+		{ transcript: ' approves  every booking', isFinal: false }
+	]),
+	'The fleet office approves every booking'
+);
+check('nothing heard yet', spokenText([]), '');
+check('speech follows what was typed', joinDictation('Mostly email.', 'Sometimes Teams'), 'Mostly email. Sometimes Teams');
+check('no doubled space after a trailing one', joinDictation('Mostly email. ', 'Teams'), 'Mostly email. Teams');
+check('an empty box takes the speech as it is', joinDictation('  ', 'Teams'), 'Teams');
+check('silence leaves the typed text alone', joinDictation('Mostly email.', ''), 'Mostly email.');
+check('a Czech browser starts in Czech', defaultSpokenLanguage(['cs', 'en-US']), 'cs-CZ');
+check('a British browser starts in English', defaultSpokenLanguage(['en-GB']), 'en-US');
+check('an unknown language falls back to the first offered', defaultSpokenLanguage(['ja-JP']), 'cs-CZ');
+check('silence is not an error', describeDictationError('no-speech'), '');
+check('a blocked microphone says how to fix it', describeDictationError('not-allowed').includes('Allow it'), true);
 
 console.log('\n--- answers offered alongside a question ---');
 

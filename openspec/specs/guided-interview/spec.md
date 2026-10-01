@@ -19,6 +19,8 @@ usable content.
 - `src/routes/api/ask/+server.ts`
 - `src/routes/api/presence/+server.ts`
 - `src/lib/components/AgentChat.svelte`
+- `src/lib/components/Dictation.svelte`
+- `src/lib/dictation.ts`
 
 ## Requirements
 
@@ -174,6 +176,37 @@ recommended, and typing an answer SHALL always remain available.
 #### Scenario: The page is reloaded
 - **WHEN** suggested answers were offered on the last reply
 - **THEN** they are still there, because they are stored on the message
+
+### Requirement: An answer may be spoken
+Where the browser can transcribe speech, the chat SHALL offer a microphone that writes what
+was heard into the answer box, after anything already typed, and SHALL send nothing until
+the user presses Send.
+
+#### Scenario: Speaking an answer
+- **WHEN** the user presses the microphone and talks
+- **THEN** the words appear in the answer box as they are recognised, and the box cannot be
+  typed into until listening stops, because the recogniser rewrites it as it revises what it
+  heard
+
+#### Scenario: The answer is sent mid-sentence
+- **WHEN** the user presses Send, picks an offered answer, or a turn starts while listening
+- **THEN** listening stops at once and nothing heard afterwards reaches the box
+
+#### Scenario: Where the recording goes
+- **WHEN** the browser can transcribe the chosen language on the device, downloading it on
+  first use if needed
+- **THEN** it is transcribed there; otherwise the browser's online service is used and the
+  status line says so for as long as it listens, because that recording leaves the company
+  and the user is the one who decides whether to speak
+
+#### Scenario: A browser without speech recognition
+- **WHEN** the browser offers no speech recognition
+- **THEN** no microphone is shown, rather than a control that can only fail
+
+#### Scenario: The microphone is blocked
+- **WHEN** permission is refused
+- **THEN** the user is told how to allow it, and silence on its own is not reported as an
+  error
 
 ### Requirement: A chapter is opened deliberately
 An untouched chapter SHALL offer an explicit way to start it.

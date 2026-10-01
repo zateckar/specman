@@ -1,4 +1,6 @@
 <script lang="ts">
+	import Dictation from './Dictation.svelte';
+
 	interface AnswerOption {
 		label: string;
 		recommended: boolean;
@@ -57,6 +59,9 @@
 
 	let input = $state('');
 	let scroller: HTMLDivElement | undefined = $state();
+	let dictation: Dictation | undefined = $state();
+	let listening = $state(false);
+	let dictationStatus = $state('');
 
 	// Follow the reply as it streams, and land at the bottom on a chapter switch.
 	$effect(() => {
@@ -81,6 +86,8 @@
 
 	function send(text: string) {
 		if (!text.trim() || busy) return;
+		// What is on screen is what is sent; nothing heard after this point lands.
+		dictation?.cancel();
 		input = '';
 		onsend(text);
 	}
@@ -203,14 +210,29 @@
 	{/if}
 
 	<div class="composer">
-		<textarea
-			bind:value={input}
-			onkeydown={onKeydown}
-			placeholder="Type your answer…"
-			rows="2"
-			disabled={busy}
-		></textarea>
-		<button class="send" onclick={() => send(input)} disabled={busy || !input.trim()}>Send</button>
+		<div class="row">
+			<!-- Read-only while listening: the recogniser rewrites the box as it revises
+			     what it heard, and would overwrite anything typed in the meantime. -->
+			<textarea
+				bind:value={input}
+				onkeydown={onKeydown}
+				placeholder={listening ? 'Listening…' : 'Type your answer…'}
+				rows="2"
+				disabled={busy}
+				readonly={listening}
+			></textarea>
+			<Dictation
+				bind:this={dictation}
+				bind:value={input}
+				bind:listening
+				bind:status={dictationStatus}
+				disabled={busy}
+			/>
+			<button class="send" onclick={() => send(input)} disabled={busy || !input.trim()}>Send</button>
+		</div>
+		{#if dictationStatus}
+			<p class="dictation-status" class:live={listening} role="status">{dictationStatus}</p>
+		{/if}
 	</div>
 </section>
 
@@ -435,11 +457,24 @@
 	}
 
 	.composer {
-		display: flex;
-		gap: 8px;
 		padding: 12px 16px;
 		border-top: 1px solid var(--line);
 		flex: 0 0 auto;
+	}
+
+	.row {
+		display: flex;
+		gap: 8px;
+	}
+
+	.dictation-status {
+		margin: 6px 0 0;
+		font-size: 12px;
+		color: var(--ink-soft);
+	}
+
+	.dictation-status.live {
+		color: #b02a2a;
 	}
 
 	textarea {
