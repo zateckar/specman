@@ -95,6 +95,11 @@ its children's.
 - **WHEN** totals are computed
 - **THEN** the container is not counted alongside its sections
 
+#### Scenario: Every counted chapter is complete
+- **WHEN** each chapter that counts is complete and nothing is open
+- **THEN** the index says everything is answered — compared against what is counted, because
+  compared against every chapter, set-aside and split ones included, it never could
+
 ### Requirement: The index updates as a turn streams
 Status and open-question changes SHALL reach the index during the turn rather than only on
 the next page load.

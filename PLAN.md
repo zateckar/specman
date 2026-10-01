@@ -162,6 +162,15 @@ This plan has recorded three near-identical failures — a column added and neve
 a condition added and never backfilled, an arrangement changed and never backfilled — each
 one a rule that existed only in somebody's memory of it.
 
+A second one, from the review of 2026-10-01: **a failure stored as a result is worse than no
+result.** The same shape turned up four times. A diagram that failed to draw was saved as the
+application's diagram. A discarded assumption was deleted with nothing asking what should
+replace it. A
+repository that could not be created left an application that failed on every turn. A boot
+repair run on every start mistook new questions for the old defect and deleted them. In each
+case the code took the path a success would have taken, with nothing in hand. Wherever work
+can fail, ask what is *stored* when it does.
+
 ## Where to go next
 
 Nothing in this plan is outstanding. These are the gaps, and each is a candidate for the
@@ -173,6 +182,7 @@ first folder under `openspec/changes/`:
 - **Streaming the verification run** if the ~80-second request proves too long behind a
   proxy.
 - **Deleting a project** — currently only possible from the database and `data/repos/`.
+  `deleteProject` exists, but only to undo a creation whose repository could not be made.
 - **Importing an ArchiMate file back.** The export is one-way: a model edited in Archi cannot
   be brought back in, and the next *Draw again* would overwrite it in any case.
 
@@ -227,6 +237,17 @@ first folder under `openspec/changes/`:
   unable to sign in. Two of the three values are recoverable from a stored row and are
   backfilled; a gateway account is not, so it is recorded the next time that person arrives.
   An account that has not arrived since the column was added still reads as unknown.
+- **Sign-in throttling is kept in memory.** Failed password attempts are counted per address
+  and name in `llm/attempts.ts`, so a restart forgets them and a second process keeps its own
+  count — the same one-process limit as the repository lock. They are keyed on the name as
+  well as the address, because behind the company proxy many people share one address and one
+  person's typos must not lock out the rest.
+- **Every signed-in colleague can open every application.** By design — the documents are
+  shared within the organisation, and `access-control` says so — but there is no per-
+  application membership. If documents ever need to be private to a team, that is a new
+  capability, not a setting.
+- **Unsent answers live in the browser tab.** A draft survives switching chapters, not a
+  reload or a second tab.
 
 ---
 

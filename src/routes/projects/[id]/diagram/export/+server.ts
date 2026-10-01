@@ -20,7 +20,11 @@ export const GET: RequestHandler = async ({ params, locals }) => {
 	if (!project) throw error(404, 'No such application');
 
 	const stored = latestArchitecture(project.id);
-	if (!stored) throw error(404, 'No diagram has been drawn for this application yet');
+	// An empty model is no diagram: a file with no elements in it would open in
+	// a modelling tool as a blank view, which reads as "nothing is there".
+	if (!stored || (stored.elements as unknown[]).length === 0) {
+		throw error(404, 'No diagram has been drawn for this application yet');
+	}
 
 	const model = {
 		elements: stored.elements as Parameters<typeof toOpenExchange>[0]['elements'],

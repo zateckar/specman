@@ -168,9 +168,17 @@ function renderAgents(
 ): string {
 	const { project, requirements, decisions, problems } = input;
 	const errors = problems.filter((p) => p.severity === 'error');
-	const now = requirements.filter((r) => r.scope === 'now');
-	const assumed = decisions.filter((d) => d.source !== 'user' && d.status !== 'confirmed');
-	const openQuestions = chapters.reduce((sum, c) => sum + c.open_questions.length, 0);
+	// Counted over the chapters that apply. A set-aside chapter is rendered as
+	// "nothing in this area needs building", and counting its rules here as well
+	// told the reader the opposite on the first page.
+	const applies = new Set(chapters.filter((c) => c.applicable !== 0).map((c) => c.key));
+	const now = requirements.filter((r) => r.scope === 'now' && applies.has(r.chapter_key));
+	const assumed = decisions.filter(
+		(d) => d.source !== 'user' && d.status !== 'confirmed' && applies.has(d.chapter_key)
+	);
+	const openQuestions = chapters
+		.filter((c) => applies.has(c.key))
+		.reduce((sum, c) => sum + c.open_questions.length, 0);
 
 	const lines: string[] = [
 		`# ${project.name}`,

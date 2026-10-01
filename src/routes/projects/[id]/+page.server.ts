@@ -1,4 +1,4 @@
-import { error } from '@sveltejs/kit';
+import { error, fail } from '@sveltejs/kit';
 import {
 	getProject,
 	projectChapters,
@@ -8,9 +8,35 @@ import {
 } from '$lib/server/db';
 import { effectiveStatus, pendingByChapter } from '$lib/server/llm/decisions';
 import { validateDocument } from '$lib/server/llm/validation';
-import { openProposal, proposalDiff, reviewRevision } from '$lib/server/proposals';
+import { includeChapter, openProposal, proposalDiff, reviewRevision } from '$lib/server/proposals';
 import { stripChapterHeading } from '$lib/server/markdown';
-import type { PageServerLoad } from './$types';
+import type { Actions, PageServerLoad } from './$types';
+
+export const actions: Actions = {
+	/** The user overrules the triage: this chapter does apply after all. */
+	include: async ({ params, request, locals }) => {
+		if (!locals.user) throw error(401, 'Not signed in');
+		const project = getProject(Number(params.id));
+		if (!project) throw error(404, 'No such application');
+
+		const key = String((await request.formData()).get('key') ?? '');
+		if (!projectChapters(project.id).some((c) => c.key === key)) {
+			return fail(400, { message: 'That chapter is no longer there.' });
+		}
+		try {
+			await includeChapter(project, key);
+		} catch (cause) {
+			console.error('[projects] could not include a chapter:', cause);
+			// No model is involved and nothing the user wrote is at stake, so the
+			// assistant's failure wording does not fit.
+			const conflict = cause instanceof Error && cause.name === 'DocumentConflict';
+			return fail(409, {
+				message: conflict ? cause.message : 'The chapter could not be included just now. Try again in a minute.'
+			});
+		}
+		return { included: key };
+	}
+};
 
 export const load: PageServerLoad = async ({ params, url }) => {
 	const project = getProject(Number(params.id));
@@ -72,7 +98,8 @@ export const load: PageServerLoad = async ({ params, url }) => {
 			// A chapter set aside is not unfinished — it was never in scope.
 			chapters: chapters.filter((c) => c.applicable !== 0),
 			requirements,
-			decisions
+			decisions,
+			setAside: chapters.filter((c) => c.applicable === 0)
 		}),
 		activeKey: active,
 		messages: recentMessages(project.id, active, 50).map((m) => ({

@@ -1,4 +1,4 @@
-import { randomBytes, scryptSync, timingSafeEqual } from 'node:crypto';
+import { randomBytes, scrypt, scryptSync, timingSafeEqual } from 'node:crypto';
 import { db, countUsers, getUser, getUserByUsername } from '../db';
 import { config } from '../env';
 import { mayAssertIdentity, readForwardedIdentity } from '../llm/forwarded';
@@ -10,11 +10,25 @@ function hash(password: string, salt: string): string {
 	return scryptSync(password, salt, 64).toString('hex');
 }
 
-export function verifyPassword(password: string, salt: string, expected: string): boolean {
-	const actual = Buffer.from(hash(password, salt), 'hex');
+/**
+ * The same hash off the event loop. A sign-in is the one place an
+ * unauthenticated caller makes the server run scrypt, and the synchronous form
+ * stalls every other request for as long as it takes.
+ */
+function hashAsync(password: string, salt: string): Promise<Buffer> {
+	return new Promise((resolve, reject) => {
+		scrypt(password, salt, 64, (error, key) => (error ? reject(error) : resolve(key)));
+	});
+}
+
+export async function verifyPassword(password: string, salt: string, expected: string): Promise<boolean> {
+	const actual = await hashAsync(password, salt);
 	const target = Buffer.from(expected, 'hex');
 	return actual.length === target.length && timingSafeEqual(actual, target);
 }
+
+/** Hashed for a name that has no password, so its answer takes as long as a wrong one. */
+const DECOY = { salt: randomBytes(16).toString('hex'), hash: randomBytes(64).toString('hex') };
 
 export function createUser(args: {
 	username: string;
@@ -55,10 +69,19 @@ export function bootstrapAdmin(): void {
 	console.info('[auth] created initial admin account "admin"');
 }
 
-export function login(username: string, password: string): User | null {
+/**
+ * The account a name and password sign in to, or null.
+ *
+ * An unknown name, or one with no password, still costs a full hash. Answering
+ * those at once would tell anyone timing the reply which names exist.
+ */
+export async function login(username: string, password: string): Promise<User | null> {
 	const user = getUserByUsername(username);
-	if (!user?.password_hash || !user.password_salt) return null;
-	if (!verifyPassword(password, user.password_salt, user.password_hash)) return null;
+	if (!user?.password_hash || !user.password_salt) {
+		await verifyPassword(password, DECOY.salt, DECOY.hash);
+		return null;
+	}
+	if (!(await verifyPassword(password, user.password_salt, user.password_hash))) return null;
 	return user;
 }
 
@@ -126,8 +149,9 @@ export const SESSION_COOKIE = 'specman_session';
  * rule against.
  *
  * Returns null whenever the request asserts nothing, is not allowed to assert
- * it, or names an account that signs in with a password — a proxy header is a
- * string the caller chose, and a matching name is not proof of anything.
+ * it, or names an account that signs in another way — with a password or through
+ * company sign-in. A proxy header is a string the caller chose, and a matching
+ * name is not proof of anything.
  */
 export function userForProxyHeaders(
 	header: (name: string) => string | null,
@@ -147,9 +171,13 @@ export function userForProxyHeaders(
 	}
 
 	const local = db()
-		.prepare('SELECT id, password_hash, created_via FROM users WHERE username = ?')
+		.prepare(
+			`SELECT id, password_hash, created_via,
+			        EXISTS (SELECT 1 FROM oidc_identities o WHERE o.user_id = users.id) AS linked
+			   FROM users WHERE username = ?`
+		)
 		.get(identity.username) as
-		| { id: number; password_hash: string | null; created_via: string }
+		| { id: number; password_hash: string | null; created_via: string; linked: number }
 		| undefined;
 
 	if (local?.password_hash) {
@@ -157,6 +185,16 @@ export function userForProxyHeaders(
 		// a password for. Otherwise a header naming "admin" is the whole system.
 		console.warn(
 			`[proxy-auth] refused "${identity.username}" — a local password account already uses that name`
+		);
+		return null;
+	}
+
+	if (local && (local.linked || local.created_via === 'oidc')) {
+		// The mirror of company sign-in refusing a proxy account's name: this
+		// account belongs to an issuer and subject, and a header carrying the same
+		// string is not that subject.
+		console.warn(
+			`[proxy-auth] refused "${identity.username}" — that name belongs to a company sign-in account`
 		);
 		return null;
 	}

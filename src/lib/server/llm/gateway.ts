@@ -176,6 +176,7 @@ export class GatewayProvider implements LlmProvider {
 		let servedBy = body.model;
 		let outputTokens = 0;
 		let completed = false;
+		let wrote = false;
 
 		const reader = response.body.getReader();
 		const decoder = new TextDecoder();
@@ -221,6 +222,7 @@ export class GatewayProvider implements LlmProvider {
 						} else if (event.type === 'content_block_delta') {
 							const delta = event.delta ?? {};
 							if (delta.type === 'text_delta' && delta.text) {
+								wrote = true;
 								yield { type: 'text', text: delta.text };
 							} else if (delta.type === 'thinking_delta' && delta.thinking) {
 								// Reasoning-model output — never surfaced to the user.
@@ -243,6 +245,12 @@ export class GatewayProvider implements LlmProvider {
 		}
 
 		if (!completed) throw new GatewayError('The gateway response ended before it was complete.', 200, '', false);
+		// Silence is a valid answer, but not silence that spent the whole budget: that
+		// is the model reasoning until it hit the ceiling, reported by a backend that
+		// does not say max_tokens. Accepting it let a starved check read as a clean one.
+		if (!wrote && outputTokens > 0 && outputTokens >= body.max_tokens) {
+			throw new GatewayError('The gateway ran out of room before completing its response.', 200, '', false);
+		}
 		console.info(`[llm] stream served by ${servedBy} (${outputTokens} output tokens)`);
 		yield { type: 'done', servedBy, outputTokens };
 	}

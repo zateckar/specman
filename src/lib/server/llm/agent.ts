@@ -350,15 +350,41 @@ document. You may still write chapters using the <chapter> block.`
 	return parts.join('\n\n---\n\n');
 }
 
+/** Stands in front of a conversation that opens with the assistant's question. */
+export const CONVERSATION_RESUMES = '(Continuing our conversation about this chapter.)';
+
+/**
+ * The stored transcript as the gateway will accept it.
+ *
+ * Three shapes the transcript can take that the API does not:
+ *  - It opens with the assistant. That is what clicking an open question does —
+ *    the question is stored as the assistant's turn and the answer follows — so
+ *    dropping leading assistant turns dropped the very question being answered.
+ *    A neutral user turn is put in front instead.
+ *  - An empty turn. A reply that was nothing but blocks has no words; an empty
+ *    text block is a hard 400 on Anthropic-shaped APIs.
+ *  - Two turns in a row from one side, after a turn that failed. They are joined.
+ */
 export function toChatMessages(
 	history: Array<{ role: 'user' | 'assistant'; content: string }>,
 	userMessage: string
 ): ChatMessage[] {
-	const messages: ChatMessage[] = history.map((m) => ({ role: m.role, content: m.content }));
-	messages.push({ role: 'user', content: userMessage });
+	return normaliseConversation([...history, { role: 'user', content: userMessage }]);
+}
+
+/** Any run of turns, shaped as `toChatMessages` describes. */
+export function normaliseConversation(turns: ChatMessage[]): ChatMessage[] {
+	const messages: ChatMessage[] = [];
+	for (const turn of turns) {
+		const content = String(turn.content ?? '').trim();
+		if (!content) continue;
+		const last = messages.at(-1);
+		if (last && last.role === turn.role) last.content = `${last.content}\n\n${content}`;
+		else messages.push({ role: turn.role, content });
+	}
 
 	// The gateway requires the conversation to start with a user turn.
-	while (messages.length && messages[0].role !== 'user') messages.shift();
+	if (messages[0]?.role === 'assistant') messages.unshift({ role: 'user', content: CONVERSATION_RESUMES });
 	return messages;
 }
 
@@ -414,7 +440,9 @@ An invitation to move on — "shall we look at another chapter next?" — is not
 open question, does not count as asking the user anything, and does not keep
 this chapter in progress.`;
 
-	const recentTurns = args.conversation.slice(-6);
+	// Cut first, then shaped: a cut can start on the assistant's turn, and the
+	// latest reply can be empty when it was nothing but blocks.
+	const recentTurns = normaliseConversation(args.conversation.slice(-6));
 
 	try {
 		const result = await gateway.callWithTools({
@@ -490,8 +518,9 @@ cannot guess the shape of the answer, reply with an empty block.`;
 			messages: [{ role: 'user', content: args.question }],
 			// The answer is a handful of words, but the model reasons before writing
 			// and thinking tokens come out of the same budget. At 400 it spent the
-			// lot deliberating and emitted no block at all.
-			maxTokens: 2000,
+			// lot deliberating and emitted no block at all. It reads the whole chapter
+			// first, so a long chapter needs room to reason about it too.
+			maxTokens: 4000,
 			signal: args.signal
 		})) {
 			if (event.type === 'text') text += event.text;

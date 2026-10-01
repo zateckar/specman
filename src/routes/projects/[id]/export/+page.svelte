@@ -2,14 +2,38 @@
 	let { data } = $props();
 
 	let copied = $state(false);
+	let copyNote = $state('');
+	let preview: HTMLPreElement | undefined = $state();
 
 	const errors = $derived(data.problems.filter((p) => p.severity === 'error'));
 	const warnings = $derived(data.problems.filter((p) => p.severity === 'warning'));
 
+	/**
+	 * The clipboard API exists only on a secure page, and is refused when the
+	 * browser says no — in both cases the button used to do nothing at all, with
+	 * no word of it. The older copy command works over plain http; failing that,
+	 * the text is selected so the user can copy it themselves, and told so.
+	 */
 	async function copy() {
-		await navigator.clipboard.writeText(data.single);
-		copied = true;
-		setTimeout(() => (copied = false), 2500);
+		copyNote = '';
+		try {
+			await navigator.clipboard.writeText(data.single);
+			copied = true;
+		} catch {
+			copied = selectPreview() && document.execCommand('copy');
+			if (!copied) copyNote = 'Copying was blocked by the browser. The text is selected below — press Ctrl+C to copy it.';
+		}
+		if (copied) setTimeout(() => (copied = false), 2500);
+	}
+
+	function selectPreview(): boolean {
+		if (!preview) return false;
+		const range = document.createRange();
+		range.selectNodeContents(preview);
+		const selection = window.getSelection();
+		selection?.removeAllRanges();
+		selection?.addRange(range);
+		return true;
 	}
 </script>
 
@@ -33,6 +57,7 @@
 			{copied ? 'Copied' : 'Copy it all'}
 		</button>
 	</div>
+	<p class="copy-note" role="status">{copied ? 'Copied to the clipboard.' : copyNote}</p>
 
 	{#if errors.length > 0 || data.openQuestions > 0 || data.unconfirmed > 0}
 		<div class="card caveats">
@@ -65,7 +90,7 @@
 	{/if}
 
 	<h2>What it looks like</h2>
-	<pre class="card preview">{data.single}</pre>
+	<pre class="card preview" bind:this={preview}>{data.single}</pre>
 </main>
 
 <style>
@@ -147,6 +172,13 @@
 
 	.caveats .error {
 		color: #8c2020;
+	}
+
+	.copy-note {
+		min-height: 1em;
+		margin: -6px 0 12px;
+		font-size: 12.5px;
+		color: var(--ink-soft);
 	}
 
 	.preview {

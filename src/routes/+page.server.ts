@@ -1,32 +1,30 @@
+import { existsSync, rmSync } from 'node:fs';
 import { fail, redirect } from '@sveltejs/kit';
-import { createProject, defaultTemplate, listProjects, projectChapters, slugExists } from '$lib/server/db';
+import {
+	createProject,
+	defaultTemplate,
+	deleteProject,
+	listProjects,
+	projectChapters,
+	projectDecisions,
+	slugExists
+} from '$lib/server/db';
 import { repoPathFor } from '$lib/server/git/repo';
+import { effectiveStatus, pendingByChapter } from '$lib/server/llm/decisions';
+import { describeFailure } from '$lib/server/llm/failures';
 import { toProfile } from '$lib/server/llm/profile';
+import { uniqueSlug } from '$lib/server/llm/slug';
 import { countableChapters } from '$lib/server/llm/subchapters';
 import { ensureWorkingProposal } from '$lib/server/proposals';
 import type { Actions, PageServerLoad } from './$types';
 
-function slugify(name: string): string {
-	const base =
-		name
-			.toLowerCase()
-			.normalize('NFD')
-			.replace(/\p{Diacritic}/gu, '')
-			.replace(/[^a-z0-9]+/g, '-')
-			.replace(/^-+|-+$/g, '')
-			.slice(0, 48) || 'app';
-
-	let slug = base;
-	let n = 2;
-	while (slugExists(slug)) slug = `${base}-${n++}`;
-	return slug;
-}
-
 export const load: PageServerLoad = async () => {
 	const projects = listProjects().map((project) => {
 		const chapters = projectChapters(project.id);
-		// The same rule the chapter index uses, or the card and the index disagree
-		// about the same document.
+		const pending = pendingByChapter(projectDecisions(project.id));
+		// The same rules the chapter index uses — which chapters count, and the
+		// status derived from unconfirmed decisions — or the card and the index
+		// disagree about the same document.
 		const counted = countableChapters(chapters);
 		return {
 			id: project.id,
@@ -34,8 +32,8 @@ export const load: PageServerLoad = async () => {
 			description: project.description,
 			created_at: project.created_at,
 			total: counted.length,
-			complete: counted.filter((c) => c.status === 'complete').length,
-			open: chapters.reduce((sum, c) => sum + c.open_questions.length, 0)
+			complete: counted.filter((c) => effectiveStatus(c.status, pending.get(c.key) ?? 0) === 'complete').length,
+			open: counted.reduce((sum, c) => sum + c.open_questions.length, 0)
 		};
 	});
 
@@ -60,7 +58,9 @@ export const actions: Actions = {
 			critical: form.get('critical') === 'yes'
 		});
 
-		const slug = slugify(name);
+		// Free in the database and on disk: a folder left behind by anything else
+		// must not be adopted as this application's repository.
+		const slug = uniqueSlug(name, (candidate) => slugExists(candidate) || existsSync(repoPathFor(candidate)));
 		const project = createProject({
 			name,
 			description,
@@ -73,8 +73,20 @@ export const actions: Actions = {
 		});
 
 		// Create the repository and its first working branch up front, so the
-		// first conversation turn doesn't pay for it.
-		await ensureWorkingProposal(project);
+		// first conversation turn doesn't pay for it — and so an application whose
+		// repository cannot be made is not created at all. Left in place, it was
+		// listed on the home page, every turn in it failed, and trying again made a
+		// second one beside it.
+		try {
+			await ensureWorkingProposal(project);
+		} catch (cause) {
+			console.error(`[projects] could not create the repository for "${name}":`, cause);
+			deleteProject(project.id);
+			rmSync(project.repo_path, { recursive: true, force: true });
+			return fail(503, {
+				message: `The application could not be created. ${describeFailure(cause, { messageSaved: false })}`
+			});
+		}
 
 		throw redirect(303, `/projects/${project.id}`);
 	}

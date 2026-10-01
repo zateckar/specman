@@ -45,8 +45,10 @@ async function collectFindings(system: string, prompt: string): Promise<Issue[]>
 	for await (const event of gateway.streamChat({
 		system,
 		messages: [{ role: 'user', content: prompt }],
-		// Reasoning and output consume the same budget.
-		maxTokens: 3000
+		// Reasoning and output consume the same budget, and a chapter check reads the
+		// whole chapter and its conversation before it writes a word. 3000 is the size
+		// that returned nothing for the diagram; this is the size that worked there.
+		maxTokens: 12000
 	})) {
 		if (event.type === 'text') text += event.text;
 	}
@@ -73,16 +75,34 @@ function describeRequirements(requirements: Requirement[]): string {
 		.join('\n');
 }
 
-/** One chapter against its own criteria and the decisions taken in it. */
+/** A turn of the conversation, as the check reads it. */
+export interface Turn {
+	role: 'user' | 'assistant';
+	content: string;
+}
+
+/** How much of each chapter's conversation the check reads. */
+export const TRANSCRIPT_TURNS = 12;
+
+function describeTranscript(turns: Turn[]): string {
+	if (turns.length === 0) return '(no conversation yet)';
+	return turns
+		.slice(-TRANSCRIPT_TURNS)
+		.map((t) => `${t.role === 'user' ? 'Colleague' : 'Assistant'}: ${t.content.trim()}`)
+		.join('\n');
+}
+
+/** One chapter against its own criteria, the decisions taken in it, and what was said. */
 async function checkChapter(args: {
 	chapter: Chapter;
 	requirements: Requirement[];
 	decisions: Decision[];
+	transcript: Turn[];
 }): Promise<Issue[]> {
-	const { chapter, requirements, decisions } = args;
+	const { chapter, requirements, decisions, transcript } = args;
 
-	// Nothing written, nothing to check — and no call to pay for.
-	if (!chapter.content_md.trim() && requirements.length === 0) return [];
+	// Nothing written and nothing said, nothing to check — and no call to pay for.
+	if (!chapter.content_md.trim() && requirements.length === 0 && transcript.length === 0) return [];
 
 	const system = `You are checking one chapter of an application design document for
 problems. Be strict but fair, and silent when it is sound.
@@ -106,10 +126,14 @@ ${describeRequirements(requirements)}
 Decisions recorded against it:
 ${decisions.map((d) => `- ${d.statement}${d.rationale ? ` (because ${d.rationale})` : ''}`).join('\n') || '- (none)'}
 
+The most recent conversation about this chapter:
+${describeTranscript(transcript)}
+
 Check three things. Is anything here in conflict with something else here? Is
-any decision listed above absent from the text and the rules — settled in
-conversation but never actually written down? Is anything too vague to build
-from without guessing?`;
+anything settled in conversation — a decision listed above, an answer the
+colleague gave, or something the assistant said it would record — absent from
+the text and the rules, never actually written down? Is anything too vague to
+build from without guessing?`;
 
 	return collectFindings(system, prompt);
 }
@@ -174,16 +198,27 @@ export async function verifyDocument(args: {
 	chapters: Chapter[];
 	requirements: Requirement[];
 	decisions: Decision[];
+	/**
+	 * Each chapter's recent conversation, by key. Without it the check can only
+	 * compare the document with itself, and something the assistant said it would
+	 * record and then did not is invisible: it is in neither.
+	 */
+	transcripts?: Record<string, Turn[]>;
 }): Promise<VerificationResult> {
 	const { chapters, requirements, decisions } = args;
+	const transcripts = args.transcripts ?? {};
 
 	// A chapter set aside by the triage was never in scope, so it is not a gap.
 	const inScope = chapters.filter((c) => c.applicable !== 0);
 	const scopedKeys = new Set(inScope.map((c) => c.key));
 	const scopedRequirements = requirements.filter((r) => scopedKeys.has(r.chapter_key));
 	const scopedDecisions = decisions.filter((d) => scopedKeys.has(d.chapter_key));
+	// A chapter talked about but never written is the case the transcript is for.
 	const worthChecking = inScope.filter(
-		(c) => c.content_md.trim() || requirements.some((r) => r.chapter_key === c.key)
+		(c) =>
+			c.content_md.trim() ||
+			requirements.some((r) => r.chapter_key === c.key) ||
+			(transcripts[c.key] ?? []).some((t) => t.role === 'user')
 	);
 
 	const perChapter = await mapWithLimit(worthChecking, CONCURRENCY, async (chapter) => {
@@ -191,7 +226,8 @@ export async function verifyDocument(args: {
 			const issues = await checkChapter({
 				chapter,
 				requirements: requirements.filter((r) => r.chapter_key === chapter.key),
-				decisions: decisions.filter((d) => d.chapter_key === chapter.key)
+				decisions: decisions.filter((d) => d.chapter_key === chapter.key),
+				transcript: transcripts[chapter.key] ?? []
 			});
 			return { key: chapter.key, failed: false, issues };
 		} catch (cause) {

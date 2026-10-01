@@ -8,6 +8,10 @@
 export const SCHEMA = `
 PRAGMA journal_mode = WAL;
 PRAGMA foreign_keys = ON;
+-- Wait for another connection's write rather than failing at once. One process
+-- never contends with itself, but an overlapping container during a restart, a
+-- script or a test run beside the server would otherwise get SQLITE_BUSY.
+PRAGMA busy_timeout = 5000;
 
 CREATE TABLE IF NOT EXISTS users (
   id            INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -187,6 +191,20 @@ CREATE TABLE IF NOT EXISTS approval_intents (
 );
 CREATE UNIQUE INDEX IF NOT EXISTS approval_active_per_project
 ON approval_intents(project_id) WHERE phase <> 'complete';
+
+-- One-off repairs already applied to this database, so each runs exactly once.
+CREATE TABLE IF NOT EXISTS migrations (
+  name       TEXT PRIMARY KEY,
+  applied_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+-- Documents a repair rewrote that have not yet reached their repository. Kept
+-- here rather than in memory: the repair removes its own trigger, so a list held
+-- for one boot was lost for good when the commit after it failed.
+CREATE TABLE IF NOT EXISTS migrated_documents (
+  project_id INTEGER PRIMARY KEY REFERENCES projects(id) ON DELETE CASCADE,
+  summary    TEXT NOT NULL
+);
 `;
 
 /**

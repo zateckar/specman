@@ -1,7 +1,5 @@
 <script lang="ts">
 	let { data, form } = $props();
-
-	const CONDITIONS = 'always, personal_data, beyond_team, external, critical';
 </script>
 
 <main>
@@ -42,7 +40,7 @@
 			</label>
 
 			<label>
-				Applies when — any one of these is enough ({CONDITIONS})
+				Applies when — any one of these is enough ({data.conditions})
 				<input name="appliesWhen" value={standard.applies_when.join(', ')} />
 			</label>
 

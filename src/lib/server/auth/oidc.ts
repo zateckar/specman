@@ -28,7 +28,18 @@ export function redirectUri(): string {
 	return `${config.publicUrl.replace(/\/$/, '')}/login/oidc/callback`;
 }
 
-export async function authorizationUrl(state: string, codeVerifier: string): Promise<string> {
+/**
+ * Where to send the browser to sign in.
+ *
+ * The nonce ties the ID token to this attempt. PKCE already stops a stolen code
+ * being redeemed elsewhere; the nonce stops a token issued for some other sign-in
+ * being replayed into this one.
+ */
+export async function authorizationUrl(
+	state: string,
+	codeVerifier: string,
+	nonce: string
+): Promise<string> {
 	const cfg = await configuration();
 	const codeChallenge = await client.calculatePKCECodeChallenge(codeVerifier);
 
@@ -38,7 +49,8 @@ export async function authorizationUrl(state: string, codeVerifier: string): Pro
 			scope: 'openid profile email',
 			code_challenge: codeChallenge,
 			code_challenge_method: 'S256',
-			state
+			state,
+			nonce
 		})
 		.toString();
 }
@@ -66,13 +78,15 @@ export class OidcNameCollision extends Error {
 export async function completeLogin(
 	currentUrl: URL,
 	expectedState: string,
-	codeVerifier: string
+	codeVerifier: string,
+	expectedNonce: string
 ): Promise<User> {
 	const cfg = await configuration();
 
 	const tokens = await client.authorizationCodeGrant(cfg, currentUrl, {
 		pkceCodeVerifier: codeVerifier,
-		expectedState
+		expectedState,
+		expectedNonce
 	});
 
 	const claims = tokens.claims();

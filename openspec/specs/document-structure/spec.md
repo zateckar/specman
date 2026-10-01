@@ -66,6 +66,12 @@ sub-chapters at that moment, deterministically and without a model call.
 - **THEN** the strongest pairing across the whole set is taken first, so an exact match
   claims its own section before a loose one can take it
 
+#### Scenario: A section's content is written back into its parent later
+- **WHEN** a reply after the split rewrites the parent with a heading that matches an empty
+  section
+- **THEN** that content is filed into the section on the same terms as at split time, because
+  the prompt tells the model never to do this and the model sometimes does
+
 ### Requirement: An unplaceable heading stays with its parent
 Content that cannot be matched confidently SHALL remain in the parent chapter, and SHALL NOT
 be filed by position.
@@ -115,6 +121,16 @@ its address uses http, https, mailto, tel, or no scheme at all.
 - **WHEN** a link or image address uses any other scheme
 - **THEN** the address is dropped and the wording kept, since the words are the user's
   content and the address is not
+
+#### Scenario: The scheme is written with character references
+- **WHEN** an address spells its scheme or colon as `&#106;`, `&#x6A;` or `&colon;`
+- **THEN** it is read as the browser would read it and refused, because the browser decodes
+  those before it looks at the scheme and `&#106;avascript:` is a working script link
+
+#### Scenario: Image description or link title holds a quote
+- **WHEN** the words describing an image, or a link's title, contain `"`
+- **THEN** they are escaped inside the attribute, because marked writes an image description
+  verbatim and `![x" onerror="…](a.png)` ran script for every reader without a click
 
 ### Requirement: A chapter's title is added once
 The document writer SHALL supply a chapter's heading, and a duplicate heading written into

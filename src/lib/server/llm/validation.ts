@@ -47,44 +47,72 @@ interface DecisionLike {
 	status: string;
 }
 
+/**
+ * A requirement as the user knows it: by what it says. The preview never shows
+ * references, so a finding naming REQ-003 named something the reader had no way
+ * to find.
+ */
+function quote(req: RequirementLike): string {
+	const words = req.statement.trim().replace(/\s+/g, ' ');
+	if (!words) return 'a rule with no wording';
+	return `the rule “${words.length > 80 ? `${words.slice(0, 77).trimEnd()}…` : words}”`;
+}
+
+function capitalise(text: string): string {
+	return text.charAt(0).toUpperCase() + text.slice(1);
+}
+
 export function validateDocument(input: {
 	chapters: ChapterLike[];
 	requirements: RequirementLike[];
 	decisions?: DecisionLike[];
+	/**
+	 * Chapters the triage set aside. Not checked as chapters — they were never in
+	 * scope — but they exist, and a rule filed under one is not an orphan.
+	 */
+	setAside?: Array<{ key: string; title: string }>;
 }): Finding[] {
 	const findings: Finding[] = [];
 	const { chapters, requirements } = input;
 	const decisions = input.decisions ?? [];
 	const chapterKeys = new Set(chapters.map((c) => c.key));
+	const setAside = new Map((input.setAside ?? []).map((c) => [c.key, c.title]));
 	const titleOf = new Map(chapters.map((c) => [c.key, c.title]));
 
-	const seenRefs = new Set<string>();
-	const seenStatements = new Map<string, string>();
+	const seenRefs = new Map<string, RequirementLike>();
+	const seenStatements = new Map<string, RequirementLike>();
 
 	for (const req of requirements) {
-		if (seenRefs.has(req.ref)) {
+		const sharer = seenRefs.get(req.ref);
+		if (sharer) {
 			findings.push({
 				severity: 'error',
-				message: `Two requirements share the reference ${req.ref}.`,
+				message: `Two rules were recorded as one: ${quote(sharer)} and ${quote(req)}.`,
 				ref: req.ref,
 				chapterKey: req.chapter_key
 			});
 		}
-		seenRefs.add(req.ref);
+		seenRefs.set(req.ref, req);
 
 		if (!req.statement.trim()) {
 			findings.push({
 				severity: 'error',
-				message: `${req.ref} has no wording.`,
+				message: `A rule in ${titleOf.get(req.chapter_key) ?? 'the document'} has no wording.`,
 				ref: req.ref,
 				chapterKey: req.chapter_key
 			});
 		}
 
-		if (!chapterKeys.has(req.chapter_key)) {
+		if (setAside.has(req.chapter_key)) {
+			findings.push({
+				severity: 'warning',
+				message: `${capitalise(quote(req))} is in “${setAside.get(req.chapter_key)}”, which was set aside as not applying. Open that chapter if it does apply.`,
+				ref: req.ref
+			});
+		} else if (!chapterKeys.has(req.chapter_key)) {
 			findings.push({
 				severity: 'error',
-				message: `${req.ref} belongs to a chapter that no longer exists.`,
+				message: `${capitalise(quote(req))} belongs to a chapter that no longer exists.`,
 				ref: req.ref
 			});
 		}
@@ -94,7 +122,7 @@ export function validateDocument(input: {
 		if (req.scope !== 'out' && req.scenarios.length === 0) {
 			findings.push({
 				severity: 'warning',
-				message: `${req.ref} has no example of what it means in practice.`,
+				message: `${capitalise(quote(req))} has no example of what it means in practice.`,
 				ref: req.ref,
 				chapterKey: req.chapter_key
 			});
@@ -104,7 +132,7 @@ export function validateDocument(input: {
 			if (!scenario.when.trim() || !scenario.then.trim()) {
 				findings.push({
 					severity: 'warning',
-					message: `An example under ${req.ref} is only half written.`,
+					message: `An example under ${quote(req)} is only half written.`,
 					ref: req.ref,
 					chapterKey: req.chapter_key
 				});
@@ -113,16 +141,15 @@ export function validateDocument(input: {
 
 		const key = normalise(req.statement);
 		if (key) {
-			const twin = seenStatements.get(key);
-			if (twin) {
+			if (seenStatements.has(key)) {
 				findings.push({
 					severity: 'warning',
-					message: `${req.ref} says the same thing as ${twin}.`,
+					message: `${capitalise(quote(req))} is recorded twice.`,
 					ref: req.ref,
 					chapterKey: req.chapter_key
 				});
 			} else {
-				seenStatements.set(key, req.ref);
+				seenStatements.set(key, req);
 			}
 		}
 	}

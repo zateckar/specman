@@ -47,9 +47,11 @@ import { mapWithLimit } from '../src/lib/server/llm/parallel.ts';
 import {
 	chapterApplies,
 	describeProfile,
+	readConditions,
 	reasonForSkipping,
 	toProfile
 } from '../src/lib/server/llm/profile.ts';
+import { baseSlug, uniqueSlug } from '../src/lib/server/llm/slug.ts';
 import { buildSingleFile, buildSpecBundle } from '../src/lib/server/llm/export.ts';
 import {
 	arrangeChapters,
@@ -71,6 +73,9 @@ import {
 import { renderMarkdown, safeUrl } from '../src/lib/safe-markdown.ts';
 import { createSink, sseFrame } from '../src/lib/server/llm/sink.ts';
 import { mayAssertIdentity, readForwardedIdentity } from '../src/lib/server/llm/forwarded.ts';
+import { safeReturnPath } from '../src/lib/server/llm/return-path.ts';
+import { describeFailure } from '../src/lib/server/llm/failures.ts';
+import { FREE_ATTEMPTS, SignInAttempts } from '../src/lib/server/llm/attempts.ts';
 import { createLocks } from '../src/lib/server/llm/lock.ts';
 import { createPresence } from '../src/lib/server/llm/presence.ts';
 import { readFrames } from '../src/lib/sse.ts';
@@ -324,10 +329,33 @@ check('tags split across chunks still parse', split.parser.drafts.get('data'), '
 check('options split across chunks still parse', parseOptions(split.parser.optionsBlock).length, 2);
 check('nothing leaks when split character by character', split.visible, 'Hi.');
 
-// Truncation mid-block is common when max_tokens runs out.
+// The stream ending inside a block. The gateway refuses a reply that ran out of
+// max_tokens, so this is the model stopping cleanly without closing its block.
 const cut = streamed(['Here it is.\n<chapter key="data">Half a sen']);
 check('an unterminated chapter is salvaged', cut.parser.drafts.get('data'), 'Half a sen');
 check('and its text still does not leak', cut.visible, 'Here it is.');
+
+// Nobody means to erase a chapter by writing nothing into it.
+check('an empty chapter block is not a draft', streamed(['<chapter key="security"></chapter>Thanks!']).parser.drafts.has('security'), false);
+check('nor is a self-closed one', streamed(['<chapter key="security"/>Thanks!']).parser.drafts.has('security'), false);
+check('nor one holding only whitespace', streamed(['<chapter key="security">\n  \n</chapter>']).parser.drafts.size, 0);
+
+// The model finished but forgot to close the chapter. Blocks never nest, so the
+// next opening tag is where it ended — and what follows is not chapter prose.
+const forgot = streamed([
+	'<chapter key="security">## Access\nOnly staff.\n',
+	'<requirement scope="now">Users must sign in\nWHEN x\nTHEN y</requirement>\n',
+	'Which team owns this?'
+]);
+check('an unclosed chapter ends where the next block opens', forgot.parser.drafts.get('security'), '## Access\nOnly staff.');
+check('the requirement after it is still recorded', forgot.parser.blocksOf('requirement').length, 1);
+check('and the reply after that still reaches the user', forgot.visible, 'Which team owns this?');
+check('no developer notation lands in the prose', forgot.parser.drafts.get('security').includes('WHEN'), false);
+
+check('single-quoted attributes are read', streamed(["<chapter key='data'>Body.</chapter>"]).parser.drafts.get('data'), 'Body.');
+check('and do not leak the tag', streamed(["Hi.\n<chapter key='data'>Body.</chapter>"]).visible, 'Hi.');
+// No key means the chapter under discussion; the caller knows which that is.
+check('a chapter block with no key is kept for the caller', streamed(['<chapter>Body.</chapter>']).parser.drafts.get(''), 'Body.');
 
 console.log('\n--- requirements ---');
 
@@ -1312,6 +1340,23 @@ check(
 	true
 );
 check(
+	'a word longer than a line is broken, not left to run out of the box',
+	wrapName('Fahrzeugdisponierungssystemverwaltung').every((line) => line.length <= 22),
+	true
+);
+check(
+	'and the break is marked',
+	wrapName('Fahrzeugdisponierungssystemverwaltung')[0].endsWith('-'),
+	true
+);
+check(
+	'the shortening mark stays inside the line',
+	wrapName('Onetwothreefourfivesix onetwothreefourfivesix onetwothreefourfivesix more words here').every(
+		(line) => line.length <= 22
+	),
+	true
+);
+check(
 	'every box is tall enough for its own lines',
 	laid.boxes.every((b) => b.height >= 20 + b.lines.length * 13),
 	true
@@ -1410,6 +1455,39 @@ check(
 				point.y > wiredLaid.height
 		)
 		.map(({ edge, point }) => `${edge.from} → ${edge.to} at ${point.x},${point.y}`),
+	[]
+);
+
+// The band names are text, not boxes, so the check above says nothing about
+// them — and written across the top of a band, a name sat in the first gutter
+// and the channel over the band's first row, where wires run.
+function entersArea({ a, b }, area) {
+	const left = Math.min(a.x, b.x);
+	const right = Math.max(a.x, b.x);
+	const top = Math.min(a.y, b.y);
+	const bottom = Math.max(a.y, b.y);
+	return right > area.x && left < area.x + area.width && bottom > area.y && top < area.y + area.height;
+}
+for (const [name, layout] of [
+	['the wired example', wiredLaid],
+	['one box per row', layoutDiagram(wired, { maxPerRow: 1 })],
+	['four across', layoutDiagram(wired, { maxPerRow: 4 })]
+]) {
+	check(
+		`no wire runs through a band's name (${name})`,
+		layout.edges.flatMap((edge) =>
+			segmentsOf(edge)
+				.filter((segment) => layout.bands.some((band) => entersArea(segment, band.labelArea)))
+				.map(() => `${edge.from} → ${edge.to}`)
+		),
+		[]
+	);
+}
+check(
+	'and no box sits on one',
+	wiredLaid.boxes.filter((box) =>
+		wiredLaid.bands.some((band) => entersArea({ a: { x: box.x, y: box.y }, b: { x: box.x + box.width, y: box.y + box.height } }, band.labelArea))
+	),
 	[]
 );
 
@@ -1582,6 +1660,68 @@ check('javascript is refused', safeUrl('javascript:alert(1)'), null);
 check('leading whitespace does not disguise it', safeUrl('  JaVaScRiPt:alert(1)'), null);
 check('data is refused', safeUrl('data:text/html,<script>'), null);
 check('vbscript is refused', safeUrl('vbscript:msgbox'), null);
+
+// A browser decodes character references in an attribute before it reads the
+// scheme, so an encoded letter or colon is the same javascript: URL.
+check('an encoded letter does not disguise javascript', safeUrl('&#106;avascript:alert(1)'), null);
+check('nor a hexadecimal one', safeUrl('&#x6A;avascript:alert(1)'), null);
+check('nor one without its semicolon', safeUrl('&#106avascript:alert(1)'), null);
+check('nor a named colon', safeUrl('javascript&colon;alert(1)'), null);
+check('an unknown reference where the scheme would be is refused', safeUrl('javascript&foo;alert(1)'), null);
+check('an ampersand in a query is still an ordinary path', safeUrl('/search?a=1&b=2'), '/search?a=1&b=2');
+check('an encoded link renders without its href', renderMarkdown('[Open](&#106;avascript:alert(1))').includes('href'), false);
+
+// marked writes image alt text into the attribute unescaped. A quote in it was a
+// handler that fired for every reader, with no click.
+const altBreakout = renderMarkdown('![x" onerror="alert(1)](nope.png)');
+check('image alt text cannot close its attribute', altBreakout.includes('onerror="'), false);
+check('the image itself still renders', altBreakout.includes('<img src="nope.png"'), true);
+check('with its words escaped', altBreakout.includes('alt="x&quot; onerror=&quot;alert(1)"'), true);
+const titled = renderMarkdown('[Docs](https://example.com "a\\" onmouseover=\\"x")');
+check('a link title cannot close its attribute', titled.includes('onmouseover="'), false);
+check('an ampersand in a link is escaped once', renderMarkdown('[q](https://x.test/?a=1&b=2)').includes('href="https://x.test/?a=1&amp;b=2"'), true);
+
+console.log('\n--- telling the user what went wrong ---');
+
+const gatewayError = Object.assign(new Error('Gateway stream failed with 502'), { name: 'GatewayError' });
+check('a gateway failure is described, not quoted', describeFailure(gatewayError).includes('502'), false);
+check('and says their words are kept', describeFailure(gatewayError).includes('Your message is saved'), true);
+check('running out of room says what to do', describeFailure(new Error('The gateway ran out of room before completing its response.')).includes('one part at a time'), true);
+check('a network failure says try again', describeFailure(new TypeError('fetch failed')).includes('Try again in a minute'), true);
+check('a database error is not quoted', describeFailure(new Error('SQLITE_CONSTRAINT: UNIQUE constraint failed')).includes('SQLITE'), false);
+const conflict = Object.assign(new Error('The document changed while the assistant was working.'), { name: 'DocumentConflict' });
+check('a message already written for the user is kept', describeFailure(conflict), conflict.message);
+check('nothing is promised when nothing was saved', describeFailure(gatewayError, { messageSaved: false }).includes('saved'), false);
+
+console.log('\n--- where sign-in returns to ---');
+
+check('a plain path is kept', safeReturnPath('/projects/4?chapter=security#x'), '/projects/4?chapter=security#x');
+check('a scheme-relative address goes home', safeReturnPath('//evil.example'), '/');
+check('so does a backslash one', safeReturnPath('/\\evil.example'), '/');
+// The browser's URL parser drops tabs and newlines before resolving.
+check('a tab cannot turn a path into another host', safeReturnPath('/\t/evil.example'), '/');
+check('nor a newline', safeReturnPath('/\n/evil.example'), '/');
+check('an absolute address goes home', safeReturnPath('https://evil.example/'), '/');
+check('nothing at all goes home', safeReturnPath(null), '/');
+
+console.log('\n--- failed sign-in attempts ---');
+
+let clock = 0;
+const attempts = new SignInAttempts(() => clock);
+for (let i = 0; i < FREE_ATTEMPTS - 1; i++) attempts.failed('10.0.0.1', 'novak');
+check('a few mistakes cost nothing', attempts.waitFor('10.0.0.1', 'novak'), 0);
+attempts.failed('10.0.0.1', 'novak');
+check('then a wait begins', attempts.waitFor('10.0.0.1', 'novak') > 0, true);
+check('the name is not matched case by case', attempts.waitFor('10.0.0.1', 'NOVAK') > 0, true);
+check('another address is not held up by it', attempts.waitFor('10.0.0.2', 'novak'), 0);
+const firstWait = attempts.waitFor('10.0.0.1', 'novak');
+clock += firstWait;
+attempts.failed('10.0.0.1', 'novak');
+check('each further failure waits longer', attempts.waitFor('10.0.0.1', 'novak') > firstWait, true);
+for (let i = 0; i < 30; i++) attempts.failed('10.0.0.1', 'novak');
+check('up to a ceiling', attempts.waitFor('10.0.0.1', 'novak') <= 15 * 60_000, true);
+attempts.succeeded('10.0.0.1', 'novak');
+check('a success forgets the history', attempts.waitFor('10.0.0.1', 'novak'), 0);
 
 console.log('\n--- a turn that outlives the tab ---');
 
@@ -1920,6 +2060,17 @@ console.log('\n--- who else is in this document ---');
 	presence.setWriting(1, 11, false, t0);
 	check('and so is stopping', presence.others(1, 10, t0)[0].writing, false);
 
+	// Two tabs, two turns: the first to finish must not clear the second.
+	presence.setWriting(1, 11, true, t0);
+	presence.setWriting(1, 11, true, t0);
+	presence.setWriting(1, 11, false, t0);
+	check('one of two turns finishing leaves them writing', presence.others(1, 10, t0)[0].writing, true);
+	presence.setWriting(1, 11, false, t0);
+	check('both finishing does not', presence.others(1, 10, t0)[0].writing, false);
+	presence.setWriting(1, 11, false, t0);
+	check('an extra finish cannot go below nothing', (presence.setWriting(1, 11, true, t0), presence.others(1, 10, t0)[0].writing), true);
+	presence.setWriting(1, 11, false, t0);
+
 	// Someone who closed their laptop should stop being company, without anything
 	// having to tell us they left.
 	const later = t0 + 46_000;
@@ -1944,6 +2095,45 @@ console.log('\n--- who else is in this document ---');
 		{ name: 'Jan Novák', writing: true }
 	]);
 }
+
+console.log('\n--- the folder an application lives in ---');
+
+check('a name becomes a folder name', baseSlug('Půjčování aut'), 'pujcovani-aut');
+check('a Windows device name is given a suffix', baseSlug('Con'), 'con-app');
+check('in any case', baseSlug('NUL'), 'nul-app');
+check('and the numbered ones too', baseSlug('LPT1'), 'lpt1-app');
+check('a name merely starting with one is left alone', baseSlug('Console'), 'console');
+check('nothing usable still gives a folder', baseSlug('???'), 'app');
+check(
+	'a taken slug counts up',
+	uniqueSlug('Fleet', (slug) => ['fleet', 'fleet-2'].includes(slug)),
+	'fleet-3'
+);
+
+console.log('\n--- conditions an administrator types ---');
+
+check('known conditions are read', readConditions('personal_data, critical'), {
+	conditions: ['personal_data', 'critical']
+});
+check('a blank field means always, not never', readConditions('  '), { conditions: ['always'] });
+check('a typo is refused by name rather than read as always', readConditions('personal-data, critical'), {
+	unknown: ['personal-data']
+});
+check('case and repeats do not matter', readConditions('Critical, critical'), { conditions: ['critical'] });
+
+console.log('\n--- what a drawn element may link to ---');
+
+check(
+	'a chapter key is kept',
+	toElement({ type: 'actor', name: 'Employee', chapter: 'Users-and-roles' }, '').chapter,
+	'users-and-roles'
+);
+check(
+	'anything not shaped like a key is dropped rather than put in an address',
+	toElement({ type: 'actor', name: 'Employee', chapter: 'x&y=1"><script>' }, '').chapter,
+	''
+);
+check('a name with nothing a slug can keep is not drawn', toElement({ type: 'actor', name: '日本語' }, ''), null);
 
 console.log(`\n${pass} passed, ${fail} failed`);
 process.exit(fail ? 1 : 0);

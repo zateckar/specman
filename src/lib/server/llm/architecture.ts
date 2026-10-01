@@ -87,14 +87,26 @@ export function toElement(attrs: Record<string, string>, body: string): Element 
 	// middle of the diagram, and a mislabelled box is better than a dropped one.
 	const type = TYPES.includes(raw) ? raw : 'service';
 
+	// A name with nothing a slug can keep would share the empty id with every
+	// other such name, and the relations between them would be drawn wrongly.
+	const id = slug(name);
+	if (!id) return null;
+
+	// The chapter becomes a link. Only something shaped like a chapter key is
+	// kept: the model writes this attribute, and whatever it writes ends up in
+	// an address on the page and in the downloaded file.
+	const chapter = (attrs.chapter ?? '').trim().toLowerCase();
+
 	return {
-		id: slug(name),
+		id,
 		name,
 		type,
 		layer: layerOf(type),
-		chapter: (attrs.chapter ?? '').trim().toLowerCase()
+		chapter: CHAPTER_KEY.test(chapter) ? chapter : ''
 	};
 }
+
+const CHAPTER_KEY = /^[a-z0-9][a-z0-9-]{0,79}$/;
 
 /** Read a `<relation>` block. Endpoints are names; they resolve to slugs. */
 export function toRelation(attrs: Record<string, string>): Relation | null {

@@ -11,18 +11,12 @@
 	let { data } = $props();
 
 	// Local mirror so the index and preview update live during a turn, without
-	// waiting for a round trip. Re-synced whenever the server sends new data.
-	let chapters = $state([...data.chapters]);
-	let requirements = $state([...data.requirements]);
-	let decisions = $state([...data.decisions]);
-	let pendingChanges = $state(data.pendingChanges);
-
-	$effect(() => {
-		chapters = [...data.chapters];
-		requirements = [...data.requirements];
-		decisions = [...data.decisions];
-		pendingChanges = data.pendingChanges;
-	});
+	// waiting for a round trip. Each is overwritten as the stream arrives and
+	// re-derived whenever the server sends new data.
+	let chapters = $derived([...data.chapters]);
+	let requirements = $derived([...data.requirements]);
+	let decisions = $derived([...data.decisions]);
+	let pendingChanges = $derived(data.pendingChanges);
 
 	const active = $derived(chapters.find((c) => c.key === data.activeKey) ?? null);
 	const chatTitle = $derived(active ? active.title : 'Whole document');
@@ -188,10 +182,22 @@
 			errorMessage =
 				cause instanceof Error ? cause.message : 'Something went wrong. Please try again.';
 		} finally {
-			running = null;
 			// Whatever the user is looking at now, bring it up to date with the turn
 			// that has just finished — including when that is a different chapter.
+			// Only then let go of the turn: released first, the pane fell back to
+			// the transcript as it was before the turn, and the reply vanished
+			// until the reload arrived.
+			await settle();
+		}
+	}
+
+	async function settle() {
+		try {
 			await invalidateAll();
+		} catch (cause) {
+			console.warn('could not refresh after the turn:', cause);
+		} finally {
+			running = null;
 		}
 	}
 
@@ -225,8 +231,7 @@
 			// The question is already on screen and stored; suggestions are a bonus.
 			console.warn('could not suggest answers:', cause);
 		} finally {
-			running = null;
-			await invalidateAll();
+			await settle();
 		}
 	}
 

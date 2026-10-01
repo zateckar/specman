@@ -72,6 +72,8 @@ export interface LaidOutBand {
 	y: number;
 	width: number;
 	height: number;
+	/** Where the label is written, upright along the left edge. No wire enters it. */
+	labelArea: { x: number; y: number; width: number; height: number };
 }
 
 export interface Diagram {
@@ -114,6 +116,12 @@ const BAND_GAP = 46;
 const BAND_PAD_TOP = 34;
 const BAND_PAD = 24;
 const MARGIN = 18;
+/**
+ * A strip down the left of every band for its name, outside every corridor.
+ * Written across the top of the band, the name sat where the first gutter and
+ * the channel above the band's first row both run, so wires went through it.
+ */
+const LABEL_STRIP = 24;
 
 const BANDS: Array<{ layer: string; label: string }> = [
 	{ layer: 'business', label: 'Business' },
@@ -130,8 +138,24 @@ const BANDS: Array<{ layer: string; label: string }> = [
 export function wrapName(name: string): string[] {
 	if (name.length <= CHARS_PER_LINE) return [name];
 
+	// A word longer than a line is broken across lines, with a hyphen. Kept
+	// whole, "Fahrzeugdisponierungssystem" ran out of both sides of its box.
+	const words = name
+		.split(/\s+/)
+		.filter(Boolean)
+		.flatMap((word) => {
+			if (word.length <= CHARS_PER_LINE) return [word];
+			const pieces: string[] = [];
+			for (let at = 0; at < word.length; at += CHARS_PER_LINE - 1) {
+				const rest = word.length - at;
+				pieces.push(rest > CHARS_PER_LINE ? `${word.slice(at, at + CHARS_PER_LINE - 1)}-` : word.slice(at));
+				if (rest <= CHARS_PER_LINE) break;
+			}
+			return pieces;
+		});
+
 	const lines: string[] = [''];
-	for (const word of name.split(/\s+/)) {
+	for (const word of words) {
 		const current = lines[lines.length - 1];
 		if (current && `${current} ${word}`.length > CHARS_PER_LINE) lines.push(word);
 		else lines[lines.length - 1] = current ? `${current} ${word}` : word;
@@ -139,9 +163,11 @@ export function wrapName(name: string): string[] {
 
 	if (lines.length <= MAX_NAME_LINES) return lines;
 
-	// Rather than drop the tail silently, mark that it was shortened.
+	// Rather than drop the tail silently, mark that it was shortened — inside
+	// the line's width, or the mark itself is what spills out of the box.
 	const kept = lines.slice(0, MAX_NAME_LINES);
-	kept[MAX_NAME_LINES - 1] = `${kept[MAX_NAME_LINES - 1]}…`;
+	const last = kept[MAX_NAME_LINES - 1].replace(/-$/, '');
+	kept[MAX_NAME_LINES - 1] = `${last.slice(0, CHARS_PER_LINE - 1).trimEnd()}…`;
 	return kept;
 }
 
@@ -431,7 +457,7 @@ export function layoutDiagram(
 
 	const gutterX: number[] = [];
 	const columnX: number[] = [];
-	let x = MARGIN;
+	let x = MARGIN + LABEL_STRIP;
 	for (let column = 0; column < perRow; column++) {
 		gutterX.push(x);
 		x += gutterWidth[column];
@@ -473,7 +499,8 @@ export function layoutDiagram(
 			x: MARGIN,
 			y: top,
 			width: width - MARGIN * 2,
-			height: bottom - top
+			height: bottom - top,
+			labelArea: { x: MARGIN, y: top, width: LABEL_STRIP, height: bottom - top }
 		};
 	});
 

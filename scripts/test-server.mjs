@@ -1,7 +1,7 @@
 /** Boundary regressions with real SQLite/Git and simulated external services. */
 import assert from 'node:assert/strict';
 import { registerHooks } from 'node:module';
-import { existsSync, mkdtempSync, rmSync, readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, rmSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -56,7 +56,8 @@ registerHooks({
     if (url === oidcEntry) return {
       format: 'module', shortCircuit: true,
       source: `export async function discovery() { return {}; }
-        export async function authorizationCodeGrant() {
+        export async function authorizationCodeGrant(config, url, checks) {
+          globalThis.specmanTestChecks = checks;
           return { claims() { return globalThis.specmanTestClaims; } };
         }`
     };
@@ -68,6 +69,7 @@ const store = await import('../src/lib/server/db/index.ts');
 const proposals = await import('../src/lib/server/proposals.ts');
 const repo = await import('../src/lib/server/git/repo.ts');
 const { completeLogin, OidcNameCollision } = await import('../src/lib/server/auth/oidc.ts');
+const auth = await import('../src/lib/server/auth/index.ts');
 const { GatewayProvider, gateway } = await import('../src/lib/server/llm/gateway.ts');
 const { verifyDocument } = await import('../src/lib/server/llm/verification.ts');
 const chat = await import('../src/routes/api/chat/+server.ts');
@@ -131,7 +133,7 @@ try {
     [store.getProject(999).document_revision, store.getProject(999).name], [0, 'Legacy project']);
   database.prepare("INSERT INTO users (username,is_admin,created_via) VALUES ('original-admin',1,'oidc')").run();
   database.prepare("INSERT INTO oidc_identities (user_id,issuer,subject) VALUES (1,?,'original-subject')").run(process.env.OIDC_ISSUER);
-  const login = () => completeLogin(new URL('https://fixture.invalid/callback'), 'state', 'verifier');
+  const login = () => completeLogin(new URL('https://fixture.invalid/callback'), 'state', 'verifier', 'nonce');
   globalThis.specmanTestClaims = { iss: process.env.OIDC_ISSUER, sub: 'different-subject', preferred_username: 'original-admin' };
   await rejects('a recycled SSO name cannot inherit administrator rights', login, OidcNameCollision);
   check('a refused subject gains no identity link', database.prepare('SELECT COUNT(*) AS n FROM oidc_identities').get().n, 1);
@@ -143,6 +145,22 @@ try {
   database.prepare("INSERT INTO users (username,created_via) VALUES ('proxy-colleague','proxy')").run();
   globalThis.specmanTestClaims = { iss: process.env.OIDC_ISSUER, sub: 'proxy-collision', preferred_username: 'proxy-colleague' };
   await rejects('OIDC cannot adopt a proxy account with the same name', login, OidcNameCollision);
+  check('the ID token is bound to the nonce of this attempt', globalThis.specmanTestChecks.expectedNonce, 'nonce');
+
+  // The mirror: a header naming a company sign-in account is not that subject.
+  const proxyHeaders = (name) => (headerName) => headerName.toLowerCase() === 'x-forwarded-user' ? name : null;
+  check('the proxy cannot adopt a company sign-in account', auth.userForProxyHeaders(proxyHeaders('new-colleague'), '127.0.0.1'), null);
+  check('but resumes an account the proxy made', auth.userForProxyHeaders(proxyHeaders('proxy-colleague'), '127.0.0.1')?.username, 'proxy-colleague');
+
+  // A name with no password costs the same hash as a wrong password, so the
+  // reply does not say which names exist.
+  auth.createUser({ username: 'timed-colleague', password: 'correct horse' });
+  check('a password account signs in', (await auth.login('timed-colleague', 'correct horse'))?.username, 'timed-colleague');
+  check('a wrong password does not', await auth.login('timed-colleague', 'wrong'), null);
+  const timed = async (name) => { const start = performance.now(); await auth.login(name, 'wrong'); return performance.now() - start; };
+  const known = await timed('timed-colleague');
+  const unknown = await timed('nobody-at-all');
+  check('an unknown name still costs a hash', unknown > known / 4, true);
 
   globalThis.fetch = async () => new Response(textFrame('partial') + frame({ type: 'error', error: { type: 'overloaded_error' } }));
   await rejects('an SSE error after text fails the stream', () => readStream(), /interrupted/);
@@ -158,6 +176,8 @@ try {
   check('CRLF frames split at every byte still complete', (await readStream()).map((e) => e.type), ['text', 'done']);
   globalThis.fetch = async () => new Response(stopFrame);
   check('a successfully empty response is allowed', (await readStream()).map((e) => e.type), ['done']);
+  globalThis.fetch = async () => new Response(frame({ type: 'message_delta', delta: { stop_reason: 'end_turn' }, usage: { output_tokens: 4000 } }) + stopFrame);
+  await rejects('silence that spent the whole budget is not a clean answer', () => readStream(), /ran out of room/);
   globalThis.fetch = async () => new Response(textFrame('complete') + 'data: [DONE]\n\n');
   check('an explicit gateway DONE sentinel also completes', (await readStream()).map((e) => e.type), ['text', 'done']);
 
@@ -268,6 +288,15 @@ try {
   await decisionsApi.POST(event({ projectId: decisionProject.id, id: discarded.id, action: 'discard' }));
   const afterDiscard = await repo.specInputOnBranch(decisionProject.repo_path, proposals.openProposal(decisionProject.id).branch);
   check('discard removes the assumption from the committed export', afterDiscard.decisions.some(d => d.statement === discarded.statement), false);
+  const reopened = store.getChapter(decisionProject.id, 'overview');
+  check('a rejected assumption puts its chapter back in progress', reopened.status, 'in_progress');
+  check('with the question at the top of its open questions', reopened.open_questions[0], proposals.questionForRejected(discarded.statement));
+  check('and the assistant asks it in that chapter', store.recentMessages(decisionProject.id, 'overview', 1)[0].content, proposals.questionForRejected(discarded.statement));
+  check('which reaches the committed proposal too', afterDiscard.chapters.find(c => c.key === 'overview').open_questions[0], proposals.questionForRejected(discarded.statement));
+  await rejects('a decision settled in another window is reported as such', () => decisionsApi.POST(event({ projectId: decisionProject.id, id: discarded.id, action: 'discard' })), e => e.status === 409 && e.body.message.includes('another window'));
+  const confirmedAt = store.getDecision(decision.id).confirmed_at;
+  store.confirmDecision(decisionProject.id, decision.id);
+  check('confirming twice keeps the first confirmation time', store.getDecision(decision.id).confirmed_at, confirmedAt);
   await rejects('unknown decision actions are refused', () => decisionsApi.POST(event({ projectId: decisionProject.id, id: decision.id, action: 'bogus' })), e => e.status === 400);
   const queuedDecision = store.saveDecision(decisionProject.id, { chapterKey: 'overview', statement: 'Wait for the repository', rationale: '', source: 'assistant' });
   await proposals.commitDocument(decisionProject, 'Decision waiting to be confirmed');
@@ -445,6 +474,67 @@ try {
   check('a stale assessment cannot erase newer open questions', [store.getChapter(assessing.id, 'overview').status,
     store.getChapter(assessing.id, 'overview').open_questions], ['in_progress', ['A newer question?']]);
 
+  console.log('\n--- what a turn files where ---');
+  const filing = fixtureProject('filing');
+  store.updateChapterState(filing.id, 'overview', { contentMd: 'Kept prose' });
+  let seenMessages = [];
+  const turn = async (text, chapterKey = 'overview', message = 'An answer') => {
+    gateway.streamChat = async function* (req) {
+      seenMessages = req.messages;
+      yield { type: 'text', text };
+      yield { type: 'done', servedBy: 'fixture', outputTokens: 1 };
+    };
+    return (await chat.POST(event({ projectId: filing.id, chapterKey, message }))).text();
+  };
+  gateway.callWithTools = async () => { throw new Error('Simulated assessment outage'); };
+  await turn('<chapter key="overview"></chapter>Thanks.');
+  check('an empty chapter block does not erase the chapter', store.getChapter(filing.id, 'overview').content_md, 'Kept prose');
+  await turn('<chapter>Written without a key.</chapter>Done.');
+  check('a block with no key writes the chapter under discussion', store.getChapter(filing.id, 'overview').content_md, 'Written without a key.');
+  const securityTitle = store.getChapter(filing.id, 'security').title;
+  await turn(`<chapter key="${securityTitle}">Filed by its title.</chapter>Done.`);
+  check('a block naming the title instead of the key still lands', store.getChapter(filing.id, 'security').content_md, 'Filed by its title.');
+  check('a chapter written while its assessment failed is no longer empty', store.getChapter(filing.id, 'security').status, 'in_progress');
+  const unfiledEvents = await turn('<chapter key="no-such-chapter">Lost words.</chapter>Done.');
+  check('a block for no chapter is reported, not silently dropped', unfiledEvents.includes('could not be filed'), true);
+  await turn('<chapter key="overview">Nothing but a block.</chapter>');
+  check('a reply with no words is not stored as an empty turn', store.recentMessages(filing.id, 'overview', 1)[0].role, 'user');
+  await turn('Here is my next question?');
+  check('an empty turn is never sent to the gateway', seenMessages.every((m) => m.content.trim().length > 0), true);
+  check('two user turns in a row are sent as one', seenMessages.some((m, i) => i > 0 && seenMessages[i - 1].role === m.role), false);
+
+  const standard = store.saveRequirement(filing.id, { chapterKey: 'security', statement: 'A company rule', scope: 'now', scenarios: [], source: 'standard' });
+  await turn(`<requirement ref="${standard.ref}" action="remove"></requirement>Removed.`);
+  check('the assistant cannot delete a company standard', store.getRequirement(filing.id, standard.ref)?.statement, 'A company rule');
+  const elsewhere = store.saveRequirement(filing.id, { chapterKey: 'security', statement: 'Lives in security', scope: 'now', scenarios: [] });
+  await turn(`<requirement ref="${elsewhere.ref}" scope="later">Lives in security, later\nWHEN a\nTHEN b</requirement>Changed.`);
+  check('a requirement restated by reference keeps its chapter', [store.getRequirement(filing.id, elsewhere.ref).chapter_key, store.getRequirement(filing.id, elsewhere.ref).scope], ['security', 'later']);
+
+  const setAside = store.projectChapters(filing.id).find((c) => !['overview', 'security'].includes(c.key) && !c.parent_key);
+  store.setChapterApplicable(filing.id, setAside.key, false, 'Fixture triage');
+  await turn(`<chapter key="${setAside.key}">It applies after all.</chapter>Done.`);
+  check('writing into a set-aside chapter brings it back into scope', store.getChapter(filing.id, setAside.key).applicable, 1);
+
+  // Clicking an open question stores it as the assistant's turn; the answer follows.
+  const splitChapter = store.projectChapters(filing.id).find((c) => c.is_dynamic && !c.parent_key);
+  store.applySectionPlan(filing.id, splitChapter, [{ key: 'booking', title: 'Booking a car' }, { key: 'returns', title: 'Returning a car' }]);
+  store.updateChapterState(filing.id, 'returns', { contentMd: 'Already written returns.' });
+  await turn(`<chapter key="${splitChapter.key}">Intro.\n\n## Booking a car\nPick a day.\n\n## Returning a car\nOverwrite attempt.</chapter>Done.`, splitChapter.key);
+  check('prose written back into a split chapter is filed into its empty section', store.getChapter(filing.id, 'booking').content_md, 'Pick a day.');
+  check('but never over a section already written', store.getChapter(filing.id, 'returns').content_md, 'Already written returns.');
+  check('and what was filed leaves the parent', store.getChapter(filing.id, splitChapter.key).content_md.includes('Pick a day.'), false);
+
+  const untouched = store.projectChapters(filing.id).find((c) => !['overview', 'security', setAside.key, splitChapter.key].includes(c.key) && !c.parent_key);
+  store.addMessage(filing.id, untouched.key, 'assistant', 'Who may see the backups?');
+  await turn('Recorded.', untouched.key, 'Only the fleet office');
+  check('the question a clicked open question asked reaches the model',
+    [seenMessages.length, seenMessages[0].role, seenMessages[1].content, seenMessages[2].content],
+    [3, 'user', 'Who may see the backups?', 'Only the fleet office']);
+
+  gateway.streamChat = async function* () { throw Object.assign(new Error('Gateway stream failed with 502'), { name: 'GatewayError' }); };
+  const plainFailure = await (await chat.POST(event({ projectId: filing.id, chapterKey: 'overview', message: 'Again' }))).text();
+  check('a gateway failure reaches the user in plain words', plainFailure.includes('cannot be reached') && !plainFailure.includes('502'), true);
+
   console.log('\n--- durable approval cut points ---');
   for (const phase of ['before-merge', 'after-merge', 'during-bundle', 'after-bundle']) {
     const recovering = fixtureProject(`recovery-${phase}`);
@@ -595,15 +685,155 @@ try {
   const usersBefore = store.countUsers();
   database.exec(`CREATE TRIGGER interrupt_identity_insert BEFORE INSERT ON oidc_identities
     WHEN NEW.subject = 'atomic-identity' BEGIN SELECT RAISE(ABORT, 'Simulated identity failure'); END;`);
-  await rejects('an interrupted identity link rolls back the new account', () => completeLogin(new URL('https://fixture.invalid/callback'), 'state', 'verifier'), /Simulated identity failure/);
+  await rejects('an interrupted identity link rolls back the new account', () => completeLogin(new URL('https://fixture.invalid/callback'), 'state', 'verifier', 'nonce'), /Simulated identity failure/);
   check('identity failure leaves no orphan account', store.countUsers(), usersBefore);
   database.exec('DROP TRIGGER interrupt_identity_insert');
-  const concurrentLogins = await Promise.all([1, 2].map(() => completeLogin(new URL('https://fixture.invalid/callback'), 'state', 'verifier')));
+  const concurrentLogins = await Promise.all([1, 2].map(() => completeLogin(new URL('https://fixture.invalid/callback'), 'state', 'verifier', 'nonce')));
   check('concurrent sign-in resumes the same authoritative identity', concurrentLogins[0].id, concurrentLogins[1].id);
   check('concurrent registration creates one ordinary account', [store.countUsers(), concurrentLogins[0].is_admin], [usersBefore + 1, 0]);
   assert.throws(() => database.prepare('INSERT INTO oidc_identities (user_id,issuer,subject) VALUES (?,?,?)')
     .run(1, process.env.OIDC_ISSUER, 'atomic-identity'), /UNIQUE/);
   check('a duplicate authoritative identity cannot replace its ordinary owner', database.prepare('SELECT user_id FROM oidc_identities WHERE issuer = ? AND subject = ?').get(process.env.OIDC_ISSUER, 'atomic-identity').user_id, concurrentLogins[0].id);
+
+  console.log('\n--- storage that is run once and kept ---');
+  check('each one-off repair is recorded as done',
+    database.prepare("SELECT name FROM migrations WHERE name IN ('file-section-content','drop-navigation-questions') ORDER BY name").all().map((row) => row.name),
+    ['drop-navigation-questions', 'file-section-content']);
+  check('a busy database is waited for rather than refused', database.prepare('PRAGMA busy_timeout').get().timeout, 5000);
+  const firstTemplateChapter = store.templateChapters(store.defaultTemplate().id)[0];
+  store.updateTemplateChapter(firstTemplateChapter.id, { goal: '' });
+  // A second boot, in its own process, against the same file — which is what a restart is.
+  const { execFileSync } = await import('node:child_process');
+  execFileSync(process.execPath, ['--import', new URL('./ts-resolve.mjs', import.meta.url).href, '--input-type=module', '-e',
+    `const s = await import(${JSON.stringify(new URL('../src/lib/server/db/index.ts', import.meta.url).href)}); s.db().close();`],
+    { env: process.env, stdio: 'pipe' });
+  check('a goal an administrator cleared is not written back at the next start',
+    store.templateChapters(store.defaultTemplate().id)[0].goal, '');
+  const migratedProject = fixtureProject('migrated-document');
+  database.prepare('INSERT INTO migrated_documents (project_id, summary) VALUES (?, ?)').run(migratedProject.id, 'Moved section text');
+  check('the repair is listed until it reaches the repository',
+    store.projectsMigratedAtStartup().some((entry) => entry.projectId === migratedProject.id), true);
+  await proposals.commitDocument(migratedProject, 'Write the repaired document');
+  check('and not after',
+    store.projectsMigratedAtStartup().some((entry) => entry.projectId === migratedProject.id), false);
+
+  database.exec(`CREATE TRIGGER interrupt_project_chapters BEFORE INSERT ON chapters
+    WHEN (SELECT name FROM projects WHERE id = NEW.project_id) = 'half-made' BEGIN SELECT RAISE(ABORT, 'Simulated chapter failure'); END;`);
+  assert.throws(() => fixtureProject('half-made'), /Simulated chapter failure/);
+  check('an application whose chapters could not be made is not left behind', store.slugExists('half-made'), false);
+  database.exec('DROP TRIGGER interrupt_project_chapters');
+
+  console.log('\n--- creating an application ---');
+  const home = await import('../src/routes/+page.server.ts');
+  const cwd = process.cwd();
+  const createForm = (name) => ({ locals: { user: store.getUser(1) }, request: new Request('https://fixture.invalid/?/create', {
+    method: 'POST', body: new URLSearchParams({ name, description: '', reach: 'team', personalData: 'no' })
+  }) });
+  process.chdir(root);
+  try {
+    // A file where the repositories folder should be: every repository fails.
+    writeFileSync(join(root, 'data'), 'not a folder');
+    const failed = await home.actions.create(createForm('Doomed tool'));
+    check('a repository that cannot be made is answered in words', [failed.status, failed.data.message.startsWith('The application could not be created.')], [503, true]);
+    check('and leaves no application behind', store.listProjects().some((p) => p.name === 'Doomed tool'), false);
+    rmSync(join(root, 'data'));
+    const made = await home.actions.create(createForm('Con')).catch((thrown) => thrown);
+    check('a created application goes to its page', made.status, 303);
+    const con = store.listProjects().find((p) => p.name === 'Con');
+    check('a Windows device name is not used as a folder', con.slug, 'con-app');
+    check('and its repository exists', existsSync(join(con.repo_path, '.git')), true);
+    const loaded = await home.load({});
+    const card = loaded.projects.find((p) => p.id === con.id);
+    check('the home card counts what the index counts', card.total, store.projectChapters(con.id).filter((c) => c.applicable !== 0).length);
+  } finally {
+    process.chdir(cwd);
+  }
+
+  console.log('\n--- a repository picked up where it stopped ---');
+  const unborn = join(root, 'unborn-repo');
+  mkdirSync(unborn, { recursive: true });
+  await simpleGit(unborn).init();
+  await repo.ensureRepo(unborn, 'Unborn');
+  check('an initialisation that stopped after init is finished', (await simpleGit(unborn).raw(['rev-parse', '--abbrev-ref', 'HEAD'])).trim(), 'main');
+  const otherBranch = join(root, 'master-repo');
+  mkdirSync(otherBranch, { recursive: true });
+  const og = simpleGit(otherBranch);
+  await og.init(['--initial-branch', 'master']);
+  await og.addConfig('user.name', 'Fixture');
+  await og.addConfig('user.email', 'fixture@localhost');
+  writeFileSync(join(otherBranch, 'README.md'), '# x\n');
+  await og.add('.');
+  await og.commit('First');
+  await repo.ensureRepo(otherBranch, 'Other');
+  check('history without main gains main at its first commit',
+    (await og.raw(['rev-parse', 'main'])).trim(), (await og.raw(['rev-list', '--max-parents=0', 'HEAD'])).trim());
+  check('a folder with no repository has no manifest', await repo.manifestOnBranch(join(root, 'nowhere'), 'main'), null);
+  check('a branch with no manifest has none', await repo.manifestOnBranch(otherBranch, 'main'), null);
+  await rejects('a branch that does not exist is an error, not an empty manifest',
+    () => repo.manifestOnBranch(otherBranch, 'no-such-branch'), Error);
+
+  console.log('\n--- drawing the diagram ---');
+  const architectureApi = await import('../src/routes/api/architecture/+server.ts');
+  const drawProject = fixtureProject('draw-project');
+  const drawEvent = () => event({ projectId: drawProject.id });
+  store.saveArchitecture(drawProject.id, [{ id: 'employee', name: 'Employee', type: 'actor', layer: 'business', chapter: '' }], []);
+  const { GatewayError } = await import('../src/lib/server/llm/gateway.ts');
+  gateway.streamChat = async function* () { throw new GatewayError('Gateway stream failed with 502'); };
+  let drawn = await architectureApi.POST(drawEvent());
+  const drawingOutage = (await drawn.json()).message;
+  check('an outage while drawing is answered in words', [drawn.status, drawingOutage.startsWith('The diagram could not be drawn.')], [503, true]);
+  check('and does not claim a message was saved, because none was sent', drawingOutage.includes('message is saved'), false);
+  gateway.streamChat = async function* () { yield { type: 'text', text: 'I could not find anything.' }; yield { type: 'done', servedBy: 'fixture', outputTokens: 5 }; };
+  drawn = await architectureApi.POST(drawEvent());
+  check('nothing usable is refused, not stored', drawn.status, 422);
+  check('and the previous picture is still the one shown', store.latestArchitecture(drawProject.id).elements.length, 1);
+  store.saveArchitecture(drawProject.id, [], []);
+  check('an empty drawing left from before does not hide the good one', store.latestArchitecture(drawProject.id).elements.length, 1);
+  gateway.streamChat = async function* (req) {
+    const text = req.system.includes('listing the parts')
+      ? '<element type="actor" name="Employee" chapter="overview" />\n<element type="service" name="Booking" chapter="x&quot;>" />'
+      : '<relation from="Employee" to="Booking" kind="assigned" />';
+    yield { type: 'text', text };
+    yield { type: 'done', servedBy: 'fixture', outputTokens: 5 };
+  };
+  drawn = await architectureApi.POST(drawEvent());
+  const drawnBody = await drawn.json();
+  check('a drawing with something in it is stored', [drawn.status, store.latestArchitecture(drawProject.id).elements.length], [200, 2]);
+  check('a chapter link the model made up is dropped', drawnBody.elements.map((e) => e.chapter), ['overview', '']);
+  gateway.streamChat = realStream;
+
+  console.log('\n--- administrators editing what every document copies ---');
+  const standardsAdmin = await import('../src/routes/admin/standards/+page.server.ts');
+  const templatesAdmin = await import('../src/routes/admin/templates/+page.server.ts');
+  const adminForm = (url, fields) => ({ locals: { user: store.getUser(1) }, request: new Request(`https://fixture.invalid/${url}`, {
+    method: 'POST', body: new URLSearchParams(fields)
+  }) });
+  const someStandard = store.listStandards()[0];
+  const typo = await standardsAdmin.actions.save(adminForm('admin/standards?/save', { id: String(someStandard.id), statement: someStandard.statement, appliesWhen: 'personal-data' }));
+  check('a misspelt condition is refused by name', [typo.status, typo.data.message.includes('personal-data')], [400, true]);
+  check('and the standard is unchanged', store.listStandards()[0].applies_when, someStandard.applies_when);
+  await standardsAdmin.actions.save(adminForm('admin/standards?/save', { id: String(someStandard.id), statement: someStandard.statement, appliesWhen: '' }));
+  check('a cleared condition means always, not never', store.listStandards()[0].applies_when, ['always']);
+  const goneStandard = await standardsAdmin.actions.save(adminForm('admin/standards?/save', { id: '987654', statement: 'x' }));
+  check('a standard that is gone is an answer, not a crash', goneStandard.status, 400);
+  const blankTitle = await templatesAdmin.actions.save(adminForm('admin/templates?/save', { id: String(firstTemplateChapter.id), title: ' ', purpose: 'p' }));
+  check('a chapter cannot be given a blank title', blankTitle.status, 400);
+  const blankPurpose = await templatesAdmin.actions.save(adminForm('admin/templates?/save', { id: String(firstTemplateChapter.id), title: 'T', purpose: '' }));
+  check('or a blank purpose', blankPurpose.status, 400);
+  check('and neither was saved', store.templateChapters(store.defaultTemplate().id)[0].title, firstTemplateChapter.title);
+  const goneChapter = await templatesAdmin.actions.save(adminForm('admin/templates?/save', { id: '987654', title: 'T', purpose: 'p' }));
+  check('a template chapter that is gone is an answer, not a crash', goneChapter.status, 400);
+
+  console.log('\n--- including a chapter that was set aside ---');
+  const projectPage = await import('../src/routes/projects/[id]/+page.server.ts');
+  const includeProject = fixtureProject('include-project');
+  await proposals.ensureWorkingProposal(includeProject);
+  store.setChapterApplicable(includeProject.id, 'security', false, 'Not needed for a team tool');
+  const beforeInclude = (await simpleGit(includeProject.repo_path).raw(['rev-list', '--count', 'HEAD'])).trim();
+  const included = await projectPage.actions.include({ params: { id: String(includeProject.id) }, locals: { user: store.getUser(1) },
+    request: new Request('https://fixture.invalid/?/include', { method: 'POST', body: new URLSearchParams({ key: 'security' }) }) });
+  check('the user can overrule the triage', [included.included, store.getChapter(includeProject.id, 'security').applicable], ['security', 1]);
+  check('and the change is committed like any other', Number((await simpleGit(includeProject.repo_path).raw(['rev-list', '--count', 'HEAD'])).trim()) > Number(beforeInclude), true);
 } finally {
   globalThis.fetch = realFetch;
   gateway.streamChat = realStream;

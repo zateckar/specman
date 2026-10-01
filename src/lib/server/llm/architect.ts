@@ -106,50 +106,49 @@ The document, chapter by chapter, with what each says must be true:
 
 ${structure}`;
 
-	try {
-		// Two calls rather than one. Naming the parts and then connecting them are
-		// separate jobs, and asking for both at once spent the entire output budget
-		// on reasoning and produced nothing at all. Each half is small, and the
-		// second is nearly mechanical because the list of names is given to it.
-		const elements = await collect(
-			`You are listing the parts of an application described in a design document,
+	// A failed call is thrown, not turned into an empty model. Swallowed here, it
+	// was saved as the application's diagram and replaced a good picture with
+	// "nothing could be drawn" — the caller decides what an outage means.
+	//
+	// Two calls rather than one. Naming the parts and then connecting them are
+	// separate jobs, and asking for both at once spent the entire output budget
+	// on reasoning and produced nothing at all. Each half is small, and the
+	// second is nearly mechanical because the list of names is given to it.
+	const elements = await collect(
+		`You are listing the parts of an application described in a design document,
 as layers in the manner of ArchiMate. You are describing what the document
 already says — you are not designing anything, and you must not add parts it
 does not mention.
 
 ${ELEMENT_FORMAT}`,
-			document,
-			(parser) =>
-				parser
-					.blocksOf('element')
-					.map((block) => toElement(block.attrs, block.body))
-					.filter((element): element is Element => element !== null),
-			args.signal
-		);
+		document,
+		(parser) =>
+			parser
+				.blocksOf('element')
+				.map((block) => toElement(block.attrs, block.body))
+				.filter((element): element is Element => element !== null),
+		args.signal
+	);
 
-		if (elements.length === 0) return { elements: [], relations: [] };
+	if (elements.length === 0) return { elements: [], relations: [] };
 
-		const named = elements.map((element) => `- ${element.name} (${element.type})`).join('\n');
+	const named = elements.map((element) => `- ${element.name} (${element.type})`).join('\n');
 
-		const relations = await collect(
-			`You are connecting up the parts of an application that have already been
+	const relations = await collect(
+		`You are connecting up the parts of an application that have already been
 identified, using only what its design document supports.
 
 ${RELATION_FORMAT}`,
-			`${document}\n\nThe parts, which are the only things you may name:\n${named}`,
-			(parser) =>
-				parser
-					.blocksOf('relation')
-					.map((block) => toRelation(block.attrs))
-					.filter((relation): relation is Relation => relation !== null),
-			args.signal
-		);
+		`${document}\n\nThe parts, which are the only things you may name:\n${named}`,
+		(parser) =>
+			parser
+				.blocksOf('relation')
+				.map((block) => toRelation(block.attrs))
+				.filter((relation): relation is Relation => relation !== null),
+		args.signal
+	);
 
-		return buildModel(elements, relations);
-	} catch (error) {
-		console.warn('[architect] could not derive the model:', error);
-		return { elements: [], relations: [] };
-	}
+	return buildModel(elements, relations);
 }
 
 /** One streamed call, parsed. Reports an empty result rather than hiding it. */

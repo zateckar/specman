@@ -22,7 +22,12 @@ export const actions: Actions = {
 
 		const form = await request.formData();
 		const id = Number(form.get('id'));
-		if (!id) return fail(400, { message: 'Missing chapter id' });
+		if (!id) return fail(400, { failed: id, message: 'Missing chapter id' });
+		// A chapter removed since the page loaded is an answer, not a crash.
+		const known = listTemplates().some((template) =>
+			templateChapters(template.id).some((chapter) => chapter.id === id)
+		);
+		if (!known) return fail(400, { failed: id, message: 'That chapter is no longer there. Reload the page.' });
 
 		const lines = (value: FormDataEntryValue | null) =>
 			String(value ?? '')
@@ -30,10 +35,18 @@ export const actions: Actions = {
 				.map((line) => line.trim())
 				.filter(Boolean);
 
+		// Every new application copies these. A blank title is a chapter nobody can
+		// find in the index; a blank purpose is a chapter the assistant has no
+		// guidance for — both would be copied into every document from now on.
+		const title = String(form.get('title') ?? '').trim();
+		const purpose = String(form.get('purpose') ?? '').trim();
+		if (!title) return fail(400, { failed: id, message: 'A chapter needs a title.' });
+		if (!purpose) return fail(400, { failed: id, message: 'A chapter needs a purpose — it is what the assistant works from.' });
+
 		updateTemplateChapter(id, {
-			title: String(form.get('title') ?? '').trim(),
+			title,
 			goal: String(form.get('goal') ?? '').trim(),
-			purpose: String(form.get('purpose') ?? '').trim(),
+			purpose,
 			questions: lines(form.get('questions')),
 			criteria: lines(form.get('criteria'))
 		});

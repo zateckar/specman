@@ -1,6 +1,6 @@
 import { error, json } from '@sveltejs/kit';
 import { getDecision, getProject } from '$lib/server/db';
-import { recordDecision } from '$lib/server/proposals';
+import { DecisionNotFound, recordDecision } from '$lib/server/proposals';
 import type { RequestHandler } from './$types';
 
 /**
@@ -21,12 +21,17 @@ export const POST: RequestHandler = async ({ request, locals }) => {
 	if (!project) throw error(404, 'No such project');
 
 	const decision = getDecision(id);
-	if (!decision || decision.project_id !== project.id) throw error(404, 'No such decision');
+	if (!decision || decision.project_id !== project.id) {
+		throw error(409, 'That decision is no longer there. It may have been settled in another window.');
+	}
 	if (action !== 'confirm' && action !== 'discard') throw error(400, 'Unknown decision action');
 
 	try {
 		await recordDecision(project, id, action);
 	} catch (cause) {
+		// Settled in another window while this request waited for the repository.
+		// Not a storage failure, and saying it was one would be untrue.
+		if (cause instanceof DecisionNotFound) throw error(409, cause.message);
 		console.error('[decisions] could not record the decision:', cause);
 		const applied = action === 'discard' ? !getDecision(id) : getDecision(id)?.status === 'confirmed';
 		throw error(503, applied

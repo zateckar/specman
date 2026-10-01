@@ -2,20 +2,26 @@ import { writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import {
 	db,
+	addMessage,
+	atomically,
+	clearMigrated,
 	documentRevision,
 	DocumentConflict,
 	confirmDecision,
 	deleteDecision,
+	getChapter,
 	getDecision,
 	getProject,
+	updateChapterState,
 	projectChapters,
 	projectDecisions,
 	projectRequirements,
 	saveVerification,
+	setChapterApplicable,
 	type VerificationRow,
 	projectsMigratedAtStartup
 } from './db';
-import type { Project, Proposal } from './db/types';
+import type { Decision, Project, Proposal } from './db/types';
 import {
 	MAIN_BRANCH,
 	checkoutBranch,
@@ -125,6 +131,9 @@ async function commitWorkingDocument(project: Project, message: string): Promise
 	);
 	writeFileSync(join(project.repo_path, 'specman.export.json'), JSON.stringify(input, null, 2) + '\n', 'utf8');
 	const commit = await commitAll(project.repo_path, message, proposal.branch);
+	// The whole document is in the repository now, whether or not anything
+	// changed, so a repair waiting to reach it has.
+	clearMigrated(project.id);
 
 	if (commit) {
 		db()
@@ -135,15 +144,72 @@ async function commitWorkingDocument(project: Project, message: string): Promise
 	return commit;
 }
 
+/** The decision is gone — another tab discarded it first. */
+export class DecisionNotFound extends Error {
+	constructor() {
+		super('That decision is no longer there. It may have been settled in another window.');
+		this.name = 'DecisionNotFound';
+	}
+}
+
+/** What the assistant asks once the user says an assumption was wrong. */
+export function questionForRejected(statement: string): string {
+	return `Earlier I chose this for you: “${statement.trim()}”. You said that is not right — what should it be instead?`;
+}
+
 /** A decision change and its commit share the approval lock. */
 export async function recordDecision(project: Project, id: number, action: 'confirm' | 'discard'): Promise<void> {
 	await withRepo(project.repo_path, async () => {
 		await recoverApproval(project);
 		const decision = getDecision(id);
-		if (!decision || decision.project_id !== project.id) throw new Error('No such decision');
-		if (action === 'discard') deleteDecision(project.id, id);
+		if (!decision || decision.project_id !== project.id) throw new DecisionNotFound();
+		if (action === 'discard') reopenRejected(project, decision);
 		else confirmDecision(project.id, id);
 		await commitWorkingDocument(project, action === 'discard' ? 'Discard a proposed decision' : 'Confirm a proposed decision');
+	});
+}
+
+/**
+ * Bring a chapter the triage set aside back into the document.
+ *
+ * The index told the user to "open one if you think it does apply", and opening
+ * it changed nothing: the chapter stayed out of the progress, the export and the
+ * handoff until something happened to be written in it. This is the overruling
+ * the triage promised, as a deliberate act, committed like any other change.
+ */
+export async function includeChapter(project: Project, key: string): Promise<void> {
+	await withRepo(project.repo_path, async () => {
+		await recoverApproval(project);
+		const chapter = getChapter(project.id, key);
+		if (!chapter || chapter.applicable !== 0) return;
+		setChapterApplicable(project.id, key, true);
+		await commitWorkingDocument(project, `Include ${chapter.title}`);
+	});
+}
+
+/**
+ * "Not right" does not end the matter; it reopens it.
+ *
+ * Deleting the row was all this used to do, while the page promised the question
+ * would be raised again — a plan with no owner. The rejected assumption stayed in
+ * the prose, and with nothing pending the chapter could read as complete and be
+ * approved resting on it. So the work is done here, at the moment the user says
+ * so: the chapter is put back in progress with the question at the top of its
+ * open questions, and the assistant asks it in that chapter's conversation.
+ * One transaction, so the decision cannot vanish without the question appearing.
+ */
+function reopenRejected(project: Project, decision: Decision): void {
+	const question = questionForRejected(decision.statement);
+	atomically(() => {
+		deleteDecision(project.id, decision.id);
+		const chapter = getChapter(project.id, decision.chapter_key);
+		if (chapter) {
+			updateChapterState(project.id, chapter.key, {
+				status: 'in_progress',
+				openQuestions: [question, ...chapter.open_questions.filter((q) => q !== question)]
+			});
+			addMessage(project.id, chapter.key, 'assistant', question);
+		}
 	});
 }
 
@@ -264,7 +330,8 @@ export function specInput(project: Project): ExportInput {
 		problems: validateDocument({
 			chapters: chapters.filter((c) => c.applicable !== 0),
 			requirements,
-			decisions
+			decisions,
+			setAside: chapters.filter((c) => c.applicable === 0)
 		})
 	};
 }
@@ -407,12 +474,13 @@ export class UnrecordedChanges extends Error {
 }
 
 /**
- * Write out any document the startup migration rewrote.
+ * Write out any document a startup repair rewrote.
  *
- * The migration rewrites chapters in the database; the repository is where the
+ * The repair rewrites chapters in the database; the repository is where the
  * document is read from and merged, so it has to be told. Committing the same
  * content twice is a no-op — `commitAll` returns null when the tree is
- * unchanged — so this is safe on every boot.
+ * unchanged — so this is safe on every boot, and an entry whose commit fails is
+ * still there to be tried at the next one.
  */
 export async function commitStartupMigrations(): Promise<void> {
 	for (const { projectId, summary } of projectsMigratedAtStartup()) {
@@ -423,8 +491,8 @@ export async function commitStartupMigrations(): Promise<void> {
 			const commit = await commitDocument(project, summary);
 			if (commit) console.info(`[proposals] recorded the startup migration for ${project.name}: ${summary}`);
 		} catch (cause) {
-			// The next conversation turn writes the document out anyway, so a failure
-			// here delays the repository catching up rather than losing anything.
+			// Kept as outstanding: the next boot tries again, and so does the next
+			// conversation turn, which writes the whole document out anyway.
 			console.error(`[proposals] could not record the startup migration for ${project.name}:`, cause);
 		}
 	}

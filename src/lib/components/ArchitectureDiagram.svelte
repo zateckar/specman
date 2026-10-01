@@ -30,6 +30,7 @@
 		y: number;
 		width: number;
 		height: number;
+		labelArea: { x: number; y: number; width: number; height: number };
 	}
 
 	let {
@@ -89,7 +90,31 @@
 		infrastructure: 'runs on'
 	};
 
+	// The same words as the legend under the picture, so the list and the
+	// picture say the same thing.
+	const VERB: Record<string, string> = {
+		assigned: 'carries out',
+		serves: 'supports',
+		accesses: 'reads or writes',
+		flow: 'passes information to'
+	};
+
 	const STEPS = [0.4, 0.5, 0.65, 0.8, 1, 1.25, 1.5, 2, 2.5, 3];
+
+	// The picture in words, for anyone who cannot see it — and for anyone who
+	// would rather read a list than follow lines.
+	const named = $derived(new Map(diagram.boxes.map((box) => [box.id, box.name])));
+	const inWords = $derived(
+		diagram.bands.map((band) => ({
+			label: band.label,
+			boxes: diagram.boxes.filter((box) => box.layer === band.layer)
+		}))
+	);
+	const connections = $derived(
+		diagram.edges
+			.filter((edge) => named.has(edge.from) && named.has(edge.to))
+			.map((edge) => `${named.get(edge.from)} ${VERB[edge.kind] ?? 'is connected to'} ${named.get(edge.to)}`)
+	);
 
 	let hovered = $state<string | null>(null);
 	let zoom = $state(1);
@@ -205,6 +230,11 @@
 
 	function onPointerUp() {
 		panning = false;
+		// The click that ends a drag arrives in the same task as the pointer
+		// coming up, so it is still swallowed. Anything later is a new click: left
+		// set, a drag that ended outside the frame ate the next one — a keyboard
+		// Enter on a box included, which has no pointer-down to clear it.
+		if (dragged) setTimeout(() => (dragged = false), 0);
 	}
 
 	function onClickCapture(event: MouseEvent) {
@@ -298,7 +328,7 @@
 		<span class="spacer"></span>
 		{#if exportHref}
 			<a class="download" href={exportHref} download
-				>Download for Archi<span class="hint">ArchiMate exchange file</span></a
+				>Download the diagram<span class="hint">opens in Archi and other modelling tools</span></a
 			>
 		{/if}
 		<button type="button" class="wide" onclick={toggleExpanded}>
@@ -311,8 +341,8 @@
 			width={Math.round(diagram.width * zoom)}
 			height={Math.round(diagram.height * zoom)}
 			viewBox="0 0 {diagram.width} {diagram.height}"
-			role="img"
-			aria-label="Layered diagram of the application"
+			role="group"
+			aria-label="Layered diagram of the application. The same is listed in words below it."
 		>
 			<defs>
 				<marker
@@ -378,18 +408,32 @@
 					stroke-opacity="0.3"
 					stroke-dasharray="4 4"
 				/>
-				<text x={band.x + 14} y={band.y + 21} class="band-label" fill={STROKE[band.layer]}
-					>{band.label}</text
+				{@const cx = band.labelArea.x + band.labelArea.width / 2 + 1}
+				{@const cy = band.labelArea.y + band.labelArea.height / 2}
+				<!-- Upright in its own strip, which no wire enters. -->
+				<text
+					x={cx}
+					y={cy}
+					transform="rotate(-90 {cx} {cy})"
+					class="band-label upright"
+					fill={STROKE[band.layer]}>{band.label}</text
 				>
 			{/each}
 
 			{#each diagram.boxes as box (box.id)}
-				<a href={box.chapter ? `/projects/${projectId}?chapter=${box.chapter}` : undefined}>
+				<!-- Focus picks out connections the way hovering does, so the picture can
+				     be followed from the keyboard too. -->
+				<a
+					href={box.chapter ? `/projects/${projectId}?chapter=${encodeURIComponent(box.chapter)}` : undefined}
+					aria-label="{box.name}, {TYPE_LABEL[box.type] ?? box.type}"
+					onfocus={() => (hovered = box.id)}
+					onblur={() => (hovered = null)}
+				>
 					<g
-						role="listitem"
 						opacity={faded(box.id) ? 0.35 : 1}
 						onmouseenter={() => (hovered = box.id)}
 						onmouseleave={() => (hovered = null)}
+						role="presentation"
 					>
 						<title>{box.name} — {TYPE_LABEL[box.type] ?? box.type}</title>
 						<rect
@@ -441,6 +485,35 @@
 			</g>
 		</svg>
 	</div>
+
+	<details class="words">
+		<summary>The diagram in words</summary>
+		{#each inWords as layer (layer.label)}
+			{#if layer.boxes.length > 0}
+				<h3>{layer.label}</h3>
+				<ul>
+					{#each layer.boxes as box (box.id)}
+						<li>
+							{#if box.chapter}
+								<a href="/projects/{projectId}?chapter={encodeURIComponent(box.chapter)}">{box.name}</a>
+							{:else}
+								{box.name}
+							{/if}
+							<span class="kind">— {TYPE_LABEL[box.type] ?? box.type}</span>
+						</li>
+					{/each}
+				</ul>
+			{/if}
+		{/each}
+		{#if connections.length > 0}
+			<h3>How they connect</h3>
+			<ul>
+				{#each connections as sentence, index (index)}
+					<li>{sentence}</li>
+				{/each}
+			</ul>
+		{/if}
+	</details>
 </div>
 
 <style>
@@ -558,6 +631,11 @@
 		letter-spacing: 0.09em;
 	}
 
+	.band-label.upright {
+		text-anchor: middle;
+		dominant-baseline: central;
+	}
+
 	.name {
 		font-size: 12px;
 		fill: #24312b;
@@ -570,5 +648,55 @@
 
 	a:hover .name {
 		text-decoration: underline;
+	}
+
+	button:focus-visible,
+	.download:focus-visible,
+	.words a:focus-visible,
+	summary:focus-visible {
+		outline: 2px solid var(--accent);
+		outline-offset: 2px;
+	}
+
+	/* An SVG link draws no focus ring of its own in every browser. */
+	svg a:focus {
+		outline: none;
+	}
+
+	svg a:focus-visible > g > rect:first-of-type {
+		stroke: var(--accent);
+		stroke-width: 3;
+	}
+
+	.words {
+		border-top: 1px solid var(--line);
+		padding: 8px 12px;
+		font-size: 13px;
+	}
+
+	.expanded .words {
+		max-height: 30vh;
+		overflow: auto;
+	}
+
+	summary {
+		cursor: pointer;
+		color: var(--ink-soft);
+		font-size: 12.5px;
+	}
+
+	.words h3 {
+		font-size: 12px;
+		margin: 10px 0 4px;
+		color: var(--ink-soft);
+	}
+
+	.words ul {
+		margin: 0;
+		padding-left: 18px;
+	}
+
+	.words .kind {
+		color: var(--ink-soft);
 	}
 </style>

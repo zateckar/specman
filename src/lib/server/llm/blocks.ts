@@ -35,7 +35,10 @@ export interface ParsedBlock {
 
 // All distinct words, so ordinary alternation is unambiguous.
 const TAGS = 'chapter|options|requirement|decision|finding|subchapters|element|relation';
-const BLOCK_OPEN = new RegExp(`<(${TAGS})((?:\\s+[a-z_]+\\s*=\\s*"[^"]*")*)\\s*(/?)>`, 'i');
+// Either quote. The models write `key='x'` often enough that refusing it printed
+// the raw tag and the whole chapter into the chat, and saved nothing.
+const ATTRIBUTE_SOURCE = `[a-z_]+\\s*=\\s*(?:"[^"]*"|'[^']*')`;
+const BLOCK_OPEN = new RegExp(`<(${TAGS})((?:\\s+${ATTRIBUTE_SOURCE})*)\\s*(/?)>`, 'i');
 
 /**
  * Tags that carry everything in their attributes and have no body.
@@ -46,7 +49,7 @@ const BLOCK_OPEN = new RegExp(`<(${TAGS})((?:\\s+[a-z_]+\\s*=\\s*"[^"]*")*)\\s*(
  * without a self-closing slash.
  */
 const VOID_TAGS = new Set<BlockTag>(['element', 'relation']);
-const ATTRIBUTE = /([a-z_]+)\s*=\s*"([^"]*)"/gi;
+const ATTRIBUTE = /([a-z_]+)\s*=\s*(?:"([^"]*)"|'([^']*)')/gi;
 const LONGEST_CLOSE = '</requirement>'.length;
 
 /**
@@ -62,8 +65,14 @@ const PARTIAL_TAG = new RegExp(`^<(?:[a-z]*|(?:${TAGS})\\b[^<>]*)$`, 'i');
 
 function parseAttributes(raw: string): Record<string, string> {
 	const attrs: Record<string, string> = {};
-	for (const match of raw.matchAll(ATTRIBUTE)) attrs[match[1].toLowerCase()] = match[2];
+	for (const match of raw.matchAll(ATTRIBUTE)) attrs[match[1].toLowerCase()] = match[2] ?? match[3];
 	return attrs;
+}
+
+/** Where the next block opens in `text`, if one does. */
+function nextOpening(text: string): number {
+	const match = BLOCK_OPEN.exec(text);
+	return match ? match.index : -1;
 }
 
 export class ChapterStreamParser {
@@ -75,7 +84,14 @@ export class ChapterStreamParser {
 
 	/** Every block seen this turn, in the order the agent wrote them. */
 	readonly blocks: ParsedBlock[] = [];
-	/** Chapter markdown the agent rewrote, keyed by chapter key. */
+	/**
+	 * Chapter markdown the agent rewrote, keyed by chapter key as written.
+	 *
+	 * A block with no key is kept under `''` rather than dropped: the agent is
+	 * nearly always writing the chapter it was asked about, and only the caller
+	 * knows which that is. An empty block is not kept at all — nobody means to
+	 * erase a chapter by writing nothing into it.
+	 */
 	readonly drafts = new Map<string, string>();
 	/** Raw body of the last <options> block; read it with `parseOptions`. */
 	optionsBlock = '';
@@ -130,14 +146,25 @@ export class ChapterStreamParser {
 		return this.squeeze(out);
 	}
 
-	/** Flush anything held back. Call once the stream ends. */
+	/**
+	 * Flush anything held back. Call once the stream ends.
+	 *
+	 * A block still open here was never closed. Truncation is not the cause — the
+	 * gateway refuses a reply that ran out of room — so the model finished and
+	 * forgot the closing tag. What it wrote after the block is then still in the
+	 * block: the requirements, the decisions and the reply. Blocks never nest, so
+	 * the next opening tag is where this one must have ended, and everything from
+	 * there is parsed as the reply it was.
+	 */
 	end(): string {
 		if (this.open !== null) {
-			// Unterminated block — salvage what we got rather than losing the work.
-			this.blockBuffer += this.buffer;
+			const held = this.blockBuffer + this.buffer;
+			const cut = nextOpening(held);
+			this.blockBuffer = cut === -1 ? held : held.slice(0, cut);
 			this.buffer = '';
 			this.closeBlock();
-			return '';
+			if (cut === -1) return '';
+			return this.push(held.slice(cut)) + this.end();
 		}
 		const rest = this.buffer;
 		this.buffer = '';
@@ -182,8 +209,8 @@ export class ChapterStreamParser {
 		this.blocks.push(block);
 
 		// Convenience views for the two callers that predate `blocks`.
-		if (block.tag === 'chapter' && block.attrs.key) {
-			this.drafts.set(block.attrs.key.toLowerCase(), block.body);
+		if (block.tag === 'chapter') {
+			if (block.body) this.drafts.set((block.attrs.key ?? '').trim().toLowerCase(), block.body);
 		} else if (block.tag === 'options') {
 			this.optionsBlock = block.body;
 		}

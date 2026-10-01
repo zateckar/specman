@@ -76,6 +76,7 @@
 						<div class="actions">
 							<button type="submit" class="primary">Save chapter</button>
 							{#if form?.saved === chapter.id}<span class="saved">Saved</span>{/if}
+							{#if form?.failed === chapter.id && form?.message}<span class="failed" role="alert">{form.message}</span>{/if}
 						</div>
 					</form>
 				{/if}
@@ -236,5 +237,10 @@
 	.saved {
 		font-size: 12.5px;
 		color: var(--ok);
+	}
+
+	.failed {
+		font-size: 12.5px;
+		color: #8c2020;
 	}
 </style>

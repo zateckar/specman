@@ -62,18 +62,80 @@ export function db(): DatabaseSync {
 	const path = resolve(process.cwd(), config.databasePath);
 	mkdirSync(dirname(path), { recursive: true });
 
-	instance = new DatabaseSync(path);
-	instance.exec(SCHEMA);
-	addMissingColumns(instance);
-	installDocumentRevisionTriggers(instance);
-	seedDefaultTemplate(instance);
-	seedStandards(instance);
-	backfillGoals(instance);
-	backfillUserOrigins(instance);
-	backfillSectionContent(instance);
-	backfillNavigationQuestions(instance);
+	const database = new DatabaseSync(path);
+	// Published before migrating because the backfills reach the store through
+	// `db()` like everything else — and withdrawn again if migrating fails, so the
+	// next caller retries instead of being handed a half-migrated database.
+	instance = database;
+	try {
+		migrate(database);
+	} catch (cause) {
+		instance = null;
+		database.close();
+		throw cause;
+	}
+	return database;
+}
 
-	return instance;
+/**
+ * Bring a database of any age up to date.
+ *
+ * The schema's pragmas cannot run inside a transaction; everything after them
+ * does, in one, so a column and the backfill that gives it meaning arrive
+ * together or not at all, and a seed interrupted half-way is not left half-done
+ * for every later boot to skip as already present.
+ */
+function migrate(database: DatabaseSync): void {
+	database.exec(SCHEMA);
+	database.exec('BEGIN IMMEDIATE');
+	try {
+		const added = addMissingColumns(database);
+		installDocumentRevisionTriggers(database);
+		seedDefaultTemplate(database);
+		seedStandards(database);
+		backfillGoals(database, added);
+		backfillUserOrigins(database);
+		once(database, 'file-section-content', () => backfillSectionContent(database));
+		once(database, 'drop-navigation-questions', () => backfillNavigationQuestions(database));
+		database.exec('COMMIT');
+	} catch (cause) {
+		database.exec('ROLLBACK');
+		throw cause;
+	}
+}
+
+/**
+ * Run a one-off repair exactly once per database.
+ *
+ * Repairs for a past defect used to run on every boot. Each re-evaluated the
+ * whole document against today's state, so a chapter added or renamed since
+ * could make a legitimate question look like the old defect and be deleted.
+ */
+function once(database: DatabaseSync, name: string, work: () => void): void {
+	if (database.prepare('SELECT 1 FROM migrations WHERE name = ?').get(name)) return;
+	work();
+	database.prepare('INSERT INTO migrations (name) VALUES (?)').run(name);
+}
+
+/**
+ * `work` as one transaction, or as part of the caller's when there is one.
+ *
+ * SQLite does not nest `BEGIN`, and several writers here are called both on
+ * their own and from inside a larger transaction — a turn's document update, or
+ * the migration at boot.
+ */
+export function atomically<T>(work: () => T): T {
+	const database = db();
+	if (database.isTransaction) return work();
+	database.exec('BEGIN IMMEDIATE');
+	try {
+		const result = work();
+		database.exec('COMMIT');
+		return result;
+	} catch (cause) {
+		database.exec('ROLLBACK');
+		throw cause;
+	}
 }
 
 /** Database triggers also cover section planning and direct SQL migrations. */
@@ -215,17 +277,38 @@ function backfillNavigationQuestions(database: DatabaseSync): void {
  * and until it is written there the two disagree — a user approving in that window
  * would merge a document whose sections still read "not written yet". Committing
  * is not this module's job, so the list is handed to whoever boots the server.
+ *
+ * Stored, not held in memory. The repairs remove their own trigger as they run,
+ * so a list kept only for this boot was lost for good if the commit failed or
+ * the process stopped before it ran: the next boot found nothing to repair and
+ * nothing to commit. An entry is cleared only once a commit has written the
+ * whole document out.
  */
-const migrated = new Map<number, string[]>();
-
 function noteMigrated(projectId: number, what: string): void {
-	const done = migrated.get(projectId) ?? [];
-	if (!done.includes(what)) done.push(what);
-	migrated.set(projectId, done);
+	const database = db();
+	const row = database.prepare('SELECT summary FROM migrated_documents WHERE project_id = ?').get(projectId) as
+		| { summary: string }
+		| undefined;
+	const done = row ? row.summary.split('; ').filter(Boolean) : [];
+	if (done.includes(what)) return;
+	done.push(what);
+	database
+		.prepare(
+			`INSERT INTO migrated_documents (project_id, summary) VALUES (?, ?)
+			 ON CONFLICT (project_id) DO UPDATE SET summary = excluded.summary`
+		)
+		.run(projectId, done.join('; '));
 }
 
 export function projectsMigratedAtStartup(): Array<{ projectId: number; summary: string }> {
-	return [...migrated].map(([projectId, done]) => ({ projectId, summary: done.join('; ') }));
+	return asRows<{ project_id: number; summary: string }>(
+		db().prepare('SELECT project_id, summary FROM migrated_documents ORDER BY project_id').all()
+	).map((row) => ({ projectId: row.project_id, summary: row.summary }));
+}
+
+/** The whole document has reached the repository; nothing migrated is outstanding. */
+export function clearMigrated(projectId: number): void {
+	db().prepare('DELETE FROM migrated_documents WHERE project_id = ?').run(projectId);
 }
 
 /**
@@ -268,22 +351,33 @@ function seedStandards(database: DatabaseSync): void {
  * never receive the seeded values. Adding a column populates nothing; every new
  * one needs a line here.
  *
- * Only untouched values are written, so an edited template is never clobbered.
+ * Only when the column has just been added, in this same transaction. Running
+ * on every boot, "untouched" could not be told apart from "deliberately left
+ * blank": a goal an administrator cleared came back, a chapter they set to
+ * apply always was given its default condition again, and — worse — every
+ * application's empty chapter goal was filled from whatever the template said
+ * that day, which is a template edit reaching documents already under way.
  */
-function backfillGoals(database: DatabaseSync): void {
-	const seed = database.prepare(`UPDATE template_chapters SET goal = ? WHERE key = ? AND goal = ''`);
-	for (const chapter of DEFAULT_CHAPTERS) seed.run(chapter.goal, chapter.key);
+function backfillGoals(database: DatabaseSync, added: Set<string>): void {
+	if (added.has('template_chapters.goal')) {
+		const seed = database.prepare(`UPDATE template_chapters SET goal = ? WHERE key = ? AND goal = ''`);
+		for (const chapter of DEFAULT_CHAPTERS) seed.run(chapter.goal, chapter.key);
+	}
 
 	// Conditions likewise: without this the triage silently keeps every chapter,
 	// which looks like it is working and is not.
-	const conditions = database.prepare(
-		`UPDATE template_chapters SET applies_when = ?
-		  WHERE key = ? AND applies_when IN ('["always"]', '[]', '')`
-	);
-	for (const chapter of DEFAULT_CHAPTERS) {
-		if (!chapter.appliesWhen) continue;
-		conditions.run(JSON.stringify(chapter.appliesWhen), chapter.key);
+	if (added.has('template_chapters.applies_when')) {
+		const conditions = database.prepare(
+			`UPDATE template_chapters SET applies_when = ?
+			  WHERE key = ? AND applies_when IN ('["always"]', '[]', '')`
+		);
+		for (const chapter of DEFAULT_CHAPTERS) {
+			if (!chapter.appliesWhen) continue;
+			conditions.run(JSON.stringify(chapter.appliesWhen), chapter.key);
+		}
 	}
+
+	if (!added.has('chapters.goal')) return;
 
 	// Projects take the goal from their own template, matched on chapter key.
 	database.exec(`
@@ -320,25 +414,38 @@ function backfillUserOrigins(database: DatabaseSync): void {
 	`);
 }
 
-function addMissingColumns(database: DatabaseSync): void {
+/** Adds what is missing and says what that was, as `table.column`. */
+function addMissingColumns(database: DatabaseSync): Set<string> {
+	const added = new Set<string>();
 	for (const { table, column, definition } of ADDED_COLUMNS) {
 		const columns = database.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>;
 		if (columns.some((c) => c.name === column)) continue;
 
 		database.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`);
+		added.add(`${table}.${column}`);
 		console.info(`[db] added column ${table}.${column}`);
 	}
+	return added;
 }
 
 function seedDefaultTemplate(database: DatabaseSync): void {
 	const existing = database
 		.prepare('SELECT id FROM templates WHERE name = ?')
 		.get(DEFAULT_TEMPLATE.name) as { id: number } | undefined;
-	if (existing) return;
 
-	database
-		.prepare('INSERT INTO templates (name, description, is_default) VALUES (?, ?, 1)')
-		.run(DEFAULT_TEMPLATE.name, DEFAULT_TEMPLATE.description);
+	// A template with no chapters is a seed that was interrupted before seeding
+	// ran in a transaction. Every application created from it would have no
+	// chapters at all, so its chapters are seeded now rather than skipped for ever.
+	if (existing) {
+		const chapters = database
+			.prepare('SELECT COUNT(*) AS n FROM template_chapters WHERE template_id = ?')
+			.get(existing.id) as { n: number };
+		if (chapters.n > 0) return;
+	} else {
+		database
+			.prepare('INSERT INTO templates (name, description, is_default) VALUES (?, ?, 1)')
+			.run(DEFAULT_TEMPLATE.name, DEFAULT_TEMPLATE.description);
+	}
 
 	const templateId = (
 		database.prepare('SELECT id FROM templates WHERE name = ?').get(DEFAULT_TEMPLATE.name) as {
@@ -432,6 +539,13 @@ export function createProject(args: {
 	profile?: Profile;
 	kind?: 'new' | 'change';
 }): Project {
+	// One transaction: a failure part-way through the chapters or the standards
+	// used to leave an application with some of its chapters, listed on the home
+	// page and never repaired.
+	return atomically(() => insertProject(args));
+}
+
+function insertProject(args: Parameters<typeof createProject>[0]): Project {
 	const database = db();
 	const profile = toProfile(args.profile);
 
@@ -498,9 +612,11 @@ export function createProject(args: {
  */
 function inheritStandards(projectId: number, profile: Profile): void {
 	const database = db();
+	// Only chapters that apply: a standard filed under a chapter the triage set
+	// aside is a rule for work nobody is doing, reported as an orphan.
 	const chapterKeys = new Set(
 		asRows<{ key: string }>(
-			database.prepare('SELECT key FROM chapters WHERE project_id = ?').all(projectId)
+			database.prepare('SELECT key FROM chapters WHERE project_id = ? AND applicable <> 0').all(projectId)
 		).map((c) => c.key)
 	);
 
@@ -573,6 +689,16 @@ export function setChapterApplicable(
 	db()
 		.prepare('UPDATE chapters SET applicable = ?, skip_reason = ? WHERE project_id = ? AND key = ?')
 		.run(applicable ? 1 : 0, applicable ? '' : reason, projectId, key);
+}
+
+/**
+ * Remove an application and everything stored against it.
+ *
+ * Only for undoing a creation whose repository could not be made; nothing in
+ * the interface deletes an application. Every dependent table cascades.
+ */
+export function deleteProject(id: number): void {
+	db().prepare('DELETE FROM projects WHERE id = ?').run(id);
 }
 
 export function listProjects(): Project[] {
@@ -757,19 +883,23 @@ export function distributeSectionContent(
 
 	if (filed.length === 0) return { filled: [], parentMd: null };
 
-	const write = database.prepare(
-		`UPDATE chapters
-		    SET content_md = ?,
-		        status = CASE WHEN status = 'empty' THEN 'in_progress' ELSE status END,
-		        updated_at = datetime('now')
-		  WHERE project_id = ? AND key = ?`
-	);
-	for (const section of filed) write.run(section.markdown, projectId, section.key);
+	// Sections and parent together. Apart, a failure between them left the prose
+	// in both — and the section, now occupied, would never be filed again.
+	atomically(() => {
+		const write = database.prepare(
+			`UPDATE chapters
+			    SET content_md = ?,
+			        status = CASE WHEN status = 'empty' THEN 'in_progress' ELSE status END,
+			        updated_at = datetime('now')
+			  WHERE project_id = ? AND key = ?`
+		);
+		for (const section of filed) write.run(section.markdown, projectId, section.key);
 
-	database
-		.prepare(`UPDATE chapters SET content_md = ?, updated_at = datetime('now')
-		           WHERE project_id = ? AND key = ?`)
-		.run(leftover, projectId, parentKey);
+		database
+			.prepare(`UPDATE chapters SET content_md = ?, updated_at = datetime('now')
+			           WHERE project_id = ? AND key = ?`)
+			.run(leftover, projectId, parentKey);
+	});
 
 	console.info(
 		`[db] filed ${filed.length} section${filed.length === 1 ? '' : 's'} of ${parentKey} into its sub-chapters`
@@ -1041,11 +1171,12 @@ export function saveDecision(
 	return getDecision(id)!;
 }
 
+/** Idempotent: confirming twice keeps the time it was first confirmed. */
 export function confirmDecision(projectId: number, id: number): Decision | undefined {
 	db()
 		.prepare(
 			`UPDATE decisions SET status = 'confirmed', confirmed_at = datetime('now')
-			  WHERE id = ? AND project_id = ?`
+			  WHERE id = ? AND project_id = ? AND status <> 'confirmed'`
 		)
 		.run(id, projectId);
 	return getDecision(id);
@@ -1073,9 +1204,18 @@ export function saveArchitecture(
 		.run(projectId, JSON.stringify(elements), JSON.stringify(relations));
 }
 
+/**
+ * The most recent diagram with something in it. Failed drawings used to be
+ * stored as empty models; skipping them here means one of those, left from
+ * before, does not hide the good picture drawn ahead of it.
+ */
 export function latestArchitecture(projectId: number): StoredArchitecture | undefined {
 	const row = db()
-		.prepare('SELECT * FROM architectures WHERE project_id = ? ORDER BY id DESC LIMIT 1')
+		.prepare(
+			`SELECT * FROM architectures
+			  WHERE project_id = ? AND elements NOT IN ('', '[]')
+			  ORDER BY id DESC LIMIT 1`
+		)
 		.get(projectId) as Record<string, unknown> | undefined;
 	if (!row) return undefined;
 

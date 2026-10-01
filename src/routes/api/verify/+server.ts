@@ -5,9 +5,10 @@ import {
 	DocumentConflict,
 	projectChapters,
 	projectDecisions,
-	projectRequirements
+	projectRequirements,
+	recentMessages
 } from '$lib/server/db';
-import { verifyDocument } from '$lib/server/llm/verification';
+import { TRANSCRIPT_TURNS, verifyDocument } from '$lib/server/llm/verification';
 import { summariseIssues } from '$lib/server/llm/issues';
 import { writeVerification } from '$lib/server/proposals';
 import type { RequestHandler } from './$types';
@@ -28,10 +29,20 @@ export const POST: RequestHandler = async ({ request, locals }) => {
 	if (!project) throw error(404, 'No such project');
 	const revision = documentRevision(project.id);
 
+	const chapters = projectChapters(project.id);
 	const result = await verifyDocument({
-		chapters: projectChapters(project.id),
+		chapters,
 		requirements: projectRequirements(project.id),
-		decisions: projectDecisions(project.id)
+		decisions: projectDecisions(project.id),
+		transcripts: Object.fromEntries(
+			chapters.map((chapter) => [
+				chapter.key,
+				recentMessages(project.id, chapter.key, TRANSCRIPT_TURNS).map((m) => ({
+					role: m.role,
+					content: m.content
+				}))
+			])
+		)
 	});
 
 	// Publish only if the input document still exists at the captured revision.

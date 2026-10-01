@@ -89,6 +89,10 @@
 			checkedAt = result.created_at;
 			failedChecks = result.failed;
 			staleCheck = result.stale;
+			// The check is recorded on the proposal, which moves the revision the
+			// Approve button is pinned to. Without reloading, the first approval after
+			// every check was refused as "changed since this review" — by the check.
+			location.reload();
 		} catch (cause) {
 			checkError = cause instanceof Error ? cause.message : 'The check could not be run.';
 		} finally {
@@ -133,9 +137,7 @@
 		<div class="card summary">
 			<div>
 				<strong>{data.proposal.title || 'Design updates'}</strong>
-				<p class="sub">
-					{data.changeSummary} · branch <code>{data.proposal.branch}</code>
-				</p>
+				<p class="sub">{data.changeSummary}</p>
 			</div>
 			<form method="POST" action="?/approve">
 				<input type="hidden" name="proposalId" value={data.reviewed?.proposalId} />
@@ -150,7 +152,7 @@
 				<h2>Decided for you</h2>
 				<p class="sub">
 					The assistant chose these because the answer was left to it. Confirm each one, or say
-					it is wrong and it will be raised with you again.
+					it is wrong and the assistant will ask you about it again in its chapter.
 				</p>
 				{#each data.pendingDecisions as decision}
 					<div class="decision">

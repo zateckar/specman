@@ -9,14 +9,17 @@ import {
 	DocumentConflict,
 	getChapter,
 	getProject,
+	getRequirement,
 	projectChapters,
 	projectDecisions,
 	recentMessages,
 	saveDecision,
 	saveRequirement,
+	setChapterApplicable,
 	updateChapterState,
 	withDocumentRevision
 } from '$lib/server/db';
+import { describeFailure } from '$lib/server/llm/failures';
 import { effectiveStatus, toDecisionDraft, unconfirmed } from '$lib/server/llm/decisions';
 import { toRequirementDraft } from '$lib/server/llm/requirements';
 import { parseSectionPlan } from '$lib/server/llm/subchapters';
@@ -32,7 +35,28 @@ import { parseOptions, reconcileAssessment } from '$lib/server/llm/questions';
 import { presence } from '$lib/server/llm/presence';
 import { createSink, type TurnSink } from '$lib/server/llm/sink';
 import { commitDocument } from '$lib/server/proposals';
+import type { Chapter } from '$lib/server/db/types';
 import type { RequestHandler } from './$types';
+
+/** See the comment where it is used. */
+const TURN_MAX_TOKENS = 16000;
+
+/**
+ * The chapter a `<chapter>` block was meant for.
+ *
+ * The prompt asks for the key, and the models do not always give it: no key at
+ * all means the chapter under discussion, and the title written instead of the
+ * key is matched as a title. Anything else is reported rather than guessed at.
+ */
+function draftTarget(written: string, chapters: Chapter[], active: Chapter | null): Chapter | null {
+	if (!written) return active;
+	const name = written.trim().toLowerCase();
+	return (
+		chapters.find((c) => c.key.toLowerCase() === name) ??
+		chapters.find((c) => c.title.trim().toLowerCase() === name) ??
+		null
+	);
+}
 
 /**
  * One agent turn, streamed to the browser as SSE.
@@ -93,6 +117,18 @@ export const POST: RequestHandler = async ({ request, locals }) => {
 
 			const parser = new ChapterStreamParser();
 			let reply = '';
+			/** A chapter block that named no chapter this document has. */
+			let unfiled = false;
+
+			/**
+			 * A chapter the triage set aside, written into anyway, applies after all.
+			 * Left set aside, its prose and requirements were reported as belonging to
+			 * a chapter that no longer exists, and the export called it "nothing to
+			 * build" while counting its requirements as in scope.
+			 */
+			const reopen = (chapter: Chapter) => {
+				if (chapter.applicable === 0) setChapterApplicable(project.id, chapter.key, true);
+			};
 
 			try {
 				const conversation = toChatMessages(history, message);
@@ -105,7 +141,11 @@ export const POST: RequestHandler = async ({ request, locals }) => {
 						activeRequirements
 					),
 					messages: conversation,
-					maxTokens: 6000
+					// One reply carries the whole chapter rewritten, its requirements and
+					// decisions, and the model's reasoning before any of it — all from this
+					// one budget. At 6000 a chapter of a few thousand words could not be
+					// written at all, and every retry failed the same way.
+					maxTokens: TURN_MAX_TOKENS
 				})) {
 					if (event.type === 'text') {
 						const visible = parser.push(event.text);
@@ -127,7 +167,11 @@ export const POST: RequestHandler = async ({ request, locals }) => {
 				// Answers the agent offered for the question it just asked. Stored with
 				// the message so they survive a reload, not just this stream.
 				const options = parseOptions(parser.optionsBlock);
-				addMessage(project.id, chapterKey, 'assistant', reply.trim(), options);
+				// A reply that was nothing but blocks has no words to keep, and an empty
+				// turn replayed to the gateway is a request it refuses.
+				if (reply.trim() || options.length > 0) {
+					addMessage(project.id, chapterKey, 'assistant', reply.trim(), options);
+				}
 				if (options.length > 0) send('options', { options });
 
 				// --- An arrangement of sub-chapters, if the agent proposed one. Applied
@@ -154,16 +198,33 @@ export const POST: RequestHandler = async ({ request, locals }) => {
 					}
 
 					// --- Persist any chapters the agent rewrote.
-					for (const [key, markdown] of parser.drafts) {
-						const target = getChapter(project.id, key);
+					const current = projectChapters(project.id);
+					for (const [written, markdown] of parser.drafts) {
+						const target = draftTarget(written, current, active);
 						if (!target) {
-							console.warn(`[chat] agent wrote unknown chapter "${key}" — ignoring`);
+							console.warn(`[chat] agent wrote unknown chapter "${written}" — not saved`);
+							unfiled = true;
 							continue;
 						}
 						const clean = normalizeChapterMarkdown(markdown, target.title);
+						if (!clean.trim()) continue; // nobody means to erase a chapter by writing nothing
+						const key = target.key;
 						updateChapterState(project.id, key, { contentMd: clean });
-						touched.push(key);
+						reopen(target);
+						if (!touched.includes(key)) touched.push(key);
 						send('chapter', { key, markdown: clean });
+
+						// Once split, a chapter's content is its sections. Prose written
+						// back into it under a section's heading is filed there — only into
+						// an empty section, as at split time, so nothing written is lost.
+						if (key !== splitParent && current.some((c) => c.parent_key === key)) {
+							const moved = distributeSectionContent(project.id, key);
+							for (const section of moved.filled) {
+								send('chapter', { key: section.key, markdown: section.markdown });
+								if (!touched.includes(section.key)) touched.push(section.key);
+							}
+							if (moved.parentMd !== null) send('chapter', { key, markdown: moved.parentMd });
+						}
 					}
 
 					// --- Requirements the agent settled this turn. After the chapters, so a
@@ -172,19 +233,31 @@ export const POST: RequestHandler = async ({ request, locals }) => {
 						const draft = toRequirementDraft(block.attrs, block.body);
 						if (!draft) continue;
 
-						const key = draft.chapterKey ?? active?.key;
-						if (!key || !getChapter(project.id, key)) {
+						// Restating a requirement by reference changes its wording, not where
+						// it lives: it stays in its own chapter unless one is named.
+						const recorded = draft.ref ? getRequirement(project.id, draft.ref) : undefined;
+						const key = draft.chapterKey ?? recorded?.chapter_key ?? active?.key;
+						const owner = key ? getChapter(project.id, key) : undefined;
+						if (!key || !owner) {
 							console.warn(`[chat] requirement for unknown chapter "${key}" — ignoring`);
 							continue;
 						}
 
 						if (draft.remove) {
+							// A company standard is the organisation's rule, not this
+							// conversation's to delete. Deviating from one is recorded by
+							// restating it as out of scope, which stays visible in review.
+							if (recorded?.source === 'standard') {
+								console.warn(`[chat] agent tried to remove company standard ${recorded.ref} — kept`);
+								continue;
+							}
 							if (draft.ref && deleteRequirement(project.id, draft.ref)) {
 								send('requirement', { ref: draft.ref, chapterKey: key, removed: true });
 							}
 							if (!touched.includes(key)) touched.push(key);
 							continue;
 						}
+						reopen(owner);
 
 						const saved = saveRequirement(project.id, {
 							ref: draft.ref,
@@ -219,7 +292,9 @@ export const POST: RequestHandler = async ({ request, locals }) => {
 						if (!draft) continue;
 
 						const key = draft.chapterKey ?? active?.key;
-						if (!key || !getChapter(project.id, key)) continue;
+						const owner = key ? getChapter(project.id, key) : undefined;
+						if (!key || !owner) continue;
+						reopen(owner);
 
 						const saved = saveDecision(project.id, {
 							chapterKey: key,
@@ -231,10 +306,11 @@ export const POST: RequestHandler = async ({ request, locals }) => {
 						if (!touched.includes(key)) touched.push(key);
 					}
 
-					// --- A chapter the agent wrote in passing is no longer empty, whatever
-					//     else is true of it. Cheap correction — no extra gateway call.
+					// --- A chapter that has just been written is no longer empty, whatever
+					//     else is true of it — including the active one, whose assessment
+					//     can fail and would otherwise leave it reading "not started".
+					//     Cheap correction — no extra gateway call.
 					for (const key of touched) {
-						if (key === active?.key) continue;
 						const written = getChapter(project.id, key);
 						if (written?.status === 'empty') {
 							updateChapterState(project.id, key, { status: 'in_progress' });
@@ -244,6 +320,13 @@ export const POST: RequestHandler = async ({ request, locals }) => {
 
 				});
 				for (const [event, data] of documentEvents) send(event, data);
+				if (unfiled) {
+					send('error', {
+						message:
+							'Part of that answer could not be filed into a chapter, so it was not saved. ' +
+							'Ask the assistant to write it again.'
+					});
+				}
 
 				// --- Re-assess completeness against its own captured revision.
 				const assessKey = active?.key ?? touched[0];
@@ -323,12 +406,7 @@ export const POST: RequestHandler = async ({ request, locals }) => {
 				send('done', {});
 			} catch (cause) {
 				console.error('[chat] turn failed:', cause);
-				send('error', {
-					message:
-						cause instanceof DocumentConflict ? cause.message : cause instanceof Error
-							? `The assistant could not respond: ${cause.message}`
-							: 'The assistant could not respond.'
-				});
+				send('error', { message: describeFailure(cause) });
 			} finally {
 				// Cleared here rather than when the connection drops: the turn goes on
 				// writing after the tab closes, and it is the writing that matters to

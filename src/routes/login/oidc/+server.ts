@@ -8,6 +8,7 @@ export const GET: RequestHandler = async ({ cookies }) => {
 
 	const state = client.randomState();
 	const codeVerifier = client.randomPKCECodeVerifier();
+	const nonce = client.randomNonce();
 
 	const options = {
 		path: '/',
@@ -17,6 +18,7 @@ export const GET: RequestHandler = async ({ cookies }) => {
 	};
 	cookies.set('oidc_state', state, options);
 	cookies.set('oidc_verifier', codeVerifier, options);
+	cookies.set('oidc_nonce', nonce, options);
 
-	throw redirect(303, await authorizationUrl(state, codeVerifier));
+	throw redirect(303, await authorizationUrl(state, codeVerifier, nonce));
 };

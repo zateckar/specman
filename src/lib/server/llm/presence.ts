@@ -28,7 +28,7 @@ export interface Watcher {
 export interface Presence {
 	/** Record that someone is looking at this application. */
 	seen(projectId: number, userId: number, name: string, now: number): void;
-	/** Record that a turn has started or finished for them. */
+	/** Record that a turn has started or finished for them. Every start needs its finish. */
 	setWriting(projectId: number, userId: number, writing: boolean, now: number): void;
 	/** Everyone else currently present, most recently seen first. */
 	others(projectId: number, userId: number, now: number): Watcher[];
@@ -39,7 +39,11 @@ export interface Presence {
 interface Entry {
 	name: string;
 	lastSeen: number;
-	writing: boolean;
+	/**
+	 * Turns running for them. A count, not a flag: with two tabs open, the first
+	 * turn to finish would otherwise clear the mark while the second still writes.
+	 */
+	writes: number;
 }
 
 /**
@@ -76,7 +80,7 @@ export function createPresence(ttlMs = 45_000): Presence {
 				entry.lastSeen = now;
 				entry.name = name;
 			} else {
-				people.set(userId, { name, lastSeen: now, writing: false });
+				people.set(userId, { name, lastSeen: now, writes: 0 });
 			}
 			sweep(now);
 		},
@@ -85,12 +89,12 @@ export function createPresence(ttlMs = 45_000): Presence {
 			const people = watchers(projectId);
 			const entry = people.get(userId);
 			if (entry) {
-				entry.writing = writing;
+				entry.writes = Math.max(0, entry.writes + (writing ? 1 : -1));
 				entry.lastSeen = now;
 			} else {
 				// A turn is itself a sign of life, so someone who started one without
 				// having been seen yet still counts as present.
-				people.set(userId, { name: '', lastSeen: now, writing });
+				people.set(userId, { name: '', lastSeen: now, writes: writing ? 1 : 0 });
 			}
 			sweep(now);
 		},
@@ -103,7 +107,7 @@ export function createPresence(ttlMs = 45_000): Presence {
 			return [...people.entries()]
 				.filter(([id, entry]) => id !== userId && now - entry.lastSeen <= ttlMs && entry.name)
 				.sort((a, b) => b[1].lastSeen - a[1].lastSeen)
-				.map(([, entry]) => ({ name: entry.name, writing: entry.writing }));
+				.map(([, entry]) => ({ name: entry.name, writing: entry.writes > 0 }));
 		},
 
 		get size() {

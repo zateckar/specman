@@ -57,6 +57,12 @@ lock before merging that commit.
 - **WHEN** approval receives missing or malformed revision fields
 - **THEN** it returns a conflict asking the user to reload the review
 
+#### Scenario: The user runs the check from the review page
+- **WHEN** the whole-document check finishes and commits its report to the proposal
+- **THEN** the review page reloads, so the revision it approves is the one that includes the
+  report — kept, the old revision made the very next Approve fail with a conflict the user
+  had done nothing to cause
+
 ### Requirement: Conversation accumulates on one open proposal
 There SHALL be at most one open proposal per application, and every turn's changes SHALL be
 committed to it.

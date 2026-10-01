@@ -28,6 +28,27 @@ export interface Profile {
 /** Conditions a chapter can carry. A chapter applies if ANY of them hold. */
 export type Condition = 'always' | 'personal_data' | 'beyond_team' | 'external' | 'critical';
 
+export const CONDITIONS: readonly Condition[] = ['always', 'personal_data', 'beyond_team', 'external', 'critical'];
+
+/**
+ * Read a comma-separated list of conditions typed by an administrator.
+ *
+ * `holds` treats a condition it does not recognise as true, so that a chapter is
+ * never silently removed — which means a typo such as `personal-data` quietly
+ * turned a standard into one that applies everywhere. A blank field is read as
+ * `always`, the same as a missing value; an unknown name is refused by name.
+ */
+export function readConditions(text: string): { conditions: Condition[] } | { unknown: string[] } {
+	const names = text
+		.split(',')
+		.map((value) => value.trim().toLowerCase())
+		.filter(Boolean);
+	const unknown = names.filter((name) => !(CONDITIONS as readonly string[]).includes(name));
+	if (unknown.length > 0) return { unknown };
+	const conditions = [...new Set(names)] as Condition[];
+	return { conditions: conditions.length > 0 ? conditions : ['always'] };
+}
+
 export const DEFAULT_PROFILE: Profile = {
 	reach: 'company',
 	personalData: true,

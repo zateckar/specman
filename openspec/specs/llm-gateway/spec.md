@@ -38,6 +38,12 @@ as failures, and SHALL emit done only after message_stop or the explicit DONE se
 - **WHEN** the stream emits a success terminator with no text
 - **THEN** it completes successfully because silence is a valid finding-free verification response
 
+#### Scenario: Silence that spent the whole budget
+- **WHEN** a stream completes with no text and its output-token count has reached the
+  ceiling, from a backend that did not report max_tokens
+- **THEN** it fails as having run out of room, because that is the model reasoning until it
+  was cut off, and accepting it let a starved check read as a clean one
+
 #### Scenario: Transport chunks split CRLF delimiters
 - **WHEN** an SSE frame's line endings arrive across separate chunks
 - **THEN** the complete frame is still parsed and its terminal status is respected

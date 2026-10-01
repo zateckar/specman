@@ -12,3 +12,4 @@ build/
 *.log
 .claude/
 .kilo/
+.codex/

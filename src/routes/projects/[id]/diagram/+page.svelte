@@ -3,8 +3,11 @@
 
 	let { data } = $props();
 
-	let diagram = $state(data.diagram);
-	let createdAt = $state(data.model?.created_at ?? null);
+	// A fresh drawing overrides what the page loaded with; until then, and after
+	// any navigation that reloads the data, the stored one is shown.
+	let drawn = $state<{ diagram: typeof data.diagram; createdAt: string } | null>(null);
+	const diagram = $derived(drawn?.diagram ?? data.diagram);
+	const createdAt = $derived(drawn?.createdAt ?? data.model?.created_at ?? null);
 	let busy = $state(false);
 	let errorMessage = $state('');
 
@@ -17,17 +20,16 @@
 				headers: { 'content-type': 'application/json' },
 				body: JSON.stringify({ projectId: data.project.id })
 			});
-			if (!response.ok) throw new Error(`Could not draw the diagram (${response.status})`);
-
-			const result = await response.json();
-			diagram = result.diagram;
-			createdAt = new Date().toISOString();
-			if (result.elements.length === 0) {
+			const result = await response.json().catch(() => null);
+			// A failed drawing leaves the previous picture where it was.
+			if (!response.ok) {
 				errorMessage =
-					'Nothing could be drawn yet. There needs to be enough written down first — try again once a few chapters have content.';
+					result?.message ?? 'The diagram could not be drawn just now. Try again in a minute.';
+				return;
 			}
-		} catch (cause) {
-			errorMessage = cause instanceof Error ? cause.message : 'Something went wrong.';
+			drawn = { diagram: result.diagram, createdAt: new Date().toISOString() };
+		} catch {
+			errorMessage = 'The diagram could not be drawn just now. Try again in a minute.';
 		} finally {
 			busy = false;
 		}
@@ -56,7 +58,7 @@
 	</div>
 
 	{#if errorMessage}
-		<p class="error">{errorMessage}</p>
+		<p class="error" role="alert">{errorMessage}</p>
 	{/if}
 
 	{#if diagram && diagram.boxes.length > 0}

@@ -8,14 +8,16 @@ export const GET: RequestHandler = async ({ url, cookies }) => {
 
 	const state = cookies.get('oidc_state');
 	const verifier = cookies.get('oidc_verifier');
-	if (!state || !verifier) throw error(400, 'Sign-in expired. Please try again.');
+	const nonce = cookies.get('oidc_nonce');
+	if (!state || !verifier || !nonce) throw error(400, 'Sign-in expired. Please try again.');
 
 	cookies.delete('oidc_state', { path: '/' });
 	cookies.delete('oidc_verifier', { path: '/' });
+	cookies.delete('oidc_nonce', { path: '/' });
 
 	let user;
 	try {
-		user = await completeLogin(url, state, verifier);
+		user = await completeLogin(url, state, verifier, nonce);
 	} catch (cause) {
 		console.error('[oidc] sign-in failed:', cause);
 		// Worth telling apart: this one is not fixed by trying again, and the

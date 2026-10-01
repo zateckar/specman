@@ -1,4 +1,14 @@
+<script lang="ts" module>
+	/**
+	 * Unsent answers, per chapter. The pane is rebuilt on every chapter switch,
+	 * so a draft held in the component was thrown away by looking at another
+	 * chapter — a dictated paragraph included.
+	 */
+	const drafts = new Map<string, string>();
+</script>
+
 <script lang="ts">
+	import { tick } from 'svelte';
 	import Dictation from './Dictation.svelte';
 
 	interface AnswerOption {
@@ -57,11 +67,35 @@
 		onask: (question: string) => void;
 	} = $props();
 
-	let input = $state('');
+	// The pane is rebuilt per chapter, so these are read once on purpose.
+	// svelte-ignore state_referenced_locally
+	const draftKey = `${projectId}:${chapterKey ?? ''}`;
+	let input = $state(drafts.get(draftKey) ?? '');
+	let box: HTMLTextAreaElement | undefined = $state();
 	let scroller: HTMLDivElement | undefined = $state();
 	let dictation: Dictation | undefined = $state();
 	let listening = $state(false);
 	let dictationStatus = $state('');
+
+	$effect(() => {
+		if (input) drafts.set(draftKey, input);
+		else drafts.delete(draftKey);
+	});
+
+	// Nothing can be sent while any turn is running. The page runs one turn at a
+	// time, so an answer sent while another chapter was still being written was
+	// cleared from the box and silently dropped.
+	const blocked = $derived(busy || !!busyElsewhere);
+
+	// The box is disabled while the reply is written, which takes focus away
+	// from it. Hand it back when the reply is done, so the next answer can be
+	// typed without reaching for the mouse.
+	let wasBusy = false;
+	$effect(() => {
+		const now = busy;
+		if (wasBusy && !now) void tick().then(() => box?.focus());
+		wasBusy = now;
+	});
 
 	// Follow the reply as it streams, and land at the bottom on a chapter switch.
 	$effect(() => {
@@ -85,11 +119,18 @@
 	}
 
 	function send(text: string) {
-		if (!text.trim() || busy) return;
+		if (!text.trim() || blocked) return;
 		// What is on screen is what is sent; nothing heard after this point lands.
 		dictation?.cancel();
 		input = '';
 		onsend(text);
+	}
+
+	/** A clicked answer is sent as it is; whatever was being typed is kept. */
+	function choose(label: string) {
+		if (blocked) return;
+		dictation?.cancel();
+		onsend(label);
 	}
 
 	// Clicking "Start" is the user asking to begin, so it reads as a user turn.
@@ -127,7 +168,10 @@
 		</span>
 	</header>
 
-	<div class="scroll" bind:this={scroller}>
+	<!-- A log, so a screen reader announces each new turn; busy while the reply
+	     streams, so it is read once it is whole rather than word by word. -->
+	<div class="scroll" bind:this={scroller} role="log" aria-live="polite" aria-busy={busy} aria-label="Conversation">
+
 		{#if turns.length === 0}
 			<div class="intro">
 				<p>
@@ -144,7 +188,7 @@
 						and what still contradicts what.
 					{/if}
 				</p>
-				<button class="start" onclick={() => send(startMessage)} disabled={busy}>
+				<button class="start" onclick={() => choose(startMessage)} disabled={blocked}>
 					{#if !chapterKey}Start a review{:else if written}Go through it{:else}Start this chapter{/if}
 				</button>
 				<p class="hint">
@@ -175,7 +219,12 @@
 		{#if liveOptions.length > 0}
 			<div class="options">
 				{#each liveOptions as option}
-					<button class="option" class:recommended={option.recommended} onclick={() => send(option.label)}>
+					<button
+						class="option"
+						class:recommended={option.recommended}
+						onclick={() => choose(option.label)}
+						disabled={blocked}
+					>
 						<span class="label">{option.label}</span>
 						{#if option.recommended}<span class="tag">Recommended</span>{/if}
 					</button>
@@ -185,7 +234,7 @@
 		{/if}
 
 		{#if errorMessage}
-			<p class="error">{errorMessage}</p>
+			<p class="error" role="alert">{errorMessage}</p>
 		{/if}
 	</div>
 
@@ -194,7 +243,7 @@
 			<span class="pending-label">Still to decide — pick one to work through it:</span>
 			<div class="chips">
 				{#each openQuestions.slice(0, 3) as question}
-					<button class="chip" onclick={() => onask(question)}>{question}</button>
+					<button class="chip" onclick={() => onask(question)} disabled={blocked}>{question}</button>
 				{/each}
 			</div>
 		</div>
@@ -214,9 +263,11 @@
 			<!-- Read-only while listening: the recogniser rewrites the box as it revises
 			     what it heard, and would overwrite anything typed in the meantime. -->
 			<textarea
+				bind:this={box}
 				bind:value={input}
 				onkeydown={onKeydown}
 				placeholder={listening ? 'Listening…' : 'Type your answer…'}
+				aria-label="Your answer"
 				rows="2"
 				disabled={busy}
 				readonly={listening}
@@ -228,7 +279,7 @@
 				bind:status={dictationStatus}
 				disabled={busy}
 			/>
-			<button class="send" onclick={() => send(input)} disabled={busy || !input.trim()}>Send</button>
+			<button class="send" onclick={() => send(input)} disabled={blocked || !input.trim()}>Send</button>
 		</div>
 		{#if dictationStatus}
 			<p class="dictation-status" class:live={listening} role="status">{dictationStatus}</p>
@@ -341,8 +392,14 @@
 		font-size: 13.5px;
 	}
 
-	.option:hover {
+	.option:hover:not(:disabled) {
 		border-color: var(--accent);
+	}
+
+	.option:disabled,
+	.chip:disabled {
+		opacity: 0.5;
+		cursor: default;
 	}
 
 	.option.recommended {

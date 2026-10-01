@@ -1,4 +1,6 @@
 <script lang="ts">
+	import { enhance } from '$app/forms';
+
 	interface ChapterView {
 		key: string;
 		title: string;
@@ -59,6 +61,9 @@
 	const totalOpen = $derived(inScope.reduce((sum, c) => sum + c.open_questions.length, 0));
 	const percent = $derived(counted.length ? Math.round((complete / counted.length) * 100) : 0);
 
+	let including = $state<string | null>(null);
+	let includeError = $state('');
+
 	const statusLabel: Record<string, string> = {
 		empty: 'Not started',
 		in_progress: 'In progress',
@@ -75,7 +80,9 @@
 		<div class="meter"><div class="fill" style="width: {percent}%"></div></div>
 		{#if totalOpen > 0}
 			<p class="open-total">{totalOpen} question{totalOpen === 1 ? '' : 's'} still to answer</p>
-		{:else if complete === chapters.length}
+		{:else if counted.length > 0 && complete === counted.length}
+			<!-- Against what is counted: compared with every chapter, set-aside and
+			     split ones included, this could never be true. -->
 			<p class="done-total">Everything answered</p>
 		{/if}
 	</div>
@@ -130,10 +137,32 @@
 						<a href="/projects/{projectId}?chapter={chapter.key}" title={chapter.skip_reason}>
 							{chapter.title}
 						</a>
+						<form
+							method="POST"
+							action="/projects/{projectId}?/include"
+							use:enhance={() => {
+								including = chapter.key;
+								includeError = '';
+								return async ({ result, update }) => {
+									if (result.type === 'failure') {
+										includeError = String(result.data?.message ?? 'The chapter could not be included. Try again.');
+									}
+									await update({ reset: false });
+									including = null;
+								};
+							}}
+						>
+							<input type="hidden" name="key" value={chapter.key} />
+							<button type="submit" disabled={including !== null} aria-label="Include {chapter.title}">
+								{including === chapter.key ? 'Including…' : 'Include it'}
+							</button>
+						</form>
+						{#if chapter.skip_reason}<span class="reason">{chapter.skip_reason}</span>{/if}
 					</li>
 				{/each}
 			</ul>
-			<p>Open one if you think it does apply.</p>
+			<p>If one does apply, include it and it is asked about like any other.</p>
+			{#if includeError}<p class="include-error" role="alert">{includeError}</p>{/if}
 		</div>
 	{/if}
 </nav>
@@ -169,7 +198,42 @@
 	}
 
 	.aside li {
-		margin-bottom: 3px;
+		display: flex;
+		flex-wrap: wrap;
+		align-items: baseline;
+		gap: 2px 8px;
+		margin-bottom: 6px;
+	}
+
+	.aside form {
+		display: inline;
+		margin: 0;
+	}
+
+	.aside button {
+		background: none;
+		border: 0;
+		padding: 0;
+		font-size: 12px;
+		color: var(--accent);
+		text-decoration: underline;
+		cursor: pointer;
+	}
+
+	.aside button:disabled {
+		color: var(--ink-soft);
+		cursor: default;
+	}
+
+	.aside .include-error {
+		margin-top: 6px;
+		color: #8c2020;
+	}
+
+	.reason {
+		flex-basis: 100%;
+		font-size: 11.5px;
+		color: var(--ink-soft);
 	}
 
 	.aside a {
