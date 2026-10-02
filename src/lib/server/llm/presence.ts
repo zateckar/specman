@@ -63,10 +63,19 @@ export function createPresence(ttlMs = 45_000): Presence {
 		return found;
 	}
 
+	/**
+	 * Someone with a turn running is present until it finishes, however long it
+	 * takes. A turn on a long chapter runs past the expiry, and the mark used to
+	 * vanish half-way through it — exactly when a colleague most needed to see it.
+	 * Every turn's finish is in a `finally`, and gateway calls have a time limit,
+	 * so the count does come back down.
+	 */
+	const present = (entry: Entry, now: number) => entry.writes > 0 || now - entry.lastSeen <= ttlMs;
+
 	function sweep(now: number): void {
 		for (const [projectId, people] of byProject) {
 			for (const [userId, entry] of people) {
-				if (now - entry.lastSeen > ttlMs) people.delete(userId);
+				if (!present(entry, now)) people.delete(userId);
 			}
 			if (people.size === 0) byProject.delete(projectId);
 		}
@@ -105,7 +114,7 @@ export function createPresence(ttlMs = 45_000): Presence {
 			if (!people) return [];
 
 			return [...people.entries()]
-				.filter(([id, entry]) => id !== userId && now - entry.lastSeen <= ttlMs && entry.name)
+				.filter(([id, entry]) => id !== userId && present(entry, now) && entry.name)
 				.sort((a, b) => b[1].lastSeen - a[1].lastSeen)
 				.map(([, entry]) => ({ name: entry.name, writing: entry.writes > 0 }));
 		},

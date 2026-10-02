@@ -10,6 +10,8 @@
 		open_questions: string[];
 		content_md: string;
 		parent_key?: string;
+		applicable?: boolean;
+		skip_reason?: string;
 	}
 
 	interface RequirementView {
@@ -112,10 +114,14 @@
 	// A chapter that has been split is the exception: it is shown with its sections
 	// beneath it, because a container's content *is* its sections. Selecting one
 	// section still shows that section alone.
+	//
+	// A chapter the triage set aside is left out of the whole document, as it is
+	// left out of the progress and the handoff; listed there it read "not
+	// started", as if it were still to be done. Opened on its own it says why.
 	const shown = $derived(
 		activeKey
 			? chapters.filter((c) => c.key === activeKey || c.parent_key === activeKey)
-			: chapters
+			: chapters.filter((c) => c.applicable !== false)
 	);
 
 	// A container is not unwritten when it has nothing of its own left — that is
@@ -128,7 +134,7 @@
 </script>
 
 <aside>
-	{#if decisionError}<p role="alert">{decisionError}</p>{/if}
+	{#if decisionError}<p class="decision-error" role="alert">{decisionError}</p>{/if}
 	<header>
 		<h2>{projectName}</h2>
 		<a class="handoff" href="/projects/{projectId}/diagram">Diagram</a>
@@ -163,20 +169,29 @@
 			>
 				<h3>
 					{chapter.title}
-					<span class="badge {chapter.status}">
-						{chapter.status === 'complete'
-							? 'complete'
-							: chapter.status === 'in_progress'
-								? 'in progress'
-								: 'not started'}
-					</span>
+					{#if chapter.applicable === false}
+						<span class="badge">not needed</span>
+					{:else}
+						<span class="badge {chapter.status}">
+							{chapter.status === 'complete'
+								? 'complete'
+								: chapter.status === 'in_progress'
+									? 'in progress'
+									: 'not started'}
+						</span>
+					{/if}
 				</h3>
 
 				{#if chapter.goal}
 					<p class="goal">{chapter.goal}</p>
 				{/if}
 
-				{#if chapter.content_md?.trim()}
+				{#if chapter.applicable === false && !chapter.content_md?.trim()}
+					<p class="unwritten">
+						Not needed for this application{chapter.skip_reason ? ` — ${chapter.skip_reason}` : ''}. If
+						it does apply, include it from the list of chapters.
+					</p>
+				{:else if chapter.content_md?.trim()}
 					<div class="body">{@html render(chapter.content_md)}</div>
 				{:else if containers.has(chapter.key)}
 					{@const count = sectionCount(chapter.key)}
@@ -426,6 +441,16 @@
 		font-size: 13.5px;
 		font-style: italic;
 		margin: 0;
+	}
+
+	.decision-error {
+		margin: 10px 16px 0;
+		background: #fdecec;
+		border: 1px solid #f3c9c9;
+		color: #8c2020;
+		padding: 8px 10px;
+		border-radius: 7px;
+		font-size: 13px;
 	}
 
 	.goal {

@@ -25,6 +25,12 @@
 export interface TurnSink {
 	/** Queue one event. Never throws because the browser went away. */
 	send(event: string, data: unknown): void;
+	/**
+	 * A comment line, which the browser ignores. Sent while the model reasons
+	 * and nothing else is, so a proxy that closes idle connections does not take
+	 * a long reply for a dead one.
+	 */
+	ping(): void;
 	/** The browser has gone; stop writing. Repeated calls are harmless. */
 	disconnect(): void;
 	/** False once the browser has gone. */
@@ -68,16 +74,22 @@ export function createSink(write: (frame: string) => void): TurnSink {
 			// Built before the write is attempted: a payload that cannot be
 			// serialised is our bug and should surface as one, not be mistaken for
 			// a browser that left.
-			const frame = sseFrame(event, data);
+			deliver(sseFrame(event, data));
+		},
 
-			try {
-				write(frame);
-			} catch {
-				// Cancelled between the last write and this one — the tab closed and
-				// `cancel` has not run yet, or will not.
-				connected = false;
-				dropped += 1;
-			}
+		ping() {
+			if (connected) deliver(': still working\n\n');
 		}
 	};
+
+	function deliver(frame: string): void {
+		try {
+			write(frame);
+		} catch {
+			// Cancelled between the last write and this one — the tab closed and
+			// `cancel` has not run yet, or will not.
+			connected = false;
+			dropped += 1;
+		}
+	}
 }

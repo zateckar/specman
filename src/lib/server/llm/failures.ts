@@ -28,6 +28,16 @@ export function describeFailure(cause: unknown, context: FailureContext = {}): s
 	// Already written for the user, and the advice in it is specific.
 	if (name === 'DocumentConflict') return message;
 
+	// Trying again cannot help, and saying so is the point: the alternative was
+	// to start the history again, empty, without telling anyone.
+	if (name === 'RepositoryMissing') {
+		return (
+			'This application’s history cannot be found on the server, so nothing more can be recorded in it.' +
+			kept(context) +
+			' Tell whoever looks after Specman — it needs restoring from a backup.'
+		);
+	}
+
 	if (/ran out of room/i.test(message)) {
 		return (
 			'That was more than the assistant could write in one go.' +

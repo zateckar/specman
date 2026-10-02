@@ -37,6 +37,8 @@
 	}
 </script>
 
+<svelte:head><title>Hand to a developer — {data.project.name} — Specman</title></svelte:head>
+
 <main>
 	<a class="back" href="/projects/{data.project.id}">← Back to {data.project.name}</a>
 	<h1>Hand this to a developer</h1>
@@ -44,13 +46,18 @@
 	<p class="lead">
 		The same document, rewritten for whoever builds it: what must be true, what must not be
 		built, and who decided each thing. It is written into the application's repository under
-		<code>spec/</code> whenever changes are approved, so anyone who clones it gets the current
+		<code>spec/</code> whenever changes are approved, so anyone who clones it gets the approved
 		version.
+	</p>
+	<!-- The preview is built from the document as it stands, which can be ahead of
+	     what was approved; the page used to read as though they were the same. -->
+	<p class="lead">
+		What you copy here is the document as it stands now, including anything not yet approved.
 	</p>
 
 	<div class="card summary">
 		<div>
-			<strong>{data.requirementCount} requirements in scope</strong>
+			<strong>{data.requirementCount} requirement{data.requirementCount === 1 ? '' : 's'} in scope</strong>
 			<p class="sub">{data.files.length} files under <code>spec/</code></p>
 		</div>
 		<button class="primary" onclick={copy}>

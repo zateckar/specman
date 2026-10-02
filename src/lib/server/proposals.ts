@@ -1,4 +1,4 @@
-import { writeFileSync } from 'node:fs';
+import { existsSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import {
 	db,
@@ -12,6 +12,7 @@ import {
 	getChapter,
 	getDecision,
 	getProject,
+	listProjects,
 	updateChapterState,
 	projectChapters,
 	projectDecisions,
@@ -34,6 +35,7 @@ import {
 	revisionIsAncestor,
 	recoveryTreeSafe,
 	onlyBundleChanged,
+	repoPathFor,
 	specInputOnBranch,
 	withRepo,
 	writeDocument,
@@ -94,7 +96,9 @@ function createProposal(projectId: number): Proposal {
  */
 async function workingProposal(project: Project): Promise<Proposal> {
 	await recoverApproval(project);
-	await ensureRepo(project.repo_path, project.name);
+	// A proposal is made only once the repository has its first commit, so any
+	// proposal at all means there was a history here to lose.
+	await ensureRepo(project.repo_path, project.name, listProposals(project.id).length > 0);
 
 	const proposal = openProposal(project.id) ?? createProposal(project.id);
 	await checkoutBranch(project.repo_path, proposal.branch);
@@ -181,8 +185,11 @@ export async function includeChapter(project: Project, key: string): Promise<voi
 	await withRepo(project.repo_path, async () => {
 		await recoverApproval(project);
 		const chapter = getChapter(project.id, key);
-		if (!chapter || chapter.applicable !== 0) return;
-		setChapterApplicable(project.id, key, true);
+		if (!chapter) return;
+		if (chapter.applicable === 0) setChapterApplicable(project.id, key, true);
+		// Committed even when it already reads as included. A choice whose commit
+		// failed is kept, as a confirmation is, and that is what a retry finds —
+		// returning early made the retry succeed while still recording nothing.
 		await commitWorkingDocument(project, `Include ${chapter.title}`);
 	});
 }
@@ -442,6 +449,41 @@ async function recoverApprovalWork(project: Project): Promise<void> {
 	writeSpecBundle(project.repo_path, buildSpecBundle(await specInputOnBranch(project.repo_path, intent.merge_revision)));
 	await commitAll(project.repo_path, 'Update the build-ready specification', MAIN_BRANCH);
 	db().prepare(`UPDATE approval_intents SET phase = 'complete' WHERE proposal_id = ?`).run(intent.proposal_id);
+}
+
+/**
+ * Point each application at its repository again after the installation moved.
+ *
+ * The path is stored whole, resolved against the folder the server was started
+ * in. Started from another folder — a different working directory in the
+ * container, a backup restored somewhere else — every stored path named
+ * nothing. Where the repository is found where this installation would put it,
+ * the stored path follows it; where it is found nowhere, that is said at boot
+ * rather than discovered by the first person to answer a question.
+ *
+ * Synchronous and run before anything reads `repo_path`.
+ */
+export function relocateRepositories(): void {
+	for (const project of listProjects()) {
+		if (existsSync(join(project.repo_path, '.git'))) continue;
+		const here = repoPathFor(project.slug);
+		if (here !== project.repo_path && existsSync(join(here, '.git'))) {
+			db().prepare('UPDATE projects SET repo_path = ? WHERE id = ?').run(here, project.id);
+			console.warn(`[repos] "${project.name}" is now read from ${here} (was ${project.repo_path})`);
+		} else if (historyMissing(project)) {
+			console.error(`[repos] the repository of "${project.name}" is missing from ${project.repo_path}`);
+		}
+	}
+}
+
+/**
+ * An application that has had a history, whose repository is not there.
+ *
+ * A proposal is made only once the repository has its first commit, so any
+ * proposal at all means there was a history to lose. See `RepositoryMissing`.
+ */
+export function historyMissing(project: Project): boolean {
+	return !existsSync(join(project.repo_path, '.git')) && listProposals(project.id).length > 0;
 }
 
 /** Idempotent forward recovery; failures in one project do not hide the others. */

@@ -80,7 +80,7 @@ export function validateDocument(input: {
 	const titleOf = new Map(chapters.map((c) => [c.key, c.title]));
 
 	const seenRefs = new Map<string, RequirementLike>();
-	const seenStatements = new Map<string, RequirementLike>();
+	const seenStatements = new Map<string, RequirementLike[]>();
 
 	for (const req of requirements) {
 		const sharer = seenRefs.get(req.ref);
@@ -140,22 +140,34 @@ export function validateDocument(input: {
 		}
 
 		const key = normalise(req.statement);
-		if (key) {
-			if (seenStatements.has(key)) {
-				findings.push({
-					severity: 'warning',
-					message: `${capitalise(quote(req))} is recorded twice.`,
-					ref: req.ref,
-					chapterKey: req.chapter_key
-				});
-			} else {
-				seenStatements.set(key, req);
-			}
-		}
+		if (key) seenStatements.set(key, [...(seenStatements.get(key) ?? []), req]);
+	}
+
+	// Counted, then said once. Reported pair by pair, a rule held three times
+	// read "is recorded twice" — twice.
+	for (const copies of seenStatements.values()) {
+		if (copies.length < 2) continue;
+		findings.push({
+			severity: 'warning',
+			message: `${capitalise(quote(copies[0]))} is recorded ${copies.length === 2 ? 'twice' : `${copies.length} times`}.`,
+			ref: copies[1].ref,
+			chapterKey: copies[1].chapter_key
+		});
 	}
 
 	for (const chapter of chapters) {
-		if (chapter.status === 'complete' && chapter.open_questions.length > 0) {
+		// Reported whatever the chapter's status: the status is already derived to
+		// withhold "complete" while these are outstanding, so the job here is to
+		// say what needs doing rather than repeat that it is unfinished.
+		const pending = decisions.filter(
+			(d) => d.chapter_key === chapter.key && d.source !== 'user' && d.status !== 'confirmed'
+		).length;
+		// Finished as the badge beside it says, not as stored: a chapter waiting on
+		// a confirmation reads "in progress", and a finding calling it finished
+		// contradicted the badge on the same chapter.
+		const finished = chapter.status === 'complete' && pending === 0;
+
+		if (finished && chapter.open_questions.length > 0) {
 			findings.push({
 				severity: 'error',
 				message: `${chapter.title} is marked finished but still has questions open.`,
@@ -164,20 +176,13 @@ export function validateDocument(input: {
 		}
 
 		const own = requirements.filter((r) => r.chapter_key === chapter.key);
-		if (chapter.status === 'complete' && own.length === 0) {
+		if (finished && own.length === 0) {
 			findings.push({
 				severity: 'warning',
 				message: `${chapter.title} is finished but states nothing that must be true.`,
 				chapterKey: chapter.key
 			});
 		}
-
-		// Reported whatever the chapter's status: the status is already derived to
-		// withhold "complete" while these are outstanding, so the job here is to
-		// say what needs doing rather than repeat that it is unfinished.
-		const pending = decisions.filter(
-			(d) => d.chapter_key === chapter.key && d.source !== 'user' && d.status !== 'confirmed'
-		).length;
 
 		if (pending > 0) {
 			findings.push({

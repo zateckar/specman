@@ -22,6 +22,7 @@ behaviour of that lookup is specified here.
 - `src/routes/admin/users/+page.svelte`
 - `src/routes/+layout.server.ts`
 - `src/routes/+layout.svelte`
+- `src/routes/+error.svelte`
 - `src/routes/login/+page.server.ts`
 - `src/routes/login/+page.svelte`
 - `src/routes/login/oidc/+server.ts`
@@ -82,6 +83,22 @@ attempts from there for a wait that grows with each failure, up to a ceiling.
 - **WHEN** a sign-in succeeds
 - **THEN** the failures before it are forgotten
 
+#### Scenario: Everyone arrives through the proxy
+- **WHEN** the caller is a trusted proxy that names, in `X-Forwarded-For`, the address it saw
+- **THEN** the failures are counted against that address, because counted against the
+  proxy's own, six wrong passwords from anyone locked the administrator's break-glass
+  sign-in for the whole company; from any other peer the header is ignored, because it is
+  the caller's own invention
+
+### Requirement: The sign-in form is for signing in
+Submitting the sign-in form while already signed in SHALL send the user to the front page
+without checking a password.
+
+#### Scenario: The form is sent from a tab left open
+- **WHEN** someone already signed in submits it
+- **THEN** they are taken home, rather than having a password checked, counted against them
+  and a second session issued
+
 ### Requirement: Stored credentials never leave the server
 The user record made available to a page SHALL carry no password hash and no salt.
 
@@ -109,6 +126,12 @@ After a successful sign-in the server SHALL send the user to a path on this host
 - **THEN** it is resolved the way the browser will resolve it and sent home, because the
   browser drops the tab, reads `//evil.example` and leaves this host
 
+#### Scenario: The other host is reached through a dot segment
+- **WHEN** the destination is `/..//evil.example`
+- **THEN** the user goes to the front page, because it resolves on this host to the path
+  `//evil.example`, and the browser reads that path again as an address once it is sent
+  back; what is checked is the path that will be sent, not only the one that arrived
+
 ### Requirement: A company sign-in is bound to its own attempt
 Company sign-in SHALL send a fresh nonce with each attempt and SHALL refuse an ID token that
 does not carry it.
@@ -117,6 +140,11 @@ does not carry it.
 - **WHEN** the callback presents an ID token issued for a different attempt
 - **THEN** sign-in fails, because state and PKCE protect the code but not which token comes
   back with it
+
+#### Scenario: The directory could not be reached once
+- **WHEN** looking up the provider's configuration failed
+- **THEN** the next sign-in looks it up again, because the failed lookup was kept and every
+  company sign-in failed until the server was restarted
 
 ### Requirement: The bootstrap admin is not a permanent backdoor
 The server SHALL create the initial `admin` account from `ADMIN_PASSWORD` only while no
@@ -183,6 +211,13 @@ administrator rights.
 - **WHEN** anything arriving from outside would make someone an administrator
 - **THEN** it does not, because who someone is and what they may do are separate questions
   and only the first is the directory's to answer
+
+#### Scenario: A colleague made an administrator signs in through an unchecked proxy
+- **WHEN** the proxy names an account that was granted administrator rights, and no trusted
+  peers are configured
+- **THEN** that request is treated as an ordinary user's, because with no address checked
+  anyone who can reach the port can send the same header; the rights are honoured once
+  `PROXY_AUTH_TRUSTED_IPS` is set, and the boot warning says so
 
 ### Requirement: The people page says how each person gets in
 Each account SHALL record how it came to exist, and the people page SHALL describe every way
@@ -253,6 +288,45 @@ who created one SHALL be recorded but SHALL NOT restrict who may work on it.
 - **THEN** it is refused, because sharing within the organisation is not sharing with
   whoever can reach the port
 
+#### Scenario: A page is opened signed out
+- **WHEN** the request is for a page
+- **THEN** the user is sent to sign in and brought back to the same address afterwards,
+  including what follows the `?`, which chooses the chapter
+
+#### Scenario: The page calls an endpoint after the session ended
+- **WHEN** a request under `/api/` carries no identity
+- **THEN** it is answered 401 with a sentence saying to sign in again, because a redirect
+  answered with the sign-in page, which the conversation read as a reply with nothing in it
+
+### Requirement: Another site cannot act through a colleague's browser
+The server SHALL refuse a write to its endpoints that a browser says came from another
+origin, and SHALL tell browsers not to show its pages inside another site's.
+
+#### Scenario: A page elsewhere posts to the conversation
+- **WHEN** a request under `/api/` other than GET, HEAD or OPTIONS carries an `Origin` that is
+  not this site
+- **THEN** it is refused with 403, whatever its content type; SvelteKit already refuses the
+  types a browser sends cross-site without a preflight, `text/plain` among them, and this
+  holds the rule for every type besides, because behind the proxy the identity is added on
+  the way in whichever page sent the request
+
+#### Scenario: A page elsewhere frames Specman
+- **WHEN** any page is served
+- **THEN** it says it may not be framed, so a click on "That's right" cannot be someone else's
+  click on an invisible copy
+
+### Requirement: Errors are explained in words
+A page that cannot be shown SHALL say why in plain words and offer the way back, and SHALL
+NOT show a status code or the developer's message.
+
+#### Scenario: An application that does not exist
+- **WHEN** the address names an application that is not there
+- **THEN** the page says there is nothing here and links back to the applications
+
+#### Scenario: A page for administrators
+- **WHEN** someone without the rights opens one
+- **THEN** the page says it is for the people who look after Specman
+
 ### Requirement: Administration is restricted
 The template and standards pages SHALL be reachable only by an administrator.
 
@@ -274,3 +348,9 @@ Sessions past their expiry SHALL be removed without waiting to be presented agai
 - **WHEN** their session expires and they never return
 - **THEN** the row is cleared out anyway, rather than being kept for ever because only a
   visit would have deleted it
+
+#### Scenario: A session expired earlier today
+- **WHEN** the clear-out runs
+- **THEN** that session is removed, because expiries are compared in the form they are
+  written in; compared against SQLite's `datetime('now')`, whose space sorts before the
+  stored `T`, every session expiring today looked unexpired until tomorrow

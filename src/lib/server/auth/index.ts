@@ -129,7 +129,10 @@ export function destroySession(sessionId: string): void {
  */
 export function purgeExpiredSessions(): void {
 	const result = db()
-		.prepare("DELETE FROM sessions WHERE expires_at < datetime('now')")
+		// Compared in the form the expiry is written in. `datetime('now')` has a
+		// space where an ISO time has a `T`, and as text every session due to
+		// expire later today sorted after it, so a day's expiries were missed.
+		.prepare("DELETE FROM sessions WHERE expires_at < strftime('%Y-%m-%dT%H:%M:%fZ', 'now')")
 		.run();
 	const gone = Number(result.changes ?? 0);
 	if (gone > 0) console.info(`[auth] removed ${gone} expired session(s)`);
@@ -208,7 +211,7 @@ export function userForProxyHeaders(
 		if (local.created_via === '') {
 			db().prepare(`UPDATE users SET created_via = 'proxy' WHERE id = ?`).run(local.id);
 		}
-		return getUser(local.id) ?? null;
+		return withheldRights(getUser(local.id) ?? null);
 	}
 
 	// Registered as an ordinary user, exactly as company sign-in does. What
@@ -224,6 +227,21 @@ export function userForProxyHeaders(
 	console.info(`[proxy-auth] registered "${identity.username}" as a new user`);
 
 	return getUser(id) ?? null;
+}
+
+/**
+ * The user as a header may present them.
+ *
+ * With no trusted peers configured, anyone who can reach the port can send the
+ * header, so naming a colleague who was later made an administrator would be
+ * the whole system. Rights granted on the people page are honoured through the
+ * header only once the server can check who sent it; until then that colleague
+ * works here as an ordinary user, and the bootstrap password still gets an
+ * administrator in.
+ */
+function withheldRights(user: User | null): User | null {
+	if (!user || !user.is_admin || config.proxyAuthTrustedIps.length > 0) return user;
+	return { ...user, is_admin: 0 };
 }
 
 /**
@@ -248,8 +266,10 @@ export function reportProxyAuthPosture(): void {
 
 	console.warn(
 		'[proxy-auth] enabled with NO trusted peers configured. Any caller that can reach this ' +
-			'port may sign in as any non-administrator by sending X-Forwarded-User. This is only ' +
-			'safe if a reverse proxy is the sole route here and it overwrites that header. Set ' +
-			'PROXY_AUTH_TRUSTED_IPS, or PROXY_AUTH_ENABLED=false if there is no proxy.'
+			'port may sign in as any account the proxy registered, and register new ones, by ' +
+			'sending X-Forwarded-User. Administrator rights are not honoured through the header ' +
+			'until the sender can be checked, so administrators must use a password or company ' +
+			'sign-in. This is only safe if a reverse proxy is the sole route here and it overwrites ' +
+			'that header. Set PROXY_AUTH_TRUSTED_IPS, or PROXY_AUTH_ENABLED=false if there is no proxy.'
 	);
 }

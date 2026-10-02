@@ -2,6 +2,8 @@
 	let { data, form } = $props();
 </script>
 
+<svelte:head><title>Sign in — Specman</title></svelte:head>
+
 <main>
 	<div class="card">
 		<h1>Sign in</h1>

@@ -15,17 +15,19 @@
  *
  *   npm test
  */
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, rmSync, utimesSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { simpleGit } from 'simple-git';
 import {
 	MAIN_BRANCH,
+	RepositoryMissing,
 	WrongBranch,
 	checkoutBranch,
 	commitAll,
 	currentBranch,
-	ensureRepo
+	ensureRepo,
+	withRepo
 } from '../src/lib/server/git/repo.ts';
 
 let pass = 0;
@@ -106,6 +108,37 @@ try {
 		raisedOnClean instanceof WrongBranch,
 		true
 	);
+
+	console.log('\n--- a lock left by a git that was killed ---');
+
+	// Left behind by a container stopped mid-commit, it failed every commit after.
+	await checkoutBranch(root, 'spec/0001');
+	writeFileSync(join(root, 'docs', '030-later.md'), '# Later\n\nWritten after the restart.\n');
+	const lock = join(root, '.git', 'index.lock');
+	writeFileSync(lock, '');
+	const anHourAgo = new Date(Date.now() - 60 * 60_000);
+	utimesSync(lock, anHourAgo, anHourAgo);
+	const afterRestart = await withRepo(root, () => commitAll(root, 'Update Later', 'spec/0001'));
+	check('a stale lock is cleared and the commit is made', [existsSync(lock), typeof afterRestart], [false, 'string']);
+
+	// One a running git could own is not ours to take.
+	writeFileSync(lock, '');
+	await withRepo(root, async () => {});
+	check('a fresh lock is left alone', existsSync(lock), true);
+	rmSync(lock);
+
+	console.log('\n--- a history that has gone ---');
+
+	const gone = join(root, 'gone');
+	let refused = null;
+	try {
+		await ensureRepo(gone, 'Gone', true);
+	} catch (cause) {
+		refused = cause;
+	}
+	check('a repository that existed is not started again empty', [refused instanceof RepositoryMissing, existsSync(gone)], [true, false]);
+	await ensureRepo(gone, 'New');
+	check('a new one is still made where none existed', await currentBranch(gone), MAIN_BRANCH);
 } finally {
 	rmSync(root, { recursive: true, force: true });
 }

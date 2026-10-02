@@ -17,11 +17,12 @@ import {
 	saveRequirement,
 	setChapterApplicable,
 	updateChapterState,
+	withChapterUnchanged,
 	withDocumentRevision
 } from '$lib/server/db';
 import { describeFailure } from '$lib/server/llm/failures';
-import { effectiveStatus, toDecisionDraft, unconfirmed } from '$lib/server/llm/decisions';
-import { toRequirementDraft } from '$lib/server/llm/requirements';
+import { attributeDecision, effectiveStatus, toDecisionDraft, unconfirmed } from '$lib/server/llm/decisions';
+import { sameStatement, toRequirementDraft } from '$lib/server/llm/requirements';
 import { parseSectionPlan } from '$lib/server/llm/subchapters';
 import { gateway } from '$lib/server/llm/gateway';
 import {
@@ -40,6 +41,9 @@ import type { RequestHandler } from './$types';
 
 /** See the comment where it is used. */
 const TURN_MAX_TOKENS = 16000;
+
+/** Comfortably inside the idle limit of any proxy likely to sit in front. */
+const HEARTBEAT_MS = 15_000;
 
 /**
  * The chapter a `<chapter>` block was meant for.
@@ -114,6 +118,10 @@ export const POST: RequestHandler = async ({ request, locals }) => {
 			const live = createSink((frame) => controller.enqueue(encoder.encode(frame)));
 			sink = live;
 			const send = (event: string, data: unknown) => live.send(event, data);
+			// The model can reason for a minute before its first word, and a proxy
+			// that closes quiet connections ended the stream there — which the page
+			// read as a reply that had finished.
+			const heartbeat = setInterval(() => live.ping(), HEARTBEAT_MS);
 
 			const parser = new ChapterStreamParser();
 			let reply = '';
@@ -167,12 +175,22 @@ export const POST: RequestHandler = async ({ request, locals }) => {
 				// Answers the agent offered for the question it just asked. Stored with
 				// the message so they survive a reload, not just this stream.
 				const options = parseOptions(parser.optionsBlock);
-				// A reply that was nothing but blocks has no words to keep, and an empty
-				// turn replayed to the gateway is a request it refuses.
-				if (reply.trim() || options.length > 0) {
-					addMessage(project.id, chapterKey, 'assistant', reply.trim(), options);
+				const writes =
+					parser.drafts.size > 0 ||
+					(['subchapters', 'requirement', 'decision'] as const).some((tag) => parser.blocksOf(tag).length > 0);
+
+				// A gateway that answers successfully with nothing at all used to end
+				// the turn as though it had worked: no reply, no error, and the
+				// answer apparently taken in.
+				if (!reply.trim() && options.length === 0 && !writes) {
+					send('error', {
+						message:
+							'The assistant sent nothing back this time. Your message is saved — send it again, ' +
+							'or put it another way.'
+					});
+					send('done', {});
+					return;
 				}
-				if (options.length > 0) send('options', { options });
 
 				// --- An arrangement of sub-chapters, if the agent proposed one. Applied
 				//     before the chapter drafts so a section created by this reply can be
@@ -180,7 +198,9 @@ export const POST: RequestHandler = async ({ request, locals }) => {
 				//     comment claimed it did not, and any such write was dropped.
 				const touched: string[] = [];
 				const documentEvents: Array<[string, unknown]> = [];
-				withDocumentRevision(project.id, revision, () => {
+				// A reply that writes nothing has nothing to check against a newer
+				// document, so a colleague's change in the meantime is no conflict.
+				if (writes) withDocumentRevision(project.id, revision, () => {
 					const send = (event: string, data: unknown) => documentEvents.push([event, data]);
 					let splitParent: string | null = null;
 
@@ -234,14 +254,21 @@ export const POST: RequestHandler = async ({ request, locals }) => {
 						if (!draft) continue;
 
 						// Restating a requirement by reference changes its wording, not where
-						// it lives: it stays in its own chapter unless one is named.
+						// it lives: it stays in its own chapter unless one is named. A named
+						// chapter is matched as a chapter block's is, by key or by title.
 						const recorded = draft.ref ? getRequirement(project.id, draft.ref) : undefined;
-						const key = draft.chapterKey ?? recorded?.chapter_key ?? active?.key;
-						const owner = key ? getChapter(project.id, key) : undefined;
-						if (!key || !owner) {
-							console.warn(`[chat] requirement for unknown chapter "${key}" — ignoring`);
+						const owner = draft.chapterKey
+							? draftTarget(draft.chapterKey, current, null)
+							: recorded
+								? (getChapter(project.id, recorded.chapter_key) ?? null)
+								: active;
+						if (!owner) {
+							// Dropped without a word, this read as recorded and was not.
+							console.warn(`[chat] requirement for unknown chapter "${draft.chapterKey ?? ''}" — not saved`);
+							unfiled = true;
 							continue;
 						}
+						const key = owner.key;
 
 						if (draft.remove) {
 							// A company standard is the organisation's rule, not this
@@ -259,8 +286,14 @@ export const POST: RequestHandler = async ({ request, locals }) => {
 						}
 						reopen(owner);
 
+						// The same rule written again without its reference is that rule,
+						// not a second copy of it.
+						const restated = draft.ref
+							? undefined
+							: chapterRequirements(project.id, key).find((r) => sameStatement(r.statement, draft.statement));
+
 						const saved = saveRequirement(project.id, {
-							ref: draft.ref,
+							ref: draft.ref ?? restated?.ref,
 							chapterKey: key,
 							statement: draft.statement,
 							scope: draft.scope,
@@ -291,16 +324,20 @@ export const POST: RequestHandler = async ({ request, locals }) => {
 						const draft = toDecisionDraft(block.attrs, block.body);
 						if (!draft) continue;
 
-						const key = draft.chapterKey ?? active?.key;
-						const owner = key ? getChapter(project.id, key) : undefined;
-						if (!key || !owner) continue;
+						const owner = draft.chapterKey ? draftTarget(draft.chapterKey, current, null) : active;
+						if (!owner) {
+							console.warn(`[chat] decision for unknown chapter "${draft.chapterKey ?? ''}" — not saved`);
+							unfiled = true;
+							continue;
+						}
+						const key = owner.key;
 						reopen(owner);
 
 						const saved = saveDecision(project.id, {
 							chapterKey: key,
 							statement: draft.statement,
 							rationale: draft.rationale,
-							source: draft.source
+							source: attributeDecision(draft.source, message)
 						});
 						send('decision', saved);
 						if (!touched.includes(key)) touched.push(key);
@@ -319,6 +356,19 @@ export const POST: RequestHandler = async ({ request, locals }) => {
 					}
 
 				});
+
+				// Stored only once what it describes has been. Before, a reply saying
+				// "I've recorded that" stayed in the transcript over an empty chapter
+				// whenever the changes behind it were refused — and was replayed to the
+				// model as though they had been made.
+				//
+				// A reply that was nothing but blocks has no words to keep, and an
+				// empty turn replayed to the gateway is a request it refuses.
+				if (reply.trim() || options.length > 0) {
+					addMessage(project.id, chapterKey, 'assistant', reply.trim(), options);
+				}
+				if (options.length > 0) send('options', { options });
+
 				for (const [event, data] of documentEvents) send(event, data);
 				if (unfiled) {
 					send('error', {
@@ -328,11 +378,12 @@ export const POST: RequestHandler = async ({ request, locals }) => {
 					});
 				}
 
-				// --- Re-assess completeness against its own captured revision.
+				// --- Re-assess completeness against the chapter as it reads now. The
+				//     verdict is kept only if the chapter still reads that way when it
+				//     arrives; a change elsewhere in the document does not make it stale.
 				const assessKey = active?.key ?? touched[0];
 				if (assessKey) {
 					const chapter = getChapter(project.id, assessKey);
-					const assessmentRevision = documentRevision(project.id);
 					if (chapter) {
 						const assessment = reconcileAssessment(
 							await assessChapter({
@@ -345,14 +396,15 @@ export const POST: RequestHandler = async ({ request, locals }) => {
 							// Read now, not at the start of the turn: a split this turn adds titles.
 							projectChapters(project.id)
 								.filter((c) => c.key !== assessKey)
-								.map((c) => c.title)
+								.map((c) => c.title),
+							chapter.content_md.trim().length > 0
 						);
 
 						if (assessment) {
 							// Store the assessor's verdict; the status the user sees is derived
 							// from it, so confirming an assumption takes effect at once.
 							try {
-								withDocumentRevision(project.id, assessmentRevision, () => updateChapterState(project.id, assessKey, {
+								withChapterUnchanged(project.id, chapter, () => updateChapterState(project.id, assessKey, {
 									status: assessment.status,
 									openQuestions: assessment.openQuestions
 								}));
@@ -394,11 +446,15 @@ export const POST: RequestHandler = async ({ request, locals }) => {
 						// which is what the message should say, rather than asking for a
 						// turn to be repeated that is already stored.
 						console.error('[chat] failed to record changes in git:', gitError);
+						// Except when there is no history to record it in: then the next
+						// change will not pick it up either, and saying so would be untrue.
 						send('error', {
 							message:
-								'Your answers are saved, but this change has not been added to the ' +
-								'application’s history yet, so it will not appear for review until ' +
-								'the next change is recorded.'
+								gitError instanceof Error && gitError.name === 'RepositoryMissing'
+									? describeFailure(gitError)
+									: 'Your answers are saved, but this change has not been added to the ' +
+										'application’s history yet, so it will not appear for review until ' +
+										'the next change is recorded.'
 						});
 					}
 				}
@@ -408,6 +464,7 @@ export const POST: RequestHandler = async ({ request, locals }) => {
 				console.error('[chat] turn failed:', cause);
 				send('error', { message: describeFailure(cause) });
 			} finally {
+				clearInterval(heartbeat);
 				// Cleared here rather than when the connection drops: the turn goes on
 				// writing after the tab closes, and it is the writing that matters to
 				// anyone else in the document.

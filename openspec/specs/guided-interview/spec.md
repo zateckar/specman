@@ -34,8 +34,22 @@ retaining the transcript and reporting a conflict when the document has changed.
 - **THEN** its chapter, requirement, decision and section mutations are rejected together
 
 #### Scenario: Completeness becomes stale
-- **WHEN** document changes occur while the completeness assessor is running
-- **THEN** its verdict cannot replace the newer status or open questions
+- **WHEN** the chapter's prose, status or open questions change while the completeness
+  assessor is running
+- **THEN** its verdict cannot replace the newer status or open questions; a change elsewhere
+  in the document does not discard it, because the verdict is about this chapter
+
+#### Scenario: A reply that changes nothing
+- **WHEN** a reply only talks — no prose, no rule, no decision, no sections — and the
+  document changed while it was written
+- **THEN** it is kept and no conflict is reported, because it has nothing to check against a
+  newer document; checking it failed a colleague's question back and threw away what it said
+
+#### Scenario: A reply whose changes are refused
+- **WHEN** the reply's changes are rejected as a conflict
+- **THEN** the user's message is kept but the reply is not stored and its suggested answers
+  are not offered, because stored, it said "I have recorded that" about changes that were not,
+  and was replayed to the model as though they had been
 
 ### Requirement: A turn is two independent calls
 A conversation turn SHALL be a streamed prose call and a separate structured assessment
@@ -75,6 +89,10 @@ blocks in the streamed text, and SHALL remove them from what the user sees.
 - **THEN** it is read like `key="security"`, because refusing it printed the raw tag and the
   whole chapter into the chat and saved nothing
 
+#### Scenario: Attributes without quotes, tags in capitals
+- **WHEN** the model writes `<chapter key=security>` or closes with `</CHAPTER >`
+- **THEN** both are read as the ordinary form, for the same reason
+
 #### Scenario: Blocks leave a hole in the prose
 - **WHEN** several blocks are removed from one reply
 - **THEN** the blank lines that surrounded them are collapsed, across chunk boundaries
@@ -110,6 +128,35 @@ content unchanged and report the failure instead of saving a partial draft.
   again will help, and the cause goes to the log, because "Gateway stream failed with 502"
   or the text of a database error is nothing a colleague who commissions software can act on
 
+#### Scenario: The assistant sends nothing back
+- **WHEN** the reply holds no words, no suggested answers and no change to the document
+- **THEN** the user is told nothing came back and that their message is saved, rather than
+  the turn ending as though it had been answered
+
+#### Scenario: The model is silent for a long time
+- **WHEN** the model reasons before its first word, or between blocks
+- **THEN** the server sends a comment line every fifteen seconds that the page ignores,
+  because a proxy closes a connection that carries nothing for a minute, and the turn was
+  cut off while the model was still at work
+
+### Requirement: A failed send gives the answer back
+When a turn cannot be completed, the page SHALL say so and SHALL return what the user wrote
+to the answer box.
+
+#### Scenario: The server refuses the turn
+- **WHEN** the answer cannot be sent — the session ended, another turn holds the chapter, the
+  server is down
+- **THEN** the reason is shown in words and the answer is back in the box, because it had been
+  cleared from the box and was gone
+
+#### Scenario: Something other than a reply comes back
+- **WHEN** the response is not a stream of events, such as a sign-in page
+- **THEN** it is treated as a failure, rather than read as a reply with nothing in it
+
+#### Scenario: The connection drops part-way
+- **WHEN** the stream ends without saying the turn is done
+- **THEN** the user is told the reply was cut off and that reloading shows what was recorded
+
 ### Requirement: A turn's budget covers a whole chapter
 A conversation turn SHALL be given room for the model's reasoning plus a full rewrite of the
 chapter with its requirements and decisions.
@@ -136,6 +183,16 @@ cannot be placed SHALL be reported rather than dropped.
 - **WHEN** no chapter matches
 - **THEN** the user is told part of the answer was not saved and can be asked for again,
   because prose that reads as recorded and is not is the worst outcome of a turn
+
+#### Scenario: A rule or a decision with nowhere to go
+- **WHEN** a requirement or decision names no chapter of the document, and the conversation
+  is the whole-document one, which belongs to no chapter
+- **THEN** it is not filed under a guess and the user is told part of the answer was not
+  saved, because it used to be dropped without a word
+
+#### Scenario: A rule names its chapter by title
+- **WHEN** a requirement or decision names its chapter by title rather than key
+- **THEN** it is filed there, on the same terms as a chapter block
 
 #### Scenario: The block is empty
 - **WHEN** a chapter block holds nothing, or only whitespace
@@ -257,6 +314,11 @@ The page SHALL show who else has this application open, and who is writing.
 #### Scenario: A colleague closes the page
 - **WHEN** they stop looking without saying so
 - **THEN** they cease to be listed shortly afterwards
+
+#### Scenario: A colleague's turn outlasts that
+- **WHEN** a turn runs longer than a closed page stays listed
+- **THEN** they stay listed as writing until it finishes, because the clear-out removed them
+  part-way through a turn that went on writing to the document
 
 ### Requirement: Every question stays inside the chapter being discussed
 The assistant SHALL ask only about the chapter in scope.

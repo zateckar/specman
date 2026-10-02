@@ -24,7 +24,7 @@ export interface RequirementChange {
 	before?: ManifestRequirement;
 	after?: ManifestRequirement;
 	/** For a change: which parts moved, so the UI can say "postponed" rather than "changed". */
-	fields: Array<'statement' | 'scope' | 'scenarios'>;
+	fields: Array<'statement' | 'scope' | 'scenarios' | 'chapter'>;
 }
 
 function sameScenarios(
@@ -55,6 +55,9 @@ export function requirementDelta(
 		if (previous.statement !== current.statement) fields.push('statement');
 		if (previous.scope !== current.scope) fields.push('scope');
 		if (!sameScenarios(previous.scenarios ?? [], current.scenarios ?? [])) fields.push('scenarios');
+		// A rule moved to another chapter is a change to the document even when
+		// its words are the same; the summary used to say nothing had changed.
+		if (previous.chapter !== current.chapter) fields.push('chapter');
 
 		if (fields.length > 0) {
 			changes.push({

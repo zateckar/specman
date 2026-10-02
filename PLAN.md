@@ -171,6 +171,21 @@ repair run on every start mistook new questions for the old defect and deleted t
 case the code took the path a success would have taken, with nothing in hand. Wherever work
 can fail, ask what is *stored* when it does.
 
+A third, from the review of 2026-10-02: **a sentence written for the usual case is untrue in
+the others.** The turn said a change "will be recorded with the next one" when there was no
+repository left to record it in. Approval said the outstanding changes "have been now" saved
+when that commit had failed too. Including a chapter reported "could not be included" over a
+chapter that was included and only not yet committed. Validation called a chapter finished
+while the badge beside it said in progress, and the review page offered Approve for a
+difference with nothing in it. Each message was right when it was written, for the case its
+author had in mind. Whenever the code says something to the user, ask which branch it is on —
+and say only what is true of that one.
+
+A fourth, from the same review: **a guard that counts more than it protects fails the
+innocent.** The document revision counted the assessor's verdict as a change, so a colleague
+whose turn only asked a question back failed someone else's slower turn and threw away what
+it had written. Optimistic concurrency is only as good as its idea of what a change is.
+
 ## Where to go next
 
 Nothing in this plan is outstanding. These are the gaps, and each is a candidate for the
@@ -248,6 +263,28 @@ first folder under `openspec/changes/`:
   capability, not a setting.
 - **Unsent answers live in the browser tab.** A draft survives switching chapters, not a
   reload or a second tab.
+- **Administrator rights through the proxy need `PROXY_AUTH_TRUSTED_IPS`.** With it unset,
+  anyone who can reach the port can send the header, so a person the gateway signs in is
+  treated as an ordinary user whatever the People page says. Behind the compose file's
+  loopback binding that is every proxied administrator until the gateway's address — as the
+  container sees it, usually the Docker bridge — is configured. Administrators can still sign
+  in with a password or a company account.
+- **Repositories are found again only under `data/repos/<slug>`.** The path is stored whole.
+  A server started from another folder follows each repository to that place in its own
+  folder at boot; one moved anywhere else needs `projects.repo_path` corrected by hand. A
+  repository that is simply gone is refused rather than started again — restoring it is an
+  operator's job, and the user is told so.
+- **"You decide" is recognised by phrase.** A decision the model labels as the user's is
+  treated as the assistant's when the user's message hands the choice back in English, Czech,
+  Slovak or German phrases the code lists. Handed back in other words, the model's label is
+  still believed.
+- **The database can be ahead of the history.** A confirmed or discarded decision, or an
+  included chapter, is kept when its commit fails, and reaches the repository with the next
+  commit. Until then it is not in what anyone reviews, and the page says so; rolling the
+  choice back instead would lose something the user did.
+- **A heartbeat keeps a quiet turn open, not a long one.** The comment line every fifteen
+  seconds stops a proxy closing an idle stream; a proxy with a ceiling on the whole request
+  still ends a turn that outlasts it. The turn carries on server-side either way.
 
 ---
 

@@ -81,6 +81,39 @@ export function parseSectionPlan(body: string): PlannedSection[] {
 }
 
 /**
+ * Keep a plan's keys clear of every chapter that is not one of this parent's sections.
+ *
+ * A chapter's key is unique across the whole document, and the model names
+ * sections by what they hold — `data`, `integration`, or the parent's own key —
+ * which are often chapters already. Such a key used to reach the database as a
+ * new row, hit the uniqueness rule and roll back the whole reply, and asking
+ * again failed the same way. Prefixed with the parent it is unique, and the same
+ * plan maps to the same keys next time, so the section it created is found again
+ * rather than created twice.
+ */
+export function claimSectionKeys(
+	planned: PlannedSection[],
+	parentKey: string,
+	taken: Iterable<string>
+): PlannedSection[] {
+	const used = new Set(taken);
+	const claimed: PlannedSection[] = [];
+
+	for (const section of planned) {
+		let key = section.key;
+		if (used.has(key)) {
+			const base = `${parentKey}-${section.key}`.slice(0, 76).replace(/-+$/, '');
+			key = base;
+			for (let n = 2; used.has(key); n += 1) key = `${base}-${n}`;
+		}
+		used.add(key);
+		claimed.push({ key, title: section.title });
+	}
+
+	return claimed;
+}
+
+/**
  * Work out what to change.
  *
  * Anything the plan omits keeps its content and is appended after the planned

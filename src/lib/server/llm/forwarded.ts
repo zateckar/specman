@@ -74,6 +74,22 @@ export function mayAssertIdentity(peer: string | null, trusted: string[]): boole
 	});
 }
 
+/**
+ * The address a sign-in attempt is held against.
+ *
+ * Behind a proxy every caller arrives from the proxy's address, so failed
+ * attempts were counted against one address for the whole company: six wrong
+ * passwords for `admin` from anyone locked out the administrator's break-glass
+ * sign-in for everyone. A peer on the trusted list is the proxy, and the last
+ * address it appended to `X-Forwarded-For` is the caller it saw. Anyone else's
+ * header is their own invention and is ignored.
+ */
+export function attemptAddress(peer: string, forwardedFor: string | null, trusted: string[]): string {
+	if (trusted.length === 0 || !forwardedFor || !mayAssertIdentity(peer, trusted)) return peer;
+	const hops = forwardedFor.split(',').map((hop) => hop.trim()).filter(Boolean);
+	return hops.at(-1) ?? peer;
+}
+
 function unwrapIpv4(address: string): string {
 	const bare = address.trim().replace(/^\[|\]$/g, '');
 	const mapped = /^::ffff:(\d{1,3}(?:\.\d{1,3}){3})$/i.exec(bare);

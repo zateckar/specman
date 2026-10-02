@@ -115,7 +115,8 @@ export function toRequirementDraft(
 	attrs: Record<string, string>,
 	body: string
 ): RequirementDraft | null {
-	const ref = attrs.ref?.trim() || null;
+	// Refs are stored as `REQ-004`; `req-004` names the same one.
+	const ref = attrs.ref?.trim().toUpperCase() || null;
 	const remove = (attrs.action ?? '').trim().toLowerCase() === 'remove';
 
 	// Removing needs only a ref; anything else needs words.
@@ -145,6 +146,52 @@ export function toRequirementDraft(
 		remove: false,
 		existing: /^(true|yes|1)$/i.test((attrs.existing ?? '').trim())
 	};
+}
+
+/**
+ * True when two statements are the same rule written the same way.
+ *
+ * The model restates rules as it rewrites a chapter, and does not always carry
+ * the reference with it. Without one, every restatement was a new requirement,
+ * and the chapter collected copies of itself. Only wording that matches once
+ * case, spacing and the closing full stop are set aside counts: anything looser
+ * would merge two rules that differ in the one word that matters.
+ */
+export function sameStatement(a: string, b: string): boolean {
+	const plain = (text: string) =>
+		text.trim().toLowerCase().replace(/\s+/g, ' ').replace(/[.!。]+$/u, '');
+	return plain(a) !== '' && plain(a) === plain(b);
+}
+
+/**
+ * Scenarios as a person writes them: one to a line, "If …, then …".
+ *
+ * The same sentence the interface shows, so a standard's examples are edited in
+ * the words they are read in and the storage markers stay out of the form. The
+ * first "then" divides the line; a list bullet and the closing full stop are
+ * set aside.
+ */
+const PLAIN_SCENARIO = /^(?:[-*•]\s*)?if\s+(.+?),?\s+then\s+(.+?)\s*\.?$/i;
+
+export function scenarioLines(scenarios: Scenario[]): string {
+	return scenarios.map((s) => `If ${s.when}, then ${s.then.replace(/\.\s*$/, '')}.`).join('\n');
+}
+
+/** Every line read, or the lines that could not be — never half of them. */
+export function readScenarioLines(text: string): { scenarios: Scenario[] } | { unreadable: string[] } {
+	const scenarios: Scenario[] = [];
+	const unreadable: string[] = [];
+	for (const raw of text.split('\n')) {
+		const line = raw.trim();
+		if (!line) continue;
+		const match = PLAIN_SCENARIO.exec(line);
+		if (match && match[1].trim() && match[2].trim()) {
+			scenarios.push({ when: match[1].trim(), then: match[2].trim() });
+		} else {
+			unreadable.push(line);
+		}
+	}
+	return unreadable.length > 0 ? { unreadable } : { scenarios };
 }
 
 /**

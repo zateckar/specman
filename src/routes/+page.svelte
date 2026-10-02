@@ -1,7 +1,12 @@
 <script lang="ts">
 	let { data, form } = $props();
-	let creating = $state(false);
+	// Open again after a refused submit, so its message is seen and what was
+	// typed is still there. It used to come back closed, with both hidden.
+	let creating = $derived(!!form?.message);
+	const typed = $derived((form?.values ?? {}) as Record<string, string>);
 </script>
+
+<svelte:head><title>Your applications — Specman</title></svelte:head>
 
 <main>
 	<div class="head">
@@ -19,24 +24,27 @@
 
 	{#if creating}
 		<form method="POST" action="?/create" class="card new">
-			{#if form?.message}<p class="error">{form.message}</p>{/if}
+			{#if form?.message}<p class="error" role="alert">{form.message}</p>{/if}
 			<label>
 				What is it called?
-				<input name="name" placeholder="Company car booking" required />
+				<input name="name" placeholder="Company car booking" required value={typed.name ?? ''} />
 			</label>
+			<!-- Nothing promises these can be changed later: nothing yet can change
+			     them. A chapter the answers set aside can still be included from the
+			     index, and the description is refined in the Overview chapter. -->
 			<label>
-				What should it do? (one sentence — you can change this later)
-				<input name="description" placeholder="Let employees book a pool car for a day" />
+				What should it do? (one sentence)
+				<input name="description" placeholder="Let employees book a pool car for a day" value={typed.description ?? ''} />
 			</label>
 
 			<p class="triage-intro">
 				Four quick answers so we only ask you about the things that matter for this
-				application. You can change any of them later.
+				application. If a chapter they leave out does apply, you can include it again later.
 			</p>
 
 			<label>
 				Does it already exist?
-				<select name="kind">
+				<select name="kind" value={typed.kind ?? 'new'}>
 					<option value="new">No — this is something new</option>
 					<option value="change">Yes — we want to change something we already have</option>
 				</select>
@@ -44,7 +52,7 @@
 
 			<label>
 				Who can get to it?
-				<select name="reach">
+				<select name="reach" value={typed.reach ?? 'company'}>
 					<option value="company">Anyone at Škoda Auto</option>
 					<option value="team">Just my team</option>
 					<option value="external">People outside the company too</option>
@@ -53,7 +61,7 @@
 
 			<label>
 				Does it hold anything about identifiable people — names, contact details, photographs?
-				<select name="personalData">
+				<select name="personalData" value={typed.personalData ?? 'yes'}>
 					<option value="yes">Yes, or I am not sure</option>
 					<option value="no">No, nothing about individual people</option>
 				</select>
@@ -61,7 +69,7 @@
 
 			<label>
 				Does it touch money, safety, or records the company is legally required to keep?
-				<select name="critical">
+				<select name="critical" value={typed.critical ?? 'no'}>
 					<option value="no">No</option>
 					<option value="yes">Yes, or I am not sure</option>
 				</select>
@@ -92,7 +100,7 @@
 						<div class="stats">
 							<span>{project.complete}/{project.total} chapters</span>
 							{#if project.open > 0}
-								<span class="open">{project.open} open questions</span>
+								<span class="open">{project.open} open question{project.open === 1 ? '' : 's'}</span>
 							{/if}
 						</div>
 					</a>

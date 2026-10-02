@@ -25,6 +25,8 @@
 	}
 </script>
 
+<svelte:head><title>People — Specman</title></svelte:head>
+
 <main>
 	<a class="back" href="/">← Back</a>
 	<h1>People</h1>

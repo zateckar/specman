@@ -72,6 +72,7 @@ const { completeLogin, OidcNameCollision } = await import('../src/lib/server/aut
 const auth = await import('../src/lib/server/auth/index.ts');
 const { GatewayProvider, gateway } = await import('../src/lib/server/llm/gateway.ts');
 const { verifyDocument } = await import('../src/lib/server/llm/verification.ts');
+const { sameStatement } = await import('../src/lib/server/llm/requirements.ts');
 const chat = await import('../src/routes/api/chat/+server.ts');
 const decisionsApi = await import('../src/routes/api/decisions/+server.ts');
 const verifyApi = await import('../src/routes/api/verify/+server.ts');
@@ -151,6 +152,16 @@ try {
   const proxyHeaders = (name) => (headerName) => headerName.toLowerCase() === 'x-forwarded-user' ? name : null;
   check('the proxy cannot adopt a company sign-in account', auth.userForProxyHeaders(proxyHeaders('new-colleague'), '127.0.0.1'), null);
   check('but resumes an account the proxy made', auth.userForProxyHeaders(proxyHeaders('proxy-colleague'), '127.0.0.1')?.username, 'proxy-colleague');
+  // Promoted on the people page. With nobody's address checked, the header is
+  // anyone's to send, so the rights do not come with it.
+  database.prepare("UPDATE users SET is_admin = 1 WHERE username = 'proxy-colleague'").run();
+  const trustedBefore = process.env.PROXY_AUTH_TRUSTED_IPS;
+  delete process.env.PROXY_AUTH_TRUSTED_IPS;
+  check('an unchecked header does not carry administrator rights', auth.userForProxyHeaders(proxyHeaders('proxy-colleague'), '10.9.9.9')?.is_admin, 0);
+  process.env.PROXY_AUTH_TRUSTED_IPS = '127.0.0.1';
+  check('a header from a trusted peer does', auth.userForProxyHeaders(proxyHeaders('proxy-colleague'), '127.0.0.1')?.is_admin, 1);
+  if (trustedBefore === undefined) delete process.env.PROXY_AUTH_TRUSTED_IPS; else process.env.PROXY_AUTH_TRUSTED_IPS = trustedBefore;
+  database.prepare("UPDATE users SET is_admin = 0 WHERE username = 'proxy-colleague'").run();
 
   // A name with no password costs the same hash as a wrong password, so the
   // reply does not say which names exist.
@@ -454,6 +465,27 @@ try {
   store.withDocumentRevision(independent.id, independentVersion, () => store.updateChapterState(independent.id, 'overview', { contentMd: 'Independent write' }));
   check('conflicts in one application do not invalidate another', store.getChapter(independent.id, 'overview').content_md, 'Independent write');
 
+  // A colleague's reply that writes nothing is not a change to the document.
+  const quiet = fixtureProject('quiet-reply');
+  const quietEntered = deferred();
+  const finishQuiet = deferred();
+  const quietVersion = store.documentRevision(quiet.id);
+  store.withDocumentRevision(quiet.id, quietVersion, () => {});
+  check('a transaction that writes nothing leaves the revision alone', store.documentRevision(quiet.id), quietVersion);
+  gateway.streamChat = async function* (req) {
+    const slow = req.messages.at(-1).content === 'Slow answer';
+    if (slow) { quietEntered.resolve(); await finishQuiet.promise; }
+    yield { type: 'text', text: slow ? '<chapter key="overview">Slow but valid prose</chapter>Recorded.' : 'Just a question back?' };
+    yield { type: 'done', servedBy: 'fixture', outputTokens: 1 };
+  };
+  const quietSlow = (await chat.POST(event({ projectId: quiet.id, chapterKey: 'overview', message: 'Slow answer' }))).text();
+  await quietEntered.promise;
+  await (await chat.POST(event({ projectId: quiet.id, chapterKey: 'security', message: 'Talk only' }))).text();
+  finishQuiet.resolve();
+  const quietEvents = await quietSlow;
+  check('a text-only reply does not fail a slower turn', quietEvents.includes('proposed changes were not applied'), false);
+  check('so the slower turn is saved', store.getChapter(quiet.id, 'overview').content_md.includes('Slow but valid prose'), true);
+
   const assessing = fixtureProject('assessment-race');
   const assessmentEntered = deferred();
   const finishAssessment = deferred();
@@ -534,6 +566,67 @@ try {
   gateway.streamChat = async function* () { throw Object.assign(new Error('Gateway stream failed with 502'), { name: 'GatewayError' }); };
   const plainFailure = await (await chat.POST(event({ projectId: filing.id, chapterKey: 'overview', message: 'Again' }))).text();
   check('a gateway failure reaches the user in plain words', plainFailure.includes('cannot be reached') && !plainFailure.includes('502'), true);
+
+  // Rules and decisions that cannot be placed are reported like a chapter block is.
+  const beforeOrphans = [store.projectRequirements(filing.id).length, store.projectDecisions(filing.id).length];
+  const orphanEvents = await turn('<requirement>Every booking is confirmed by email.\nWHEN booked\nTHEN mailed</requirement><decision source="agent">Email only.\nWhy: simplest.</decision>Noted.', null);
+  check('a rule from the whole-document conversation with no chapter is reported', orphanEvents.includes('could not be filed'), true);
+  check('and nothing is filed under a guess', [store.projectRequirements(filing.id).length, store.projectDecisions(filing.id).length], beforeOrphans);
+  await turn(`<requirement chapter="${securityTitle}">Only staff can see the bookings.\nWHEN a visitor looks\nTHEN nothing is shown</requirement>Noted.`, null);
+  check('a rule naming its chapter by title is filed there', store.chapterRequirements(filing.id, 'security').some(r => r.statement === 'Only staff can see the bookings.'), true);
+  await turn('<requirement>Only staff can see the bookings\nWHEN a visitor looks\nTHEN nothing is shown</requirement>Noted.', 'security');
+  check('the same rule restated without its reference is not copied', store.chapterRequirements(filing.id, 'security').filter(r => sameStatement(r.statement, 'Only staff can see the bookings')).length, 1);
+
+  // The model handed back the choice and labelled it the user's anyway.
+  await turn('<decision source="user">Bookings are kept for a year.\nWhy: long enough for audits.</decision>Done.', 'security', 'I don’t know, you decide.');
+  check('a choice handed back is not stored as the user’s', store.projectDecisions(filing.id).find(d => d.statement === 'Bookings are kept for a year.')?.status, 'proposed');
+
+  // Nothing at all back from a successful call.
+  const silentEvents = await turn('', 'overview', 'Anything?');
+  check('an empty reply is reported rather than taken as an answer', silentEvents.includes('sent nothing back'), true);
+
+  // A section named after a chapter that already exists.
+  const splitting = fixtureProject('section-keys');
+  const growing = store.projectChapters(splitting.id).find(c => c.is_dynamic && !c.parent_key);
+  const taken = store.projectChapters(splitting.id).find(c => c.key !== growing.key && !c.parent_key).key;
+  gateway.streamChat = async function* () {
+    yield { type: 'text', text: `<subchapters>${taken}: A section named like a chapter\n${growing.key}: And one like its parent\nbooking: Booking a car</subchapters>Split.` };
+    yield { type: 'done', servedBy: 'fixture', outputTokens: 1 };
+  };
+  const splitEvents = await (await chat.POST(event({ projectId: splitting.id, chapterKey: growing.key, message: 'Split it' }))).text();
+  const sections = store.projectChapters(splitting.id).filter(c => c.parent_key === growing.key).map(c => c.key);
+  check('a section key another chapter has does not crash the reply', [splitEvents.includes('event: error'), sections.length], [false, 3]);
+  check('it is filed under the parent instead', sections.includes(`${growing.key}-${taken}`), true);
+  await (await chat.POST(event({ projectId: splitting.id, chapterKey: growing.key, message: 'Split it again' }))).text();
+  check('and the same plan again finds the same sections', store.projectChapters(splitting.id).filter(c => c.parent_key === growing.key).length, 3);
+
+  // An overloaded backend said so inside the stream, before any text.
+  let streamCalls = 0;
+  globalThis.fetch = async () => {
+    streamCalls += 1;
+    return new Response(streamCalls === 1
+      ? frame({ type: 'error', error: { type: 'overloaded_error' } })
+      : textFrame('Recovered') + stopFrame);
+  };
+  const recovered = (await readStream()).filter(e => e.type === 'text').map(e => e.text).join('');
+  check('an in-stream overload before any text is retried', [streamCalls, recovered], [2, 'Recovered']);
+  globalThis.fetch = realFetch;
+
+  // A reply whose changes are refused leaves no claim in the transcript.
+  const refused = fixtureProject('refused-reply');
+  const refusedEntered = deferred();
+  const finishRefused = deferred();
+  gateway.streamChat = async function* () {
+    refusedEntered.resolve(); await finishRefused.promise;
+    yield { type: 'text', text: '<chapter key="overview">Late prose</chapter>I have recorded that.' };
+    yield { type: 'done', servedBy: 'fixture', outputTokens: 1 };
+  };
+  const refusedBody = (await chat.POST(event({ projectId: refused.id, chapterKey: 'overview', message: 'Slow' }))).text();
+  await refusedEntered.promise;
+  store.updateChapterState(refused.id, 'overview', { contentMd: 'Someone else wrote first' });
+  finishRefused.resolve();
+  check('a refused reply reports the conflict', (await refusedBody).includes('proposed changes were not applied'), true);
+  check('and is not kept in the transcript as though it were recorded', store.recentMessages(refused.id, 'overview', 5).some(m => m.content.includes('I have recorded that')), false);
 
   console.log('\n--- durable approval cut points ---');
   for (const phase of ['before-merge', 'after-merge', 'during-bundle', 'after-bundle']) {
@@ -745,6 +838,18 @@ try {
     const loaded = await home.load({});
     const card = loaded.projects.find((p) => p.id === con.id);
     check('the home card counts what the index counts', card.total, store.projectChapters(con.id).filter((c) => c.applicable !== 0).length);
+
+    // As stored by the same installation started from another folder.
+    database.prepare('UPDATE projects SET repo_path = ? WHERE id = ?').run(join(root, 'elsewhere', 'con-app'), con.id);
+    proposals.relocateRepositories();
+    check('a repository is followed to where this installation keeps it', store.getProject(con.id).repo_path, con.repo_path);
+    rmSync(con.repo_path, { recursive: true, force: true });
+    await rejects('a repository that has gone is reported, not started again empty',
+      () => proposals.commitDocument(store.getProject(con.id), 'After the loss'), (cause) => cause.name === 'RepositoryMissing');
+    check('and nothing was made in its place', existsSync(con.repo_path), false);
+    const lostReview = await reviewPage.load({ params: { id: String(con.id) } });
+    check('the review page says the history is missing, offering nothing to approve',
+      [lostReview.historyMissing, lostReview.reviewed], [true, null]);
   } finally {
     process.chdir(cwd);
   }
@@ -812,8 +917,28 @@ try {
   const typo = await standardsAdmin.actions.save(adminForm('admin/standards?/save', { id: String(someStandard.id), statement: someStandard.statement, appliesWhen: 'personal-data' }));
   check('a misspelt condition is refused by name', [typo.status, typo.data.message.includes('personal-data')], [400, true]);
   check('and the standard is unchanged', store.listStandards()[0].applies_when, someStandard.applies_when);
-  await standardsAdmin.actions.save(adminForm('admin/standards?/save', { id: String(someStandard.id), statement: someStandard.statement, appliesWhen: '' }));
-  check('a cleared condition means always, not never', store.listStandards()[0].applies_when, ['always']);
+  const examples = 'If a colleague signs in, then the company account is used.';
+  const narrowed = await standardsAdmin.actions.save(adminForm('admin/standards?/save', { id: String(someStandard.id), statement: someStandard.statement, appliesWhen: 'personal_data', scenarios: examples }));
+  check('a known condition is saved', [narrowed.saved, store.listStandards()[0].applies_when], [true, ['personal_data']]);
+  const cleared = await standardsAdmin.actions.save(adminForm('admin/standards?/save', { id: String(someStandard.id), statement: someStandard.statement, appliesWhen: '', scenarios: examples }));
+  check('a cleared condition means always, not never', [cleared.saved, store.listStandards()[0].applies_when], [true, ['always']]);
+  const reworded = await standardsAdmin.actions.save(adminForm('admin/standards?/save', {
+    id: String(someStandard.id), statement: 'Colleagues sign in with their company account.', appliesWhen: '',
+    scenarios: '- If a colleague opens the application, then they are asked for their company account.\nIf someone outside the company tries, then they are turned away'
+  }));
+  check('the examples are edited with the wording', [reworded.saved, store.listStandards()[0].scenarios], [true, [
+    { when: 'a colleague opens the application', then: 'they are asked for their company account' },
+    { when: 'someone outside the company tries', then: 'they are turned away' }
+  ]]);
+  const unreadable = await standardsAdmin.actions.save(adminForm('admin/standards?/save', { id: String(someStandard.id), statement: 'Changed wording', appliesWhen: '', scenarios: 'WHEN x THEN y' }));
+  check('an example not written as "If …, then …" is refused by quoting it', [unreadable.status, unreadable.data.message.includes('WHEN x THEN y')], [400, true]);
+  check('and what was typed comes back with the refusal, for that standard', [unreadable.data.id, unreadable.data.values.statement, unreadable.data.values.scenarios], [someStandard.id, 'Changed wording', 'WHEN x THEN y']);
+  const noExamples = await standardsAdmin.actions.save(adminForm('admin/standards?/save', { id: String(someStandard.id), statement: 'Changed wording', appliesWhen: '', scenarios: '  \n' }));
+  check('a standard is not left without an example', noExamples.status, 400);
+  check('and neither refusal changed it', store.listStandards()[0].statement, 'Colleagues sign in with their company account.');
+  const shown = await standardsAdmin.load({ locals: { user: store.getUser(1) } });
+  check('the page shows the examples in the words they are edited in', shown.standards[0].examples,
+    'If a colleague opens the application, then they are asked for their company account.\nIf someone outside the company tries, then they are turned away.');
   const goneStandard = await standardsAdmin.actions.save(adminForm('admin/standards?/save', { id: '987654', statement: 'x' }));
   check('a standard that is gone is an answer, not a crash', goneStandard.status, 400);
   const blankTitle = await templatesAdmin.actions.save(adminForm('admin/templates?/save', { id: String(firstTemplateChapter.id), title: ' ', purpose: 'p' }));
@@ -834,6 +959,20 @@ try {
     request: new Request('https://fixture.invalid/?/include', { method: 'POST', body: new URLSearchParams({ key: 'security' }) }) });
   check('the user can overrule the triage', [included.included, store.getChapter(includeProject.id, 'security').applicable], ['security', 1]);
   check('and the change is committed like any other', Number((await simpleGit(includeProject.repo_path).raw(['rev-list', '--count', 'HEAD'])).trim()) > Number(beforeInclude), true);
+
+  // Created before the standard was switched on, so nothing was copied then.
+  const inheriting = fixtureProject('include-inherits');
+  const securityStandard = store.listStandards().find((s) => s.chapter_key === 'security');
+  store.updateStandard(securityStandard.id, { active: true, appliesWhen: ['always'] });
+  store.setChapterApplicable(inheriting.id, 'security', false, 'Not needed for a team tool');
+  const standardRules = () => store.projectRequirements(inheriting.id).filter((r) => r.chapter_key === 'security' && r.source === 'standard');
+  check('a chapter set aside holds no standard', standardRules().length, 0);
+  store.setChapterApplicable(inheriting.id, 'security', true);
+  check('included, it receives the standards filed under it', standardRules().map((r) => r.statement), [securityStandard.statement]);
+  store.setChapterApplicable(inheriting.id, 'security', false, 'Not needed after all');
+  store.setChapterApplicable(inheriting.id, 'security', true);
+  check('and bringing it back again adds nothing twice', standardRules().length, 1);
+  store.updateStandard(securityStandard.id, { active: false });
 } finally {
   globalThis.fetch = realFetch;
   gateway.streamChat = realStream;

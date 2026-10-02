@@ -96,6 +96,8 @@
 	type AnswerOption = { label: string; recommended: boolean };
 
 	let running = $state<{ key: string; title: string; turns: ChatTurn[] } | null>(null);
+	/** Which pane a narrow window shows. Wide windows show both and ignore it. */
+	let pane = $state<'chat' | 'document'>('chat');
 	let errorMessage = $state('');
 	let commitFailed = $state(false);
 
@@ -122,8 +124,31 @@
 		running.turns = [...running.turns];
 	}
 
-	async function runTurn(message: string) {
-		if (running) return;
+	/**
+	 * Why a turn never started, in words the user can act on.
+	 *
+	 * "Request failed (500)" was what they saw before, and the answer they had
+	 * written was gone from the box with it.
+	 */
+	function refusal(response: Response): string {
+		if (response.status === 401 || response.redirected) {
+			return 'You have been signed out. Sign in again in another tab, then send your answer — it is back in the box.';
+		}
+		if (response.status === 404) return 'This application could not be found any more. Reload the page.';
+		return 'Your answer could not be sent just now. It is back in the box — try again in a minute.';
+	}
+
+	/** Shown together: a later problem in the same turn used to replace the earlier one. */
+	function addError(message: string) {
+		errorMessage = errorMessage ? `${errorMessage}\n${message}` : message;
+	}
+
+	/**
+	 * Run one turn. Resolves false when the answer never reached the server, so
+	 * the chat can put it back in the box rather than losing it.
+	 */
+	async function runTurn(message: string): Promise<boolean> {
+		if (running) return false;
 
 		const key = activeKey;
 		running = {
@@ -137,6 +162,7 @@
 		};
 		errorMessage = '';
 		commitFailed = false;
+		let delivered = false;
 
 		try {
 			const response = await fetch('/api/chat', {
@@ -144,11 +170,20 @@
 				headers: { 'content-type': 'application/json' },
 				body: JSON.stringify({ projectId: data.project.id, chapterKey: data.activeKey, message })
 			});
-			if (!response.ok || !response.body) throw new Error(`Request failed (${response.status})`);
+			// A session that expired is answered with the sign-in page, which fetch
+			// follows and reports as a success: the turn ended with nothing at all.
+			const streamed = (response.headers.get('content-type') ?? '').startsWith('text/event-stream');
+			if (!response.ok || !response.body || !streamed) {
+				addError(refusal(response));
+				return false;
+			}
+			delivered = true;
 
 			const reader = response.body.getReader();
 			const decoder = new TextDecoder();
 			let buffer = '';
+			let finished = false;
+			let failed = false;
 
 			for (;;) {
 				const { done, value } = await reader.read();
@@ -169,18 +204,35 @@
 					// A commit, or a change to the shape of the chapter list — either way
 					// only the server knows what the document looks like now.
 					else if (name === 'commit' || name === 'sections') onCommit();
+					else if (name === 'done') finished = true;
 					else if (name === 'error') {
-						errorMessage = body.message;
+						failed = true;
+						addError(String(body.message ?? ''));
 						// The turn's own message says the change is not in the history yet.
 						// The indicator has to agree with it, or the header quietly claims
 						// everything is saved while the text underneath says otherwise.
-						commitFailed = String(body.message ?? '').includes('history');
+						if (String(body.message ?? '').includes('history')) commitFailed = true;
 					}
 				}
 			}
-		} catch (cause) {
-			errorMessage =
-				cause instanceof Error ? cause.message : 'Something went wrong. Please try again.';
+
+			// The stream stopped without the server saying it had finished — a proxy
+			// that gave up on a quiet connection, or the network. The turn itself goes
+			// on running on the server.
+			if (!finished && !failed) {
+				addError(
+					'The connection was lost before the reply finished. The assistant carries on with it — ' +
+						'reload the page in a minute to see what it wrote.'
+				);
+			}
+			return true;
+		} catch {
+			addError(
+				delivered
+					? 'The connection was lost before the reply finished. The assistant carries on with it — reload the page in a minute to see what it wrote.'
+					: 'Your answer could not be sent — the connection failed. It is back in the box; try again in a minute.'
+			);
+			return delivered;
 		} finally {
 			// Whatever the user is looking at now, bring it up to date with the turn
 			// that has just finished — including when that is a different chapter.
@@ -266,8 +318,19 @@
 	});
 </script>
 
-<div class="workspace">
+<svelte:head><title>{active ? `${active.title} — ` : ''}{data.project.name} — Specman</title></svelte:head>
+
+<div class="workspace" class:reading={pane === 'document'}>
 	<ChapterIndex {chapters} activeKey={data.activeKey} projectId={data.project.id} {others} />
+
+	<!-- Only on a narrow window, where the conversation and the document no longer
+	     fit side by side. -->
+	<div class="pane-switch">
+		<button type="button" aria-pressed={pane === 'chat'} onclick={() => (pane = 'chat')}>Conversation</button>
+		<button type="button" aria-pressed={pane === 'document'} onclick={() => (pane = 'document')}>
+			Document{#if pendingChanges}<span class="dot" aria-label="(changes waiting for review)"></span>{/if}
+		</button>
+	</div>
 
 	<!-- Keyed on the chapter so switching chapters starts a fresh transcript. The
 	     turn itself is owned by this page, so the remount no longer interrupts it. -->
@@ -310,11 +373,61 @@
 		min-height: 0;
 	}
 
+	.pane-switch {
+		display: none;
+	}
+
+	/* The document pane holds the only way to review, the diagram, the handoff and
+	   the confirmations, so a narrow window switches between it and the
+	   conversation. It used to be hidden outright — on a 1366px laptop at 125%
+	   scaling, which is an ordinary office screen. */
 	@media (max-width: 1100px) {
 		.workspace {
 			grid-template-columns: 220px 1fr;
+			grid-template-rows: auto 1fr;
 		}
+		.workspace > :global(nav) {
+			grid-row: 1 / span 2;
+		}
+		.pane-switch {
+			display: flex;
+			gap: 4px;
+			grid-column: 2;
+			grid-row: 1;
+			padding: 6px 10px;
+			border-bottom: 1px solid var(--line);
+			background: var(--panel);
+		}
+		.pane-switch button {
+			border: 1px solid var(--line);
+			background: var(--bg);
+			border-radius: 7px;
+			padding: 5px 14px;
+			font-size: 13px;
+		}
+		.pane-switch button[aria-pressed='true'] {
+			background: var(--accent-soft);
+			border-color: var(--accent);
+			color: var(--accent);
+			font-weight: 600;
+		}
+		.pane-switch .dot {
+			display: inline-block;
+			width: 7px;
+			height: 7px;
+			margin-left: 6px;
+			border-radius: 50%;
+			background: var(--warn);
+			vertical-align: middle;
+		}
+		.workspace > :global(section),
 		.workspace > :global(aside) {
+			grid-column: 2;
+			grid-row: 2;
+			min-height: 0;
+		}
+		.workspace:not(.reading) > :global(aside),
+		.workspace.reading > :global(section) {
 			display: none;
 		}
 	}

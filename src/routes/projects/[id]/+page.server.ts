@@ -28,10 +28,18 @@ export const actions: Actions = {
 		} catch (cause) {
 			console.error('[projects] could not include a chapter:', cause);
 			// No model is involved and nothing the user wrote is at stake, so the
-			// assistant's failure wording does not fit.
+			// assistant's failure wording does not fit. Whether the choice itself was
+			// kept is read back rather than assumed: it is kept when only the commit
+			// failed, and the message has to say which.
 			const conflict = cause instanceof Error && cause.name === 'DocumentConflict';
+			const kept = projectChapters(project.id).find((c) => c.key === key)?.applicable !== 0;
 			return fail(409, {
-				message: conflict ? cause.message : 'The chapter could not be included just now. Try again in a minute.'
+				message: conflict
+					? cause.message
+					: kept
+						? 'The chapter is included, but the change has not reached the application’s history yet. ' +
+							'It will be recorded with the next change.'
+						: 'The chapter could not be included just now. Try again in a minute.'
 			});
 		}
 		return { included: key };

@@ -7,20 +7,37 @@
 		kind: 'add' | 'del' | 'meta' | 'ctx';
 	}
 
-	// Show prose diffs, not machine noise: drop index/hash lines entirely.
+	/**
+	 * Which part of the document a file in the diff is, in words.
+	 *
+	 * `diff --git a/docs/070-security.md` and `@@ -3,7 +3,9 @@` are how the change
+	 * is stored, and they were shown to the person approving it. A file becomes the
+	 * title of its chapter; the markers between the changed passages become a gap.
+	 */
+	function partOf(path: string): string {
+		if (path === 'decisions.md') return 'Decisions';
+		if (path === 'README.md') return 'The document as a whole';
+		const key = /^docs\/\d{3}(?:-\d{2})?-(.+)\.md$/.exec(path)?.[1];
+		return (key && data.chapterTitles[key]) || 'Another part of the document';
+	}
+
 	const lines: Line[] = $derived(
 		data.diff
 		.split('\n')
-		.filter((l) => !/^(index |new file mode|deleted file mode|similarity |rename )/.test(l))
-		.map((text) => {
-			if (text.startsWith('+++') || text.startsWith('---') || text.startsWith('diff --git'))
-				return { text, kind: 'meta' as const };
-			if (text.startsWith('@@')) return { text, kind: 'meta' as const };
-			if (text.startsWith('+')) return { text: text.slice(1), kind: 'add' as const };
-			if (text.startsWith('-')) return { text: text.slice(1), kind: 'del' as const };
-			return { text: text.replace(/^ /, ''), kind: 'ctx' as const };
+		.filter((l) => !/^(index |new file mode|deleted file mode|similarity |rename |--- |\+\+\+ )/.test(l))
+		.flatMap((text): Line[] => {
+			const file = /^diff --git a\/(\S+) b\//.exec(text);
+			if (file) return [{ text: partOf(file[1]), kind: 'meta' }];
+			if (text.startsWith('@@')) return [{ text: '…', kind: 'ctx' }];
+			if (text.startsWith('\\')) return []; // "\ No newline at end of file"
+			if (text.startsWith('+')) return [{ text: text.slice(1), kind: 'add' }];
+			if (text.startsWith('-')) return [{ text: text.slice(1), kind: 'del' }];
+			return [{ text: text.replace(/^ /, ''), kind: 'ctx' }];
 		})
 	);
+	// An empty diff splits into one empty line, so counting lines never said
+	// there was nothing to review.
+	const nothingToReview = $derived(!data.proposal || !data.reviewed || data.diff.trim() === '');
 
 	const added = $derived(lines.filter((l) => l.kind === 'add').length);
 	const removed = $derived(lines.filter((l) => l.kind === 'del').length);
@@ -38,7 +55,8 @@
 		const named: Record<string, string> = {
 			statement: 'wording',
 			scope: 'when it will be built',
-			scenarios: 'the example'
+			scenarios: 'the example',
+			chapter: 'the chapter it belongs to'
 		};
 		return change.fields.map((f) => named[f] ?? f).join(' and ');
 	}
@@ -82,7 +100,10 @@
 				headers: { 'content-type': 'application/json' },
 				body: JSON.stringify({ projectId: data.project.id })
 			});
-			if (!response.ok) throw new Error(`Check failed (${response.status})`);
+			if (!response.ok) {
+				const body = await response.json().catch(() => ({}));
+				throw new Error(body.message ?? 'The check could not be run just now. Try again in a minute.');
+			}
 
 			const result = await response.json();
 			issues = result.issues;
@@ -119,6 +140,8 @@
 	}
 </script>
 
+<svelte:head><title>Review changes — {data.project.name} — Specman</title></svelte:head>
+
 <main>
 	<a class="back" href="/projects/{data.project.id}">← Back to {data.project.name}</a>
 
@@ -126,24 +149,32 @@
 	{#if decisionError}<p class="check-error" role="alert">{decisionError}</p>{/if}
 	{#if form?.message}<p class="check-error" role="alert">{form.message}</p>{/if}
 
-	{#if !data.proposal || lines.length === 0}
+	{#if data.historyMissing}
+		<div class="card empty" role="alert">
+			<p><strong>This application’s history cannot be found.</strong></p>
+			<p class="sub">
+				Its changes cannot be reviewed or approved until it is restored. Your answers are kept. Tell
+				whoever looks after Specman — it needs restoring from a backup.
+			</p>
+		</div>
+	{:else if nothingToReview}
+		<!-- Not "everything is already approved": that is untrue whenever a change
+		     failed to reach the history, which is exactly when someone looks here. -->
 		<div class="card empty">
 			<p><strong>Nothing to review.</strong></p>
-			<p class="sub">
-				Everything the assistant has written so far is already part of the approved document.
-			</p>
+			<p class="sub">No recorded changes are waiting for approval.</p>
 		</div>
 	{:else}
 		<div class="card summary">
 			<div>
-				<strong>{data.proposal.title || 'Design updates'}</strong>
+				<strong>{data.proposal?.title || 'Design updates'}</strong>
 				<p class="sub">{data.changeSummary}</p>
 			</div>
 			<form method="POST" action="?/approve">
 				<input type="hidden" name="proposalId" value={data.reviewed?.proposalId} />
 				<input type="hidden" name="proposalRevision" value={data.reviewed?.proposalRevision} />
 				<input type="hidden" name="mainRevision" value={data.reviewed?.mainRevision} />
-				<button type="submit" class="primary">Approve and merge</button>
+				<button type="submit" class="primary">Approve these changes</button>
 			</form>
 		</div>
 
@@ -214,11 +245,10 @@
 					<span class="tag {issue.kind}">{ISSUE_LABEL[issue.kind] ?? issue.kind}</span>
 					<div class="text">
 						<strong>{issue.message}</strong>
-						{#if issue.chapters.length > 0 || issue.refs.length > 0}
-							<p class="where">
-								{issue.chapters.map((k) => data.chapterTitles[k] ?? k).join(', ')}
-								{#if issue.refs.length > 0} · {issue.refs.join(', ')}{/if}
-							</p>
+						<!-- Where, by chapter. Rule references such as REQ-004 are how the
+						     check finds a rule, not how the user knows it. -->
+						{#if issue.chapters.length > 0}
+							<p class="where">{issue.chapters.map((k) => data.chapterTitles[k] ?? k).join(', ')}</p>
 						{/if}
 					</div>
 				</div>
@@ -234,7 +264,7 @@
 						<div class="text">
 							<strong>{(change.after ?? change.before)?.statement}</strong>
 							<p class="where">
-								{data.chapterTitles[change.chapter] ?? change.chapter} · {change.ref}
+								{data.chapterTitles[change.chapter] ?? change.chapter}
 								{#if change.kind === 'changed'} · {describeChange(change)} changed{/if}
 							</p>
 							{#if change.kind === 'changed' && change.before && change.before.statement !== change.after?.statement}
@@ -246,7 +276,7 @@
 			</div>
 		{/if}
 
-		<button class="toggle" onclick={() => (showDiff = !showDiff)}>
+		<button class="toggle" onclick={() => (showDiff = !showDiff)} aria-expanded={showDiff}>
 			{showDiff ? 'Hide' : 'Show'} the text of every change ({added} added, {removed} removed)
 		</button>
 
@@ -264,7 +294,6 @@
 		<ul class="history card">
 			{#each data.history as entry}
 				<li>
-					<code>{entry.hash}</code>
 					<span>{entry.message}</span>
 					<time>{new Date(entry.date).toLocaleString()}</time>
 				</li>
@@ -590,12 +619,6 @@
 		border-bottom: 0;
 	}
 
-	.history code {
-		font-family: var(--mono);
-		font-size: 12px;
-		color: var(--ink-soft);
-	}
-
 	.history span {
 		flex: 1;
 	}
@@ -604,9 +627,5 @@
 		color: var(--ink-soft);
 		font-size: 12px;
 		white-space: nowrap;
-	}
-
-	code {
-		font-family: var(--mono);
 	}
 </style>

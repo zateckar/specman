@@ -6,7 +6,7 @@ import { ADDED_COLUMNS, SCHEMA } from './schema';
 import { DEFAULT_CHAPTERS, DEFAULT_TEMPLATE } from './default-template';
 import { DEFAULT_STANDARDS } from './default-standards';
 import { chapterApplies, reasonForSkipping, toProfile, type Profile } from '../llm/profile';
-import { arrangeChapters, distributeContent, reconcileSections } from '../llm/subchapters';
+import { arrangeChapters, claimSectionKeys, distributeContent, reconcileSections } from '../llm/subchapters';
 import { nextRef } from '../llm/requirements';
 import { namesChapter } from '../llm/questions';
 import type {
@@ -150,11 +150,25 @@ function installDocumentRevisionTriggers(database: DatabaseSync): void {
 		WHEN typeof(NEW.document_revision) <> 'integer' OR NEW.document_revision <= OLD.document_revision
 			OR NEW.document_revision > 9007199254740991
 		BEGIN SELECT RAISE(ABORT, 'Document revision must increase within the safe integer range'); END;`);
+	// A chapter's status and open questions are the assessor's reading of the
+	// document, not the document. Counting them made every reply a change — the
+	// assessment after a turn that only asked a question writes them — so a
+	// colleague's question back failed someone else's slower turn and threw away
+	// what it had written. Stale assessments are guarded per chapter instead; see
+	// `withChapterUnchanged`. The column list is read from the table, so a column
+	// added later counts without anyone remembering to list it; and the trigger is
+	// rebuilt every boot, because `IF NOT EXISTS` would keep an older definition.
+	const assessed = new Set(['status', 'open_questions', 'updated_at']);
+	const chapterColumns = (database.prepare('PRAGMA table_info(chapters)').all() as Array<{ name: string }>)
+		.map((column) => column.name)
+		.filter((name) => !assessed.has(name));
+	database.exec('DROP TRIGGER IF EXISTS document_chapters_UPDATE');
 	for (const table of ['chapters', 'requirements', 'decisions']) {
 		for (const event of ['INSERT', 'UPDATE', 'DELETE']) {
 			const row = event === 'DELETE' ? 'OLD' : 'NEW';
+			const on = table === 'chapters' && event === 'UPDATE' ? `UPDATE OF ${chapterColumns.join(', ')}` : event;
 			database.exec(`CREATE TRIGGER IF NOT EXISTS document_${table}_${event}
-				AFTER ${event} ON ${table} BEGIN
+				AFTER ${on} ON ${table} BEGIN
 				UPDATE projects SET document_revision = document_revision + 1 WHERE id = ${row}.project_id;
 				${event === 'UPDATE' ? `UPDATE projects SET document_revision = document_revision + 1
 					WHERE id = OLD.project_id AND OLD.project_id <> NEW.project_id;` : ''}
@@ -183,14 +197,24 @@ export function documentRevision(projectId: number): number {
 	return project.document_revision;
 }
 
-/** No await or UI events may occur inside this transaction. */
+/**
+ * Apply `work` only if nobody has changed the document since `expected` was read.
+ *
+ * The revision is checked here, not bumped: the triggers on the document tables
+ * bump it for every row that is actually written. Bumping it here as well made
+ * every reply a change, including one that wrote nothing, so a colleague's
+ * text-only answer failed someone else's slower turn and threw away everything
+ * that turn had written.
+ *
+ * No await or UI events may occur inside this transaction.
+ */
 export function withDocumentRevision<T>(projectId: number, expected: number, work: () => T): T {
 	const database = db();
 	database.exec('BEGIN IMMEDIATE');
 	try {
-		const changed = database.prepare(`UPDATE projects SET document_revision = document_revision + 1
-			WHERE id = ? AND document_revision = ?`).run(projectId, expected);
-		if (!changed.changes) throw new DocumentConflict();
+		const current = database.prepare('SELECT document_revision AS revision FROM projects WHERE id = ?')
+			.get(projectId) as { revision: number } | undefined;
+		if (!current || current.revision !== expected) throw new DocumentConflict();
 		const result = work();
 		if (result && typeof (result as { then?: unknown }).then === 'function') {
 			throw new Error('Document updates must be synchronous');
@@ -201,6 +225,28 @@ export function withDocumentRevision<T>(projectId: number, expected: number, wor
 		database.exec('ROLLBACK');
 		throw cause;
 	}
+}
+
+/**
+ * Apply `work` only if the chapter still reads as it did in `seen`.
+ *
+ * For an assessment, which is a judgement of one chapter: it is stale when that
+ * chapter's prose or state has moved since it was read, and not because
+ * something was written somewhere else in the document.
+ */
+export function withChapterUnchanged<T>(projectId: number, seen: Chapter, work: () => T): T {
+	return atomically(() => {
+		const now = getChapter(projectId, seen.key);
+		if (
+			!now ||
+			now.content_md !== seen.content_md ||
+			now.status !== seen.status ||
+			JSON.stringify(now.open_questions) !== JSON.stringify(seen.open_questions)
+		) {
+			throw new DocumentConflict();
+		}
+		return work();
+	});
 }
 
 /**
@@ -392,6 +438,14 @@ function backfillGoals(database: DatabaseSync, added: Set<string>): void {
 		   WHERE p.id = chapters.project_id AND tc.key = chapters.key AND tc.goal <> ''
 		)
 	`);
+
+	// The goal is written into each chapter's file and the export, so a document
+	// this rewrote has to reach its repository too — every goal was empty a
+	// moment ago, so any there now came from here.
+	const rewritten = asRows<{ project_id: number }>(
+		database.prepare("SELECT DISTINCT project_id FROM chapters WHERE goal <> ''").all()
+	);
+	for (const { project_id } of rewritten) noteMigrated(project_id, 'Add what each chapter is for');
 }
 
 /**
@@ -610,7 +664,7 @@ function insertProject(args: Parameters<typeof createProject>[0]): Project {
  * the waste this is meant to remove. The assistant is told to ask only where the
  * application needs to deviate.
  */
-function inheritStandards(projectId: number, profile: Profile): void {
+function inheritStandards(projectId: number, profile: Profile, onlyChapter?: string): void {
 	const database = db();
 	// Only chapters that apply: a standard filed under a chapter the triage set
 	// aside is a rule for work nobody is doing, reported as an orphan.
@@ -619,6 +673,14 @@ function inheritStandards(projectId: number, profile: Profile): void {
 			database.prepare('SELECT key FROM chapters WHERE project_id = ? AND applicable <> 0').all(projectId)
 		).map((c) => c.key)
 	);
+	// What the chapter already holds, so bringing one back twice adds nothing twice.
+	const held = new Set(
+		asRows<{ chapter_key: string; statement: string }>(
+			database
+				.prepare("SELECT chapter_key, statement FROM requirements WHERE project_id = ? AND source = 'standard'")
+				.all(projectId)
+		).map((r) => `${r.chapter_key}\u0000${r.statement}`)
+	);
 
 	const standards = asRows<Record<string, unknown>>(
 		database.prepare('SELECT * FROM standards WHERE active = 1 ORDER BY position, id').all()
@@ -626,7 +688,9 @@ function inheritStandards(projectId: number, profile: Profile): void {
 
 	for (const standard of standards) {
 		const chapterKey = standard.chapter_key as string;
+		if (onlyChapter !== undefined && chapterKey !== onlyChapter) continue;
 		if (!chapterKeys.has(chapterKey)) continue;
+		if (held.has(`${chapterKey}\u0000${standard.statement as string}`)) continue;
 		if (!chapterApplies(parseJson<string[]>(standard.applies_when as string, ['always']), profile)) {
 			continue;
 		}
@@ -661,7 +725,12 @@ export function listStandards(): Standard[] {
 
 export function updateStandard(
 	id: number,
-	patch: { statement?: string; active?: boolean; appliesWhen?: string[] }
+	patch: {
+		statement?: string;
+		active?: boolean;
+		appliesWhen?: string[];
+		scenarios?: Array<{ when: string; then: string }>;
+	}
 ): void {
 	const current = db().prepare('SELECT * FROM standards WHERE id = ?').get(id) as Record<
 		string,
@@ -670,25 +739,40 @@ export function updateStandard(
 	if (!current) throw new Error(`No standard ${id}`);
 
 	db()
-		.prepare('UPDATE standards SET statement = ?, active = ?, applies_when = ? WHERE id = ?')
+		.prepare('UPDATE standards SET statement = ?, active = ?, applies_when = ?, scenarios = ? WHERE id = ?')
 		.run(
 			patch.statement ?? (current.statement as string),
 			patch.active === undefined ? (current.active as number) : patch.active ? 1 : 0,
 			JSON.stringify(patch.appliesWhen ?? parseJson(current.applies_when as string, ['always'])),
+			patch.scenarios ? JSON.stringify(patch.scenarios) : (current.scenarios as string),
 			id
 		);
 }
 
-/** Turn a chapter the triage set aside back on, or off again. */
+/**
+ * Turn a chapter the triage set aside back on, or off again.
+ *
+ * Turned on, it receives the company standards filed under it, as it would have
+ * at creation had the triage not set it aside. It used to come back without
+ * them, so an included security chapter was interviewed from nothing and the
+ * company's own rules for it were missing from the handoff.
+ */
 export function setChapterApplicable(
 	projectId: number,
 	key: string,
 	applicable: boolean,
 	reason = ''
 ): void {
-	db()
-		.prepare('UPDATE chapters SET applicable = ?, skip_reason = ? WHERE project_id = ? AND key = ?')
-		.run(applicable ? 1 : 0, applicable ? '' : reason, projectId, key);
+	atomically(() => {
+		const was = getChapter(projectId, key)?.applicable;
+		db()
+			.prepare('UPDATE chapters SET applicable = ?, skip_reason = ? WHERE project_id = ? AND key = ?')
+			.run(applicable ? 1 : 0, applicable ? '' : reason, projectId, key);
+		if (applicable && was === 0) {
+			const project = getProject(projectId);
+			inheritStandards(projectId, toProfile(parseJson(project?.profile, {})), key);
+		}
+	});
 }
 
 /**
@@ -715,14 +799,15 @@ export function slugExists(slug: string): boolean {
 
 /* ----------------------------------------------------------------- chapters */
 
+/** One malformed value written by hand used to take the home page down with it. */
 function hydrateChapterDefinition(row: Record<string, unknown>) {
 	return {
 		...row,
-		questions: JSON.parse((row.questions as string) ?? '[]'),
-		criteria: JSON.parse((row.criteria as string) ?? '[]'),
+		questions: parseJson<string[]>(row.questions as string, []),
+		criteria: parseJson<string[]>(row.criteria as string, []),
 		applies_when: parseJson<string[]>(row.applies_when as string, ['always']),
 		...(row.open_questions !== undefined
-			? { open_questions: JSON.parse((row.open_questions as string) ?? '[]') }
+			? { open_questions: parseJson<string[]>(row.open_questions as string, []) }
 			: {})
 	};
 }
@@ -753,16 +838,20 @@ export function updateChapterState(
 	const current = getChapter(projectId, key);
 	if (!current) throw new Error(`No chapter ${key} in project ${projectId}`);
 
+	// The prose is set only when it changes. Writing it is a change to the
+	// document and recording the assessment is not, and the revision trigger fires
+	// on `content_md` being set at all, whatever it is set to.
+	const prose = patch.contentMd !== undefined && patch.contentMd !== current.content_md;
 	db()
 		.prepare(
 			`UPDATE chapters
-			    SET status = ?, open_questions = ?, content_md = ?, updated_at = datetime('now')
+			    SET status = ?, open_questions = ?,${prose ? ' content_md = ?,' : ''} updated_at = datetime('now')
 			  WHERE project_id = ? AND key = ?`
 		)
 		.run(
 			patch.status ?? current.status,
 			JSON.stringify(patch.openQuestions ?? current.open_questions),
-			patch.contentMd ?? current.content_md,
+			...(prose ? [patch.contentMd!] : []),
 			projectId,
 			key
 		);
@@ -802,7 +891,12 @@ export function applySectionPlan(
 		return { key, title: String(row.title), position: Number(row.position), hasContent };
 	});
 
-	const ops = reconcileSections(existing, planned);
+	const elsewhere = asRows<{ key: string }>(
+		database
+			.prepare("SELECT key FROM chapters WHERE project_id = ? AND coalesce(parent_key, '') <> ?")
+			.all(projectId, parent.key)
+	).map((row) => row.key);
+	const ops = reconcileSections(existing, claimSectionKeys(planned, parent.key, elsewhere));
 	const created: string[] = [];
 
 	for (const op of ops) {
@@ -1185,7 +1279,6 @@ export function confirmDecision(projectId: number, id: number): Decision | undef
 export function deleteDecision(projectId: number, id: number): void {
 	db().prepare('DELETE FROM decisions WHERE id = ? AND project_id = ?').run(id, projectId);
 }
-
 /* ----------------------------------------------------------- architectures */
 
 export interface StoredArchitecture {

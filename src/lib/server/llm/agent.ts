@@ -388,6 +388,9 @@ export function normaliseConversation(turns: ChatMessage[]): ChatMessage[] {
 	return messages;
 }
 
+/** See where it is used. */
+const ASSESS_MAX_TOKENS = 6000;
+
 /**
  * Second call of the turn: assess the chapter and record its state.
  *
@@ -452,6 +455,11 @@ this chapter in progress.`;
 				: [{ role: 'user', content: 'Assess the chapter.' }],
 			tools: [RECORD_STATE_TOOL],
 			forceTool: RECORD_STATE_TOOL.name,
+			// The answer is a few words, but the model reads the whole chapter and
+			// reasons before calling the tool, and the reasoning comes out of this
+			// budget. On the default it could spend the lot and call nothing, and
+			// every retry would do the same.
+			maxTokens: ASSESS_MAX_TOKENS,
 			signal: args.signal
 		});
 

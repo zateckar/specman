@@ -63,7 +63,8 @@
 		finished?: boolean;
 		/** The chapter to offer next — chosen by the application, not the agent. */
 		next?: { key: string; title: string } | null;
-		onsend: (text: string) => void;
+		/** Resolves false when the answer never reached the server. */
+		onsend: (text: string) => Promise<boolean> | void;
 		onask: (question: string) => void;
 	} = $props();
 
@@ -118,19 +119,25 @@
 		});
 	}
 
-	function send(text: string) {
+	async function send(text: string) {
 		if (!text.trim() || blocked) return;
 		// What is on screen is what is sent; nothing heard after this point lands.
 		dictation?.cancel();
 		input = '';
-		onsend(text);
+		// Cleared at once so the box is ready for the next answer, and put back if
+		// this one never arrived — it used to vanish with the error. Through the
+		// draft store too, in case the user has moved to another chapter since.
+		if ((await onsend(text)) === false && !drafts.get(draftKey)) {
+			drafts.set(draftKey, text);
+			input = text;
+		}
 	}
 
 	/** A clicked answer is sent as it is; whatever was being typed is kept. */
 	function choose(label: string) {
 		if (blocked) return;
 		dictation?.cancel();
-		onsend(label);
+		void onsend(label);
 	}
 
 	// Clicking "Start" is the user asking to begin, so it reads as a user turn.
@@ -564,6 +571,7 @@
 	}
 
 	.error {
+		white-space: pre-line;
 		background: #fdecec;
 		border: 1px solid #f3c9c9;
 		color: #8c2020;

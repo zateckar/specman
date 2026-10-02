@@ -47,8 +47,15 @@ export const actions: Actions = {
 		const form = await request.formData();
 		const name = String(form.get('name') ?? '').trim();
 		const description = String(form.get('description') ?? '').trim();
+		// Sent back with any refusal, so the form reopens as it was submitted.
+		const values = Object.fromEntries(
+			['name', 'description', 'kind', 'reach', 'personalData', 'critical'].map((field) => [
+				field,
+				String(form.get(field) ?? '')
+			])
+		);
 
-		if (!name) return fail(400, { message: 'Give the application a name.' });
+		if (!name) return fail(400, { message: 'Give the application a name.', values });
 
 		// A few questions decide which chapters this application actually needs.
 		// Unanswered means the cautious answer — see `toProfile`.
@@ -84,7 +91,8 @@ export const actions: Actions = {
 			deleteProject(project.id);
 			rmSync(project.repo_path, { recursive: true, force: true });
 			return fail(503, {
-				message: `The application could not be created. ${describeFailure(cause, { messageSaved: false })}`
+				message: `The application could not be created. ${describeFailure(cause, { messageSaved: false })}`,
+				values
 			});
 		}
 

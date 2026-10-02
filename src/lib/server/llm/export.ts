@@ -161,24 +161,38 @@ function renderChapter(
 	return lines.join('\n');
 }
 
+/**
+ * What the first page of the bundle says, counted once.
+ *
+ * The export page counted for itself, over every chapter, while `AGENTS.md`
+ * counted over the chapters that apply — so the page and the file it describes
+ * gave different numbers for the same document. Both read this now.
+ */
+export function bundleSummary(input: ExportInput) {
+	// Counted over the chapters that apply. A set-aside chapter is rendered as
+	// "nothing in this area needs building", and counting its rules here as well
+	// told the reader the opposite on the first page.
+	const applies = new Set(input.chapters.filter((c) => c.applicable !== 0).map((c) => c.key));
+	return {
+		inScope: input.requirements.filter((r) => r.scope === 'now' && applies.has(r.chapter_key)),
+		assumed: input.decisions.filter(
+			(d) => d.source !== 'user' && d.status !== 'confirmed' && applies.has(d.chapter_key)
+		),
+		openQuestions: input.chapters
+			.filter((c) => applies.has(c.key))
+			.reduce((sum, c) => sum + c.open_questions.length, 0),
+		errors: input.problems.filter((p) => p.severity === 'error'),
+		warnings: input.problems.filter((p) => p.severity === 'warning')
+	};
+}
+
 function renderAgents(
 	input: ExportInput,
 	chapters: ExportChapter[],
 	fileOf: Map<string, string>
 ): string {
-	const { project, requirements, decisions, problems } = input;
-	const errors = problems.filter((p) => p.severity === 'error');
-	// Counted over the chapters that apply. A set-aside chapter is rendered as
-	// "nothing in this area needs building", and counting its rules here as well
-	// told the reader the opposite on the first page.
-	const applies = new Set(chapters.filter((c) => c.applicable !== 0).map((c) => c.key));
-	const now = requirements.filter((r) => r.scope === 'now' && applies.has(r.chapter_key));
-	const assumed = decisions.filter(
-		(d) => d.source !== 'user' && d.status !== 'confirmed' && applies.has(d.chapter_key)
-	);
-	const openQuestions = chapters
-		.filter((c) => applies.has(c.key))
-		.reduce((sum, c) => sum + c.open_questions.length, 0);
+	const { project, requirements } = input;
+	const { inScope: now, assumed, openQuestions, errors, warnings } = bundleSummary(input);
 
 	const lines: string[] = [
 		`# ${project.name}`,
@@ -208,7 +222,7 @@ function renderAgents(
 		''
 	);
 
-	if (errors.length > 0 || openQuestions > 0 || assumed.length > 0) {
+	if (errors.length > 0 || openQuestions > 0 || assumed.length > 0 || warnings.length > 0) {
 		lines.push('## Read this before you start', '');
 
 		if (errors.length > 0) {
@@ -233,6 +247,16 @@ function renderAgents(
 			lines.push(
 				`**${assumed.length} decision${assumed.length === 1 ? ' was' : 's were'} made by the assistant and never confirmed**`,
 				'by the requester. They are marked in `decisions.md`. Treat them as weaker than the rest.',
+				''
+			);
+		}
+		// The page told the requester about these and the builder never heard of
+		// them: the same caveat has to reach both.
+		if (warnings.length > 0) {
+			lines.push(
+				`**${warnings.length} thing${warnings.length === 1 ? '' : 's'} worth checking:**`,
+				'',
+				...warnings.map((w) => `- ${w.message}`),
 				''
 			);
 		}

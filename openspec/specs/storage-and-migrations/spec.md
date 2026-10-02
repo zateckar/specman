@@ -34,6 +34,28 @@ snapshots on chapter, requirement, decision and project-context changes, includi
 - **WHEN** a write cannot advance the revision as an exact safe integer
 - **THEN** storage rejects it without saving unversioned document changes
 
+#### Scenario: Only the verdict on a chapter is recorded
+- **WHEN** a chapter's status or open questions change and nothing else about it does
+- **THEN** the revision does not move, because those are the assessor's reading of the
+  document rather than the document; counted, the assessment after a reply that only asked a
+  question failed a colleague's slower turn and threw away what it had written
+- **AND** a verdict is stored only if the chapter's prose, status and questions are still
+  the ones it was reached from, so a stale one is refused for that chapter alone
+
+#### Scenario: A column is added to chapters later
+- **WHEN** the trigger is installed on a database whose chapters table has gained a column
+- **THEN** the column counts, because the list of columns is read from the table and the
+  trigger is rebuilt on every boot rather than kept by `IF NOT EXISTS` as it was first written
+
+#### Scenario: A reply's guard writes nothing itself
+- **WHEN** a reply is checked against the revision it started from
+- **THEN** the check compares and does not advance the counter; only the writes advance it,
+  so a reply that changed nothing does not count as a change
+
+#### Scenario: Prose saved unchanged
+- **WHEN** a chapter is updated with the content it already holds
+- **THEN** the content column is not written, so the counter does not move for it
+
 ### Requirement: Verification and recovery migrations preserve evidence
 Storage SHALL preserve old reports with unknown input revisions and install a durable
 approval journal with at most one unfinished intent per project.
@@ -159,6 +181,20 @@ application's repository, and SHALL stay marked as waiting for that commit until
 - **WHEN** the repository already matches the database
 - **THEN** no commit is produced
 
+#### Scenario: Chapters gain what they are for
+- **WHEN** the boot that adds the chapter goal fills it in for existing applications
+- **THEN** each of those applications is recorded as waiting for a commit, because the goal is
+  written at the head of every chapter file and the repository otherwise went on without it
+
+### Requirement: A stored list that cannot be read does not stop the page
+A chapter's stored questions, criteria, conditions and open questions SHALL be read with a
+default when what is stored is not valid JSON.
+
+#### Scenario: One chapter's list was damaged
+- **WHEN** a value cannot be parsed
+- **THEN** the chapter is read with an empty list, or `always` for its conditions, rather than
+  the whole application failing to open over one field
+
 ### Requirement: Git is the source of truth for prose
 Chapter content SHALL be written to the application's repository, with `chapters.content_md`
 kept as a read cache for rendering.
@@ -168,9 +204,15 @@ kept as a read cache for rendering.
 - **THEN** it reads from the database without invoking git
 
 ### Requirement: Boot order is fixed
-The server SHALL open the database and run migrations, bootstrap the administrator, and
-only then record migrated documents into their repositories.
+The server SHALL open the database and run migrations, bootstrap the administrator, find
+each application's repository, and only then recover approvals and record migrated
+documents into their repositories.
 
 #### Scenario: A first boot of a new deployment
 - **WHEN** the server starts
 - **THEN** no request is served against a schema that has not been applied
+
+#### Scenario: Recovery fails at boot
+- **WHEN** recovering an approval or committing a migrated document raises
+- **THEN** the failure is logged and the server stays up, because an unhandled rejection ends
+  the process on Node's default settings and both steps are retried by the next writer anyway

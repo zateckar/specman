@@ -259,7 +259,9 @@
 		background: transparent;
 		border: 0;
 		padding: 0;
-		max-width: 64px;
+		/* Wide enough for the longest name offered, "Slovenčina", which was cut
+		   off at 64px. */
+		max-width: 92px;
 	}
 
 	@keyframes pulse {

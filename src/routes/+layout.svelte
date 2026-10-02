@@ -2,10 +2,8 @@
 	let { children, data } = $props();
 </script>
 
-<svelte:head>
-	<title>Specman</title>
-</svelte:head>
-
+<!-- Each page names itself. A title here as well came first in the head, and
+     every tab read "Specman" whichever application it held. -->
 <div class="app">
 	<header>
 		<a class="brand" href="/">Specman</a>

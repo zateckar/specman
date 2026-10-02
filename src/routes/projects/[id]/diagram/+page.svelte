@@ -36,6 +36,8 @@
 	}
 </script>
 
+<svelte:head><title>Diagram — {data.project.name} — Specman</title></svelte:head>
+
 <main>
 	<a class="back" href="/projects/{data.project.id}">← Back to {data.project.name}</a>
 

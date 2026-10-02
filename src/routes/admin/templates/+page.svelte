@@ -5,6 +5,8 @@
 	let openKey = $state<string | null>(null);
 </script>
 
+<svelte:head><title>Template — Specman</title></svelte:head>
+
 <main>
 	<a class="back" href="/">← Back to applications</a>
 	<h1>Document template</h1>

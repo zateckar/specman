@@ -77,6 +77,45 @@ export class GatewayError extends Error {
 	}
 }
 
+/** An error the gateway sent inside a stream it had already started. */
+class StreamInterrupted extends GatewayError {
+	constructor(payload: string, retryable: boolean) {
+		super('The gateway interrupted its response.', 200, payload, retryable);
+	}
+}
+
+/** The in-stream equivalents of a 429 or a 5xx. */
+const RETRYABLE_STREAM_ERRORS = ['overloaded_error', 'api_error', 'rate_limit_error', 'timeout_error'];
+
+/**
+ * How long the gateway may go without sending anything.
+ *
+ * A reasoning model streams its thinking as it goes, so silence this long is a
+ * backend that has stopped, not one that is thinking hard. Without a limit, a
+ * stalled call held the turn — and the colleague's "writing" mark — for ever.
+ */
+function idleLimitMs(): number {
+	const configured = Number(process.env.LLM_IDLE_TIMEOUT_MS);
+	return Number.isFinite(configured) && configured > 0 ? configured : 180_000;
+}
+
+/** `stop` abandons the request itself, so a stalled call does not linger after it is given up on. */
+async function withinIdleLimit<T>(work: Promise<T>, doing: 'answer' | 'continue', stop: () => void): Promise<T> {
+	let timer: ReturnType<typeof setTimeout> | undefined;
+	const limit = idleLimitMs();
+	const expired = new Promise<never>((_, reject) => {
+		timer = setTimeout(() => {
+			stop();
+			reject(new GatewayError(`The gateway did not ${doing} within ${Math.round(limit / 1000)} seconds.`, 504, '', true));
+		}, limit);
+	});
+	try {
+		return await Promise.race([work, expired]);
+	} finally {
+		clearTimeout(timer);
+	}
+}
+
 function isRetryable(status: number, body: string): boolean {
 	if (status === 429 || status >= 500) return true;
 	if (status === 400) return RETRYABLE_400_MARKERS.some((m) => body.includes(m));
@@ -136,14 +175,50 @@ export class GatewayProvider implements LlmProvider {
 			messages: req.messages
 		};
 
-		let response: Response | undefined;
-
-		for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
-			let res: Response;
+		// An error the gateway sends inside the stream, before any text has reached
+		// the caller, is the same transient fault as one sent as a status code — an
+		// overloaded backend says so either way. Restarting is invisible until a
+		// word has been yielded; after that it would repeat the reply.
+		for (let attempt = 1; ; attempt++) {
+			let wrote = false;
 			try {
-				res = await postJson(body, req.signal);
+				for await (const event of this.streamOnce(body, req.signal, attempt)) {
+					if (event.type === 'text') wrote = true;
+					yield event;
+				}
+				return;
 			} catch (cause) {
-				if (req.signal?.aborted) throw cause;
+				const again =
+					cause instanceof StreamInterrupted && cause.retryable && !wrote &&
+					attempt < MAX_ATTEMPTS && !req.signal?.aborted;
+				if (!again) throw cause;
+				console.warn(`[llm] stream attempt ${attempt}/${MAX_ATTEMPTS} interrupted before any text (retryable)`);
+				await sleep(backoffMs(attempt));
+			}
+		}
+	}
+
+	/** One request to the gateway, retried only up to its first byte. */
+	private async *streamOnce(
+		body: { model: string; max_tokens: number },
+		signal: AbortSignal | undefined,
+		firstAttempt: number
+	): AsyncIterable<StreamEvent> {
+		let response: Response | undefined;
+		let stop = () => {};
+
+		for (let attempt = firstAttempt; attempt <= MAX_ATTEMPTS; attempt++) {
+			let res: Response;
+			const own = new AbortController();
+			stop = () => own.abort();
+			try {
+				res = await withinIdleLimit(
+					postJson(body, signal ? AbortSignal.any([signal, own.signal]) : own.signal),
+					'answer',
+					stop
+				);
+			} catch (cause) {
+				if (signal?.aborted) throw cause;
 				if (attempt === MAX_ATTEMPTS) throw cause;
 				await sleep(backoffMs(attempt));
 				continue;
@@ -184,7 +259,7 @@ export class GatewayProvider implements LlmProvider {
 
 		try {
 			while (true) {
-				const { done, value } = await reader.read();
+				const { done, value } = await withinIdleLimit(reader.read(), 'continue', stop);
 				if (done) break;
 
 				buffer += decoder.decode(value, { stream: true });
@@ -214,7 +289,8 @@ export class GatewayProvider implements LlmProvider {
 						}
 
 						if (event.type === 'error') {
-							throw new GatewayError('The gateway interrupted its response.', 200, payload, false);
+							const kind = String(event.error?.type ?? '');
+							throw new StreamInterrupted(payload, RETRYABLE_STREAM_ERRORS.includes(kind));
 						} else if (event.type === 'message_stop') {
 							completed = true;
 						} else if (event.type === 'message_start' && event.message?.model) {
@@ -277,8 +353,16 @@ export class GatewayProvider implements LlmProvider {
 
 		for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
 			let res: Response;
+			let json: AnthropicResponse | undefined;
+			const own = new AbortController();
 			try {
-				res = await postJson(body, req.signal);
+				res = await withinIdleLimit(
+					postJson(body, req.signal ? AbortSignal.any([req.signal, own.signal]) : own.signal),
+					'answer',
+					() => own.abort()
+				);
+				// Not streamed, so the whole answer is one wait.
+				if (res.ok) json = (await withinIdleLimit(res.json(), 'answer', () => own.abort())) as AnthropicResponse;
 			} catch (cause) {
 				if (req.signal?.aborted) throw cause;
 				lastError = cause;
@@ -305,7 +389,7 @@ export class GatewayProvider implements LlmProvider {
 				continue;
 			}
 
-			const json = (await res.json()) as AnthropicResponse;
+			if (!json) throw new Error('Gateway returned no response body');
 			const blocks = json.content ?? [];
 
 			const calls: ToolCall[] = blocks

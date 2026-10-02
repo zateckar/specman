@@ -22,6 +22,10 @@ services:
     # If the gateway runs as a container, prefer removing this section entirely
     # and putting both on the same Docker network: then the port is not published
     # to the host at all, which is stronger than binding it narrowly.
+    #
+    # Administrator rights are the exception: they pass through the header only
+    # once PROXY_AUTH_TRUSTED_IPS below names the gateway, because binding the
+    # port is something this application cannot check.
     ports:
       - '127.0.0.1:3000:3000'
 
@@ -56,7 +60,9 @@ services:
       PROXY_AUTH_ENABLED: ${PROXY_AUTH_ENABLED:-true}
 
       # Who may assert X-Forwarded-User. Empty means anyone who can reach the
-      # port, which is why the port is bound the way it is above.
+      # port, which is why the port is bound the way it is above — and while it
+      # is empty, nobody signed in by the gateway has administrator rights, even
+      # someone granted them on the People page. Set it to restore them.
       #
       # Getting this right is fiddly and worth the trouble: the address Specman
       # sees is not the address the gateway thinks it has. A gateway on the host

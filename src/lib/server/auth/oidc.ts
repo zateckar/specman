@@ -14,13 +14,26 @@ export function oidcEnabled(): boolean {
 
 let discovered: Promise<client.Configuration> | null = null;
 
+/**
+ * The issuer's configuration, discovered once and kept.
+ *
+ * Only a success is kept. A failed discovery — the directory briefly down when
+ * the first person tried to sign in — used to be kept too, so company sign-in
+ * failed for everyone until the server was restarted.
+ */
 function configuration(): Promise<client.Configuration> {
 	if (!oidcEnabled()) throw new Error('OIDC is not configured');
-	discovered ??= client.discovery(
-		new URL(config.oidcIssuer!),
-		config.oidcClientId!,
-		config.oidcClientSecret!
-	);
+	if (!discovered) {
+		const attempt = client.discovery(
+			new URL(config.oidcIssuer!),
+			config.oidcClientId!,
+			config.oidcClientSecret!
+		);
+		discovered = attempt;
+		attempt.catch(() => {
+			if (discovered === attempt) discovered = null;
+		});
+	}
 	return discovered;
 }
 

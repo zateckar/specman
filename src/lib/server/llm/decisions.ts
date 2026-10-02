@@ -39,8 +39,41 @@ const LIST_PREFIX = /^\s*(?:[-*•]|\d+[.)])\s*/;
 export function normaliseSource(raw: string | undefined): DecisionSource {
 	const value = (raw ?? '').trim().toLowerCase();
 	if (value === 'user') return 'user';
-	if (value === 'standard') return 'standard';
+	// Not `standard`: company standards are copied in from the administrator's
+	// list, and a model writing the word does not make its choice the company's.
 	return 'agent';
+}
+
+/**
+ * Ways of handing a choice back. Several languages, because the user writes in
+ * their own and the prompt asks the model to reply in it.
+ */
+const DELEGATION = new RegExp(
+	`(?<![\\p{L}\\p{N}])(?:${[
+		'you decide', 'up to you', 'your call', 'whatever you think', 'whatever you suggest',
+		'whatever you recommend', 'whatever is best', "i don't know", 'i do not know', 'no idea',
+		"i don't mind", "doesn't matter", 'does not matter',
+		'rozhodni', 'rozhodněte', 'nevím', 'je mi to jedno', 'nechám to na', 'nechám na',
+		'jak myslíš', 'jak myslíte', 'neviem',
+		'entscheide du', 'entscheiden sie', 'weiß nicht', 'ist mir egal'
+	]
+		.map((phrase) => phrase.replace(/[.*+?^${}()|[\]\\]/g, '\\$&').replace(/'/g, "['’]").replace(/ /g, '\\s+'))
+		.join('|')})(?![\\p{L}\\p{N}])`,
+	'iu'
+);
+
+/**
+ * Who a decision belongs to, given what the user said this turn.
+ *
+ * The model is told to say `source="user"` only when the user gave the answer,
+ * and a decision it labels so is stored as confirmed — so the label is the one
+ * thing standing between a machine's choice and the user's name on it. The
+ * case the prompt warns about, and the one models get wrong, is the user
+ * handing the choice back: "you decide", "I don't know". When their message
+ * says that, the choice was made for them, whatever the label claims.
+ */
+export function attributeDecision(source: DecisionSource, userMessage: string): DecisionSource {
+	return source === 'user' && DELEGATION.test(userMessage) ? 'agent' : source;
 }
 
 export function toDecisionDraft(

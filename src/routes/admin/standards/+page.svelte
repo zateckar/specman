@@ -2,6 +2,8 @@
 	let { data, form } = $props();
 </script>
 
+<svelte:head><title>Company standards — Specman</title></svelte:head>
+
 <main>
 	<a class="back" href="/">← Back</a>
 	<h1>Company standards</h1>
@@ -19,38 +21,40 @@
 		</p>
 	</div>
 
-	{#if form?.message}<p class="error">{form.message}</p>{/if}
+	<!-- A refusal that names a standard is shown on that standard's card. -->
+	{#if form?.message && !('id' in form && form.id)}<p class="error" role="alert">{form.message}</p>{/if}
 	{#if form?.saved}<p class="ok">Saved.</p>{/if}
 
 	{#each data.standards as standard (standard.id)}
+		<!-- A refused save shows what was typed into this one, not what is stored. -->
+		{@const typed = form?.id === standard.id ? (form?.values ?? null) : null}
 		<form method="POST" action="?/save" class="card">
 			<input type="hidden" name="id" value={standard.id} />
 
 			<div class="head">
 				<span class="chapter">{standard.chapter_key}</span>
 				<label class="toggle">
-					<input type="checkbox" name="active" checked={standard.active === 1} />
+					<input type="checkbox" name="active" checked={typed ? typed.active : standard.active === 1} />
 					In use
 				</label>
 			</div>
 
+			{#if typed}<p class="error" role="alert">{form?.message}</p>{/if}
+
 			<label>
 				What must always be true
-				<textarea name="statement" rows="2">{standard.statement}</textarea>
+				<textarea name="statement" rows="2">{typed ? typed.statement : standard.statement}</textarea>
 			</label>
 
 			<label>
 				Applies when — any one of these is enough ({data.conditions})
-				<input name="appliesWhen" value={standard.applies_when.join(', ')} />
+				<input name="appliesWhen" value={typed ? typed.appliesWhen : standard.applies_when.join(', ')} />
 			</label>
 
-			{#if standard.scenarios.length > 0}
-				<p class="scenarios">
-					{#each standard.scenarios as scenario}
-						<span>If {scenario.when}, then {scenario.then}.</span>
-					{/each}
-				</p>
-			{/if}
+			<label>
+				Examples that show it is met — one to a line, “If …, then …”
+				<textarea name="scenarios" rows={Math.max(2, standard.scenarios.length + 1)}>{typed ? typed.scenarios : standard.examples}</textarea>
+			</label>
 
 			<button type="submit">Save</button>
 		</form>
@@ -140,15 +144,6 @@
 		font: inherit;
 		border: 1px solid var(--line);
 		border-radius: 8px;
-	}
-
-	.scenarios {
-		font-size: 12.5px;
-		color: var(--ink-soft);
-		margin: 0 0 12px;
-		display: flex;
-		flex-direction: column;
-		gap: 2px;
 	}
 
 	button {

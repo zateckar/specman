@@ -31,10 +31,14 @@ import {
 	nextRef,
 	normaliseScope,
 	parseRequirementBody,
+	readScenarioLines,
+	sameStatement,
+	scenarioLines,
 	toRequirementDraft
 } from '../src/lib/server/llm/requirements.ts';
 import { validateDocument } from '../src/lib/server/llm/validation.ts';
 import {
+	attributeDecision,
 	effectiveStatus,
 	normaliseSource,
 	pendingByChapter,
@@ -52,10 +56,11 @@ import {
 	toProfile
 } from '../src/lib/server/llm/profile.ts';
 import { baseSlug, uniqueSlug } from '../src/lib/server/llm/slug.ts';
-import { buildSingleFile, buildSpecBundle } from '../src/lib/server/llm/export.ts';
+import { buildSingleFile, buildSpecBundle, bundleSummary } from '../src/lib/server/llm/export.ts';
 import {
 	arrangeChapters,
 	chapterPath,
+	claimSectionKeys,
 	countableChapters,
 	distributeContent,
 	parseSectionPlan,
@@ -72,7 +77,7 @@ import {
 } from '../src/lib/server/llm/archimate.ts';
 import { renderMarkdown, safeUrl } from '../src/lib/safe-markdown.ts';
 import { createSink, sseFrame } from '../src/lib/server/llm/sink.ts';
-import { mayAssertIdentity, readForwardedIdentity } from '../src/lib/server/llm/forwarded.ts';
+import { attemptAddress, mayAssertIdentity, readForwardedIdentity } from '../src/lib/server/llm/forwarded.ts';
 import { safeReturnPath } from '../src/lib/server/llm/return-path.ts';
 import { describeFailure } from '../src/lib/server/llm/failures.ts';
 import { FREE_ATTEMPTS, SignInAttempts } from '../src/lib/server/llm/attempts.ts';
@@ -508,6 +513,57 @@ check(
 	'error'
 );
 
+// Seen in the running instance: one rule in three chapters read "is recorded
+// twice", and said it twice.
+const thrice = validateDocument({
+	chapters: [chapter, { ...chapter, key: 'b' }, { ...chapter, key: 'c' }],
+	requirements: [req(), req({ ref: 'REQ-002', chapter_key: 'b' }), req({ ref: 'REQ-003', chapter_key: 'c' })]
+}).filter((f) => f.message.includes('is recorded'));
+check('a rule held three times is said once, with the count', thrice.map((f) => f.message), ['The rule “It must lock.” is recorded 3 times.']);
+check(
+	'and a pair still reads "twice"',
+	validateDocument({ chapters: [chapter], requirements: [req(), req({ ref: 'REQ-002' })] }).map((f) => f.message),
+	['The rule “It must lock.” is recorded twice.']
+);
+
+// The badge beside the chapter reads "in progress" while an assumption waits,
+// so a finding calling it finished contradicted the same screen.
+const waiting = validateDocument({
+	chapters: [{ ...chapter, status: 'complete', open_questions: ['who?'] }],
+	requirements: [],
+	decisions: [{ chapter_key: 'sec', source: 'agent', status: 'proposed' }]
+});
+check('a chapter waiting on a confirmation is not called finished', waiting.some((f) => /finished/.test(f.message)), false);
+check('and the confirmation it waits on is still raised', waiting.some((f) => f.message.includes('made for you')), true);
+
+console.log('\n--- examples written in plain words ---');
+
+check(
+	'an example reads back as when and then',
+	readScenarioLines('If a colleague signs in, then the company account is used.'),
+	{ scenarios: [{ when: 'a colleague signs in', then: 'the company account is used' }] }
+);
+check(
+	'bullets, a missing comma and a missing full stop are tolerated',
+	readScenarioLines('- if two people book then one is told\n\n'),
+	{ scenarios: [{ when: 'two people book', then: 'one is told' }] }
+);
+check(
+	'the first "then" divides the line',
+	readScenarioLines('If they leave, then come back, then the draft is kept.').scenarios[0].when,
+	'they leave'
+);
+check(
+	'a line that is not an example is returned, not dropped',
+	readScenarioLines('If a, then b.\nWHEN x THEN y'),
+	{ unreadable: ['WHEN x THEN y'] }
+);
+check(
+	'what is shown is what is read back',
+	readScenarioLines(scenarioLines([{ when: 'a request arrives', then: 'it is answered.' }])),
+	{ scenarios: [{ when: 'a request arrives', then: 'it is answered' }] }
+);
+
 console.log('\n--- requirement blocks in the stream ---');
 
 const withReq = streamed([
@@ -668,6 +724,12 @@ check(
 		[{ ...base[0], scenarios: [{ when: 'x', then: 'z' }] }]
 	)[0]?.fields,
 	['scenarios']
+);
+
+check(
+	'a rule moved to another chapter counts as a change',
+	requirementDelta([base[0]], [{ ...base[0], chapter: 'g' }])[0]?.fields,
+	['chapter']
 );
 
 // A repository whose first proposal has not merged yet has no manifest on main.
@@ -891,6 +953,21 @@ check(
 	true
 );
 check('structural problems are stated up front', agents.includes('REQ-009 has no wording.'), true);
+// The export page showed these to the requester; the builder's index did not.
+check(
+	'the caveats the requester was shown reach the builder too',
+	buildSpecBundle({ ...exportInput, problems: [{ severity: 'warning', message: 'Security states nothing that must be true.' }] })
+		.get('AGENTS.md')
+		.includes('**1 thing worth checking:**\n\n- Security states nothing that must be true.'),
+	true
+);
+check(
+	'the page and the index count from the same place',
+	(({ inScope, assumed, openQuestions, errors, warnings }) => [inScope.length, assumed.length, openQuestions, errors.length, warnings.length])(
+		bundleSummary(exportInput)
+	),
+	[1, 1, 1, 1, 0]
+);
 check('unanswered questions are flagged to the builder', agents.includes('1 question remains unanswered'), true);
 check(
 	'counts read correctly in the plural too',
@@ -1689,6 +1766,9 @@ check('and says their words are kept', describeFailure(gatewayError).includes('Y
 check('running out of room says what to do', describeFailure(new Error('The gateway ran out of room before completing its response.')).includes('one part at a time'), true);
 check('a network failure says try again', describeFailure(new TypeError('fetch failed')).includes('Try again in a minute'), true);
 check('a database error is not quoted', describeFailure(new Error('SQLITE_CONSTRAINT: UNIQUE constraint failed')).includes('SQLITE'), false);
+const lostHistory = Object.assign(new Error('No repository at /srv/data/repos/x'), { name: 'RepositoryMissing' });
+check('a lost history is not offered "try again"', /try again/i.test(describeFailure(lostHistory)), false);
+check('and says who can restore it, without the path', [describeFailure(lostHistory).includes('looks after Specman'), describeFailure(lostHistory).includes('/srv')], [true, false]);
 const conflict = Object.assign(new Error('The document changed while the assistant was working.'), { name: 'DocumentConflict' });
 check('a message already written for the user is kept', describeFailure(conflict), conflict.message);
 check('nothing is promised when nothing was saved', describeFailure(gatewayError, { messageSaved: false }).includes('saved'), false);
@@ -1703,6 +1783,11 @@ check('a tab cannot turn a path into another host', safeReturnPath('/\t/evil.exa
 check('nor a newline', safeReturnPath('/\n/evil.example'), '/');
 check('an absolute address goes home', safeReturnPath('https://evil.example/'), '/');
 check('nothing at all goes home', safeReturnPath(null), '/');
+// Resolves on this host to the path `//evil.example`, which the browser reads again.
+check('a dot segment cannot leave a scheme-relative path', safeReturnPath('/..//evil.example'), '/');
+check('nor with a backslash', safeReturnPath('/../\\evil.example'), '/');
+check('nor from deeper down', safeReturnPath('/a/../..//evil.example/x'), '/');
+check('a dot segment that stays home is resolved', safeReturnPath('/projects/../projects/4'), '/projects/4');
 
 console.log('\n--- failed sign-in attempts ---');
 
@@ -1878,6 +1963,13 @@ check('an unknown peer may not, once a list exists', mayAssertIdentity(null, ['1
 check('an IPv4-mapped peer matches its plain form', mayAssertIdentity('::ffff:10.0.0.4', ['10.0.0.4']), true);
 check('and the other way round', mayAssertIdentity('10.0.0.4', ['::ffff:10.0.0.4']), true);
 check('a blank entry does not match everything', mayAssertIdentity('10.0.0.9', ['', '10.0.0.4']), false);
+
+// Which address a failed password is counted against. Behind the proxy, every
+// attempt came from the proxy, and one person's typos locked out everyone.
+check('behind a trusted proxy, the caller it saw is counted', attemptAddress('10.0.0.4', '198.51.100.7, 192.0.2.1', ['10.0.0.4']), '192.0.2.1');
+check('an untrusted peer cannot choose its own address', attemptAddress('203.0.113.9', '192.0.2.1', ['10.0.0.4']), '203.0.113.9');
+check('with no proxy configured the header is ignored', attemptAddress('203.0.113.9', '192.0.2.1', []), '203.0.113.9');
+check('a trusted proxy that sent no header is counted itself', attemptAddress('10.0.0.4', null, ['10.0.0.4']), '10.0.0.4');
 
 console.log('\n--- one writer at a time, per repository ---');
 
@@ -2094,6 +2186,14 @@ console.log('\n--- who else is in this document ---');
 	check('once they are named, they are company', presence.others(3, 21, 500), [
 		{ name: 'Jan Novák', writing: true }
 	]);
+	// A long turn outlasts the expiry; the mark has to outlast it with the turn.
+	presence.seen(3, 21, 'Watcher', 90_000);
+	check('a turn still running keeps them writing past the expiry', presence.others(3, 21, 90_000), [
+		{ name: 'Jan Novák', writing: true }
+	]);
+	presence.setWriting(3, 20, false, 90_000);
+	presence.seen(3, 21, 'Watcher', 140_000);
+	check('and once it finishes they go quiet like anyone else', presence.others(3, 21, 140_000), []);
 }
 
 console.log('\n--- the folder an application lives in ---');
@@ -2134,6 +2234,77 @@ check(
 	''
 );
 check('a name with nothing a slug can keep is not drawn', toElement({ type: 'actor', name: '日本語' }, ''), null);
+
+console.log('\n--- section keys that are already chapters ---');
+
+{
+	const elsewhere = ['overview', 'data', 'integration', 'what-it-does'];
+	const claimed = claimSectionKeys(
+		[
+			{ key: 'booking', title: 'Booking a car' },
+			{ key: 'data', title: 'The data it keeps' },
+			{ key: 'what-it-does', title: 'In short' }
+		],
+		'what-it-does',
+		elsewhere
+	);
+	check('a key nobody uses is kept', claimed[0].key, 'booking');
+	check('a key another chapter has is put under the parent', claimed[1].key, 'what-it-does-data');
+	check('and so is the parent’s own', claimed[2].key, 'what-it-does-what-it-does');
+	check('the same plan gives the same keys next time', claimSectionKeys([{ key: 'data', title: 'x y' }], 'what-it-does', elsewhere)[0].key, 'what-it-does-data');
+	check('a prefixed key that is taken too is numbered', claimSectionKeys([{ key: 'data', title: 'x y' }], 'what-it-does', [...elsewhere, 'what-it-does-data'])[0].key, 'what-it-does-data-2');
+}
+
+console.log('\n--- an empty chapter is not complete ---');
+
+check('an assessment of complete over no prose is in progress', reconcileAssessment({ status: 'complete', openQuestions: [] }, 'Done.', [], false)?.status, 'in_progress');
+check('with prose it stands', reconcileAssessment({ status: 'complete', openQuestions: [] }, 'Done.', [], true)?.status, 'complete');
+check('nor does a navigation-only verdict complete it', reconcileAssessment({ status: 'in_progress', openQuestions: ['Shall we look at Security next?'] }, 'Done.', ['Security'], false)?.status, 'in_progress');
+
+console.log('\n--- a rule restated without its reference ---');
+
+check('the same words are the same rule', sameStatement('The car must be returned by 18:00.', '  the car must be returned  by 18:00'), true);
+check('a different word is a different rule', sameStatement('The car must be returned by 18:00.', 'The car must be returned by 17:00.'), false);
+check('nothing is never the same as nothing', sameStatement('', ''), false);
+check('a lower-case reference names the stored one', toRequirementDraft({ ref: 'req-004' }, 'The rule is restated here.').ref, 'REQ-004');
+
+console.log('\n--- who a decision belongs to ---');
+
+check('the user’s own answer stays theirs', attributeDecision('user', 'Email is enough, nothing inside the app.'), 'user');
+check('“you decide” makes it the assistant’s', attributeDecision('user', 'Honestly, you decide.'), 'agent');
+check('so does “I don’t know”, with either apostrophe', [attributeDecision('user', "I don't know"), attributeDecision('user', 'I don’t know')], ['agent', 'agent']);
+check('and in Czech', attributeDecision('user', 'Nevím, rozhodni ty.'), 'agent');
+check('a word merely containing one is not one', attributeDecision('user', 'We use the Undecided folder for these.'), 'user');
+check('the assistant’s own stays the assistant’s', attributeDecision('agent', 'Fine.'), 'agent');
+check('a model cannot call its choice a company standard', normaliseSource('standard'), 'agent');
+
+console.log('\n--- tags written loosely ---');
+
+{
+	const parser = new ChapterStreamParser();
+	const shown = parser.push('<chapter key=security>Only staff.</Chapter>Recorded.') + parser.end();
+	check('an unquoted attribute is read', [...parser.drafts.keys()], ['security']);
+	check('a closing tag in another case closes the block', parser.drafts.get('security'), 'Only staff.');
+	check('and nothing of it reaches the chat', shown, 'Recorded.');
+}
+{
+	const parser = new ChapterStreamParser();
+	const shown = parser.push('<requirement scope=now>Every booking is confirmed by email.\nWHEN booked\nTHEN mailed</requirement >Done.') + parser.end();
+	check('a space before the closing bracket still closes', [parser.blocksOf('requirement').length, parser.blocksOf('requirement')[0].attrs.scope, shown], [1, 'now', 'Done.']);
+}
+
+console.log('\n--- keeping a quiet stream open ---');
+
+{
+	const frames = [];
+	const sink = createSink((frame) => frames.push(frame));
+	sink.ping();
+	check('a ping is a comment line', frames, [': still working\n\n']);
+	check('which the page reads as nothing', readFrames(frames[0]).events, []);
+	sink.disconnect();
+	sink.ping();
+	check('and is not sent once the browser has gone', frames.length, 1);
+}
 
 console.log(`\n${pass} passed, ${fail} failed`);
 process.exit(fail ? 1 : 0);

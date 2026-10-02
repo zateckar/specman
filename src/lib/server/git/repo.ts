@@ -1,5 +1,5 @@
 import { simpleGit, type SimpleGit } from 'simple-git';
-import { mkdirSync, writeFileSync, existsSync, rmSync, readdirSync } from 'node:fs';
+import { mkdirSync, writeFileSync, existsSync, rmSync, readdirSync, statSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import type { Chapter, Decision, Requirement } from '../db/types';
 import { stripChapterHeading } from '../markdown';
@@ -19,6 +19,13 @@ import { validateDocument } from '../llm/validation';
 
 export const MAIN_BRANCH = 'main';
 
+/**
+ * Where this installation keeps an application's repository.
+ *
+ * Resolved against the folder the server was started in and stored whole, so a
+ * server started from somewhere else finds none of them. `relocateRepositories`
+ * in `proposals.ts` follows them at boot.
+ */
 export function repoPathFor(slug: string): string {
 	return resolve(process.cwd(), 'data', 'repos', slug);
 }
@@ -43,7 +50,33 @@ const locks = createLocks();
  * would make reading an application wait on someone else's conversation.
  */
 export function withRepo<T>(repoPath: string, work: () => Promise<T>): Promise<T> {
-	return locks.run(repoPath, work);
+	return locks.run(repoPath, () => {
+		clearStaleIndexLock(repoPath);
+		return work();
+	});
+}
+
+/** Comfortably longer than any git command this application runs. */
+const STALE_LOCK_MS = 2 * 60_000;
+
+/**
+ * Remove an `index.lock` that nothing here can be holding.
+ *
+ * Git leaves the file behind when it is killed mid-command — a container
+ * stopped hard is enough — and from then on every commit fails until someone
+ * deletes it by hand. Every write here goes through this lock, so while it is
+ * held no git command of ours is writing; one that is merely reading can take
+ * the lock for a moment, which is what the age is for.
+ */
+function clearStaleIndexLock(repoPath: string): void {
+	const lock = join(repoPath, '.git', 'index.lock');
+	try {
+		if (Date.now() - statSync(lock).mtimeMs < STALE_LOCK_MS) return;
+		rmSync(lock, { force: true });
+		console.warn(`[git] removed a stale index.lock in ${repoPath}`);
+	} catch {
+		// No lock, or it went away by itself.
+	}
 }
 
 /**
@@ -108,6 +141,25 @@ async function hasCommit(repoPath: string, revision: string): Promise<boolean> {
 }
 
 /**
+ * An application that has had a history, whose repository is not there.
+ *
+ * Its own type because the alternative was worse than failing: a missing folder
+ * was initialised again as though the application were new, and the next turn
+ * recorded the whole document as its first change — the approved history gone,
+ * and the review page comparing against nothing, with no sign that anything
+ * had happened.
+ */
+export class RepositoryMissing extends Error {
+	readonly repoPath: string;
+
+	constructor(repoPath: string) {
+		super(`No repository at ${repoPath} — refusing to start an empty one in place of a history that existed`);
+		this.name = 'RepositoryMissing';
+		this.repoPath = repoPath;
+	}
+}
+
+/**
  * A repository with `main` holding its first commit.
  *
  * Resumable rather than all-or-nothing. The only guard used to be whether `.git`
@@ -116,9 +168,13 @@ async function hasCommit(repoPath: string, revision: string): Promise<boolean> {
  * `.git` and returned, commits failed for want of an identity, or `main` never
  * existed and the review page failed to load for good. Each step is now taken
  * if it has not happened, whatever happened before.
+ *
+ * `existed` says the application has been given a repository before. Then a
+ * missing `.git` is a loss to report, not a beginning: see `RepositoryMissing`.
  */
-export async function ensureRepo(repoPath: string, projectName: string): Promise<void> {
+export async function ensureRepo(repoPath: string, projectName: string, existed = false): Promise<void> {
 	if (existsSync(join(repoPath, '.git')) && (await hasCommit(repoPath, MAIN_BRANCH))) return;
+	if (existed && !existsSync(join(repoPath, '.git'))) throw new RepositoryMissing(repoPath);
 
 	mkdirSync(join(repoPath, 'docs'), { recursive: true });
 
@@ -495,8 +551,23 @@ export async function commitAll(
 	// Git can normalize rewritten line endings back to the existing index.
 	// Only the staged diff determines whether a commit actually exists.
 	if (!(await g.diff(['--cached', '--name-only'])).trim()) return null;
+	const before = await headRevision(repoPath);
 	const result = await g.commit(message);
-	return result.commit || null;
+	// Read from the repository rather than from git's output. A commit that
+	// failed without a word on stderr parsed as no hash, which read as "nothing
+	// changed" while the staged change sat there unrecorded.
+	const after = await headRevision(repoPath);
+	if (after && after !== before) return after;
+	throw new Error(`git commit recorded nothing for staged changes${result.commit ? '' : ' and printed no commit'}`);
+}
+
+async function headRevision(repoPath: string): Promise<string | null> {
+	try {
+		const out = (await git(repoPath).raw(['rev-parse', '--verify', 'HEAD^{commit}'])).trim();
+		return /^[0-9a-f]{40,64}$/.test(out) ? out : null;
+	} catch {
+		return null; // no commit yet
+	}
 }
 
 export async function currentBranch(repoPath: string): Promise<string> {

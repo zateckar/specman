@@ -35,9 +35,10 @@ export interface ParsedBlock {
 
 // All distinct words, so ordinary alternation is unambiguous.
 const TAGS = 'chapter|options|requirement|decision|finding|subchapters|element|relation';
-// Either quote. The models write `key='x'` often enough that refusing it printed
-// the raw tag and the whole chapter into the chat, and saved nothing.
-const ATTRIBUTE_SOURCE = `[a-z_]+\\s*=\\s*(?:"[^"]*"|'[^']*')`;
+// Either quote, or none. The models write `key='x'` often enough that refusing it
+// printed the raw tag and the whole chapter into the chat, and saved nothing —
+// and `key=security` did exactly the same.
+const ATTRIBUTE_SOURCE = `[a-z_]+\\s*=\\s*(?:"[^"]*"|'[^']*'|[^\\s"'<>/=]+)`;
 const BLOCK_OPEN = new RegExp(`<(${TAGS})((?:\\s+${ATTRIBUTE_SOURCE})*)\\s*(/?)>`, 'i');
 
 /**
@@ -49,8 +50,12 @@ const BLOCK_OPEN = new RegExp(`<(${TAGS})((?:\\s+${ATTRIBUTE_SOURCE})*)\\s*(/?)>
  * without a self-closing slash.
  */
 const VOID_TAGS = new Set<BlockTag>(['element', 'relation']);
-const ATTRIBUTE = /([a-z_]+)\s*=\s*(?:"([^"]*)"|'([^']*)')/gi;
-const LONGEST_CLOSE = '</requirement>'.length;
+const ATTRIBUTE = /([a-z_]+)\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s"'<>/=]+))/gi;
+/** With room for a space or two before the `>`, which the close also accepts. */
+const LONGEST_CLOSE = '</requirement   >'.length;
+
+/** A closing tag in any case: `</Chapter>` closed nothing, and the rest of the reply was saved as prose. */
+const closingTag = (tag: BlockTag) => new RegExp(`</${tag}\\s*>`, 'i');
 
 /**
  * Could this tail still become an opening tag?
@@ -65,7 +70,7 @@ const PARTIAL_TAG = new RegExp(`^<(?:[a-z]*|(?:${TAGS})\\b[^<>]*)$`, 'i');
 
 function parseAttributes(raw: string): Record<string, string> {
 	const attrs: Record<string, string> = {};
-	for (const match of raw.matchAll(ATTRIBUTE)) attrs[match[1].toLowerCase()] = match[2] ?? match[3];
+	for (const match of raw.matchAll(ATTRIBUTE)) attrs[match[1].toLowerCase()] = match[2] ?? match[3] ?? match[4];
 	return attrs;
 }
 
@@ -128,9 +133,8 @@ export class ChapterStreamParser {
 				break;
 			}
 
-			const closeTag = `</${this.open.tag}>`;
-			const close = this.buffer.indexOf(closeTag);
-			if (close === -1) {
+			const close = closingTag(this.open.tag).exec(this.buffer);
+			if (!close) {
 				// Keep a tail in case the closing tag is split across chunks.
 				const keep = Math.max(0, this.buffer.length - LONGEST_CLOSE);
 				this.blockBuffer += this.buffer.slice(0, keep);
@@ -138,9 +142,9 @@ export class ChapterStreamParser {
 				break;
 			}
 
-			this.blockBuffer += this.buffer.slice(0, close);
+			this.blockBuffer += this.buffer.slice(0, close.index);
 			this.closeBlock();
-			this.buffer = this.buffer.slice(close + closeTag.length);
+			this.buffer = this.buffer.slice(close.index + close[0].length);
 		}
 
 		return this.squeeze(out);

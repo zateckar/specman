@@ -140,11 +140,26 @@ export function namesChapter(question: string, titles: string[]): boolean {
  * question naming another chapter is navigation, not something left to decide
  * here. When it was the only thing keeping the chapter open, the chapter is
  * complete: nothing is left to ask.
+ *
+ * And a chapter with nothing written in it is not complete, whatever the
+ * assessor says. It read as finished in the index and the progress bar while the
+ * document had no words for it at all; `written` is whether it has any.
  */
 export function reconcileAssessment(
 	assessment: Assessment | null,
 	reply: string,
-	otherChapterTitles: string[] = []
+	otherChapterTitles: string[] = [],
+	written = true
+): Assessment | null {
+	const result = reconcileVerdict(assessment, reply, otherChapterTitles);
+	if (result && !written && result.status === 'complete') return { ...result, status: 'in_progress' };
+	return result;
+}
+
+function reconcileVerdict(
+	assessment: Assessment | null,
+	reply: string,
+	otherChapterTitles: string[]
 ): Assessment | null {
 	const isNavigation = (q: string) => namesChapter(q, otherChapterTitles);
 	const asked = questionsInReply(reply).filter((q) => !isNavigation(q));

@@ -422,9 +422,13 @@
 
 			{#each diagram.boxes as box (box.id)}
 				<!-- Focus picks out connections the way hovering does, so the picture can
-				     be followed from the keyboard too. -->
+				     be followed from the keyboard too. A box with no chapter is no link,
+				     and Tab skips an `<a>` without an address, so it is made focusable
+				     itself — its connections could otherwise only be found with a mouse. -->
 				<a
 					href={box.chapter ? `/projects/${projectId}?chapter=${encodeURIComponent(box.chapter)}` : undefined}
+					tabindex={box.chapter ? undefined : 0}
+					role={box.chapter ? undefined : 'img'}
 					aria-label="{box.name}, {TYPE_LABEL[box.type] ?? box.type}"
 					onfocus={() => (hovered = box.id)}
 					onblur={() => (hovered = null)}
