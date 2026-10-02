@@ -175,6 +175,19 @@ export class ChapterStreamParser {
 		return this.squeeze(rest);
 	}
 
+	/**
+	 * The block being written right now, with what has arrived of it so far, or
+	 * null between blocks. `index` is where it will sit in `blocks` once closed,
+	 * so a caller can tell one block from the next of the same kind.
+	 *
+	 * The last few characters are still held back in case they begin the closing
+	 * tag, so the body never shows a half-written `</chapter>`.
+	 */
+	get writing(): { index: number; tag: BlockTag; attrs: Record<string, string>; body: string } | null {
+		if (!this.open) return null;
+		return { index: this.blocks.length, tag: this.open.tag, attrs: this.open.attrs, body: this.blockBuffer };
+	}
+
 	/** Blocks of one kind, in order. */
 	blocksOf(tag: BlockTag): ParsedBlock[] {
 		return this.blocks.filter((b) => b.tag === tag);

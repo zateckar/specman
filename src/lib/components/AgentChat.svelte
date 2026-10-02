@@ -38,6 +38,7 @@
 		written = false,
 		turns,
 		busy,
+		activity = '',
 		busyElsewhere = '',
 		saveState = 'saved',
 		errorMessage = '',
@@ -54,6 +55,8 @@
 		written?: boolean;
 		turns: ChatTurn[];
 		busy: boolean;
+		/** What the assistant is doing, in words — "Writing “Overview”…". */
+		activity?: string;
 		/** Title of another chapter still being written, if there is one. */
 		busyElsewhere?: string;
 		saveState?: 'saved' | 'saving' | 'not-recorded';
@@ -161,7 +164,7 @@
 	<header>
 		<h2>{chapterTitle}</h2>
 		{#if busy}
-			<span class="thinking">Thinking…</span>
+			<span class="thinking">{activity || 'Thinking…'}</span>
 		{:else if busyElsewhere}
 			<!-- A turn keeps running when the user moves on, so say where it is
 			     rather than leaving them wondering whether it was lost. -->
@@ -217,6 +220,12 @@
 					{#if turn.content}
 						{turn.content}
 					{:else}
+						<!-- The chapter is written before the reply, so for most of a turn
+						     this bubble has no words of its own. Saying what is being done
+						     is what tells the user it is working. -->
+						{#if busy && i === turns.length - 1 && activity}
+							<span class="doing">{activity}</span>
+						{/if}
 						<span class="cursor">▊</span>
 					{/if}
 				</div>
@@ -498,6 +507,12 @@
 
 	.cursor {
 		opacity: 0.4;
+	}
+
+	.doing {
+		color: var(--ink-soft);
+		font-style: italic;
+		margin-right: 6px;
 	}
 
 	.chips {

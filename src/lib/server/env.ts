@@ -51,6 +51,13 @@ export function requireEnv(key: string): string {
 }
 
 export const config = {
+	/**
+	 * Whether the primary gateway is set up at all. Without it, Gemini answers
+	 * everything — an installation with only a Gemini key is a working one.
+	 */
+	get primaryConfigured() {
+		return Boolean(env('LLM_URL') && env('LLM_API_KEY') && env('LLM_MODEL'));
+	},
 	get gatewayUrl() {
 		return requireEnv('LLM_URL');
 	},
@@ -88,6 +95,10 @@ export const config = {
 	get geminiModel() {
 		return env('GEMINI_MODEL') ?? 'gemini-flash-latest';
 	},
+	/** Google's API unless set; a company relay, or a stub in a test, can stand in. */
+	get geminiBaseUrl() {
+		return (env('GEMINI_BASE_URL') ?? 'https://generativelanguage.googleapis.com/v1beta').replace(/\/+$/, '');
+	},
 	get databasePath() {
 		return env('DATABASE_PATH') ?? 'data/specman.db';
 	},
@@ -115,18 +126,7 @@ export const config = {
 	get proxyAuthEnabled() {
 		return (env('PROXY_AUTH_ENABLED') ?? 'true').toLowerCase() !== 'false';
 	},
-	/**
-	 * Callers permitted to assert `X-Forwarded-User`. Empty means any caller may,
-	 * which is only safe while nothing but the proxy can reach the port — see the
-	 * boot warning in `auth/index.ts`.
-	 */
-	get proxyAuthTrustedIps() {
-		return (env('PROXY_AUTH_TRUSTED_IPS') ?? '')
-			.split(',')
-			.map((value) => value.trim())
-			.filter(Boolean);
-	},
-	/** Where the proxy ends its own session, shown on sign-out when configured. */
+	/** Where the proxy ends its own session, offered on the sign-in page when configured. */
 	get proxyAuthLogoutUrl() {
 		return env('PROXY_AUTH_LOGOUT_URL');
 	}

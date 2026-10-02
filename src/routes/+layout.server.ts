@@ -1,4 +1,3 @@
-import { config } from '$lib/server/env';
 import type { LayoutServerLoad } from './$types';
 
 /**
@@ -19,11 +18,6 @@ export const load: LayoutServerLoad = async ({ locals }) => {
 			username: user.username,
 			display_name: user.display_name,
 			is_admin: user.is_admin
-		},
-		// Behind a proxy there is no session here to end, so the header must not
-		// offer a button that pretends otherwise. Where the proxy publishes its own
-		// sign-out, that is the one that means something.
-		viaProxy: locals.viaProxy,
-		proxyLogoutUrl: locals.viaProxy ? (config.proxyAuthLogoutUrl ?? null) : null
+		}
 	};
 };

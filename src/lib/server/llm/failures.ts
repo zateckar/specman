@@ -38,6 +38,16 @@ export function describeFailure(cause: unknown, context: FailureContext = {}): s
 		);
 	}
 
+	// Nothing the user can retry their way out of; the variables it names are
+	// for the log, not for them.
+	if (name === 'NoModelConfigured') {
+		return (
+			'The assistant is not set up on this server yet.' +
+			kept(context) +
+			' Tell whoever looks after Specman.'
+		);
+	}
+
 	if (/ran out of room/i.test(message)) {
 		return (
 			'That was more than the assistant could write in one go.' +

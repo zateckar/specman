@@ -3,9 +3,11 @@
 ## Purpose
 
 Specman holds one organisation's unreleased plans, so who is signed in has to be settled
-before anything else happens on a request. Sign-in is either a company account through OIDC
-or a local password, and the first administrator has to come from somewhere without leaving
-a permanent way in.
+before anything else happens on a request. Sign-in is a company account through OIDC, the
+identity a reverse proxy has already authenticated, or a local password, and the first
+administrator has to come from somewhere without leaving a permanent way in. Behind the proxy
+everyone is signed in already, so the sign-in page is also where a colleague switches to
+another account — usually the administrator's.
 
 The per-request session lookup happens in `src/hooks.server.ts`, which belongs to
 `storage-and-migrations` because the boot sequence is the larger part of what it does. The
@@ -32,12 +34,19 @@ behaviour of that lookup is specified here.
 ## Requirements
 
 ### Requirement: Every request resolves an identity
-The server SHALL resolve the session cookie to a user, or to no user, before any route
-handler runs.
+The server SHALL resolve the session cookie, or failing that the reverse proxy's assertion,
+to a user, or to no user, before any route handler runs.
 
 #### Scenario: A valid session
 - **WHEN** a request carries a session cookie that exists and has not expired
 - **THEN** the user is available to every load function and action on that request
+
+#### Scenario: A session behind the proxy
+- **WHEN** a request carries both a valid session and the proxy's header
+- **THEN** the session decides, because it exists only because someone signed in here on
+  purpose — and behind the proxy that is the only way an administrator reaches the account
+  that makes them one; read the other way round, the header always won and the password was
+  useless
 
 #### Scenario: An expired session
 - **WHEN** the session's expiry has passed
@@ -84,20 +93,45 @@ attempts from there for a wait that grows with each failure, up to a ceiling.
 - **THEN** the failures before it are forgotten
 
 #### Scenario: Everyone arrives through the proxy
-- **WHEN** the caller is a trusted proxy that names, in `X-Forwarded-For`, the address it saw
+- **WHEN** proxy sign-in is on and the proxy names, last in `X-Forwarded-For`, the address it
+  saw
 - **THEN** the failures are counted against that address, because counted against the
-  proxy's own, six wrong passwords from anyone locked the administrator's break-glass
-  sign-in for the whole company; from any other peer the header is ignored, because it is
-  the caller's own invention
+  proxy's own, six wrong passwords from anyone locked the administrator's sign-in for the
+  whole company; with proxy sign-in off the header is ignored, because nothing vouches for it
 
 ### Requirement: The sign-in form is for signing in
-Submitting the sign-in form while already signed in SHALL send the user to the front page
-without checking a password.
+Opening or submitting the sign-in form while signed in here — with a password or the company
+account — SHALL send the user to the front page without checking a password; someone signed
+in only by the proxy's header SHALL be able to use it.
 
 #### Scenario: The form is sent from a tab left open
-- **WHEN** someone already signed in submits it
+- **WHEN** someone already signed in here submits it
 - **THEN** they are taken home, rather than having a password checked, counted against them
   and a second session issued
+
+#### Scenario: The gateway's colleague opens it
+- **WHEN** the only identity on the request is the proxy's
+- **THEN** the form is shown and checked, because it is where they switch to another account;
+  sent home, an administrator behind the proxy had no way to their own account
+
+### Requirement: A colleague behind the proxy can switch account
+Signing out SHALL lead to the sign-in page, which, for someone the proxy signed in, SHALL
+name that account, offer to continue with it, and offer to sign in with another.
+
+#### Scenario: Becoming the administrator
+- **WHEN** a colleague the gateway signed in signs out and signs in with the administrator's
+  password
+- **THEN** they work as the administrator, with its rights, until they sign out of it
+
+#### Scenario: Handing back to the gateway
+- **WHEN** they sign out of that account
+- **THEN** the session is ended and the sign-in page offers to continue as the account the
+  gateway names, because the proxy still signs them in on every request
+
+#### Scenario: Leaving altogether
+- **WHEN** the proxy publishes its own sign-out
+- **THEN** the sign-in page links to it, because the proxy's session is the proxy's to end and
+  nothing here can end it
 
 ### Requirement: Stored credentials never leave the server
 The user record made available to a page SHALL carry no password hash and no salt.
@@ -212,12 +246,11 @@ administrator rights.
 - **THEN** it does not, because who someone is and what they may do are separate questions
   and only the first is the directory's to answer
 
-#### Scenario: A colleague made an administrator signs in through an unchecked proxy
-- **WHEN** the proxy names an account that was granted administrator rights, and no trusted
-  peers are configured
-- **THEN** that request is treated as an ordinary user's, because with no address checked
-  anyone who can reach the port can send the same header; the rights are honoured once
-  `PROXY_AUTH_TRUSTED_IPS` is set, and the boot warning says so
+#### Scenario: A colleague made an administrator signs in through the proxy
+- **WHEN** the proxy names an account that was granted administrator rights on the people page
+- **THEN** they have them, because turning proxy sign-in on is the operator saying the proxy
+  is the only route here and overwrites the header; a list of trusted addresses kept beside
+  that said the same thing again, and while it was empty the rights silently did nothing
 
 ### Requirement: The people page says how each person gets in
 Each account SHALL record how it came to exist, and the people page SHALL describe every way
@@ -260,18 +293,19 @@ each request and SHALL NOT convert it into a session of its own.
 - **THEN** they are signed out here at once, rather than when a session minted earlier would
   have expired
 
-#### Scenario: A caller not permitted to assert an identity
-- **WHEN** trusted peers are configured and the request comes from another address
-- **THEN** the headers are ignored and the login page is shown
+#### Scenario: Proxy sign-in is switched off
+- **WHEN** `PROXY_AUTH_ENABLED` is `false`
+- **THEN** the headers are ignored and the sign-in page is shown, which is how an installation
+  with no proxy in front stays closed to anyone sending the header themselves
 
 #### Scenario: No proxy in front
 - **WHEN** a request carries none of these headers
 - **THEN** nothing changes: the session cookie decides, as it does today
 
 #### Scenario: Signing out from behind the proxy
-- **WHEN** the identity came from the proxy
-- **THEN** the interface does not offer to end a session it did not create, and points at
-  the proxy's own sign-out where one is configured
+- **WHEN** the identity came from the proxy and the user signs out
+- **THEN** they reach the sign-in page rather than the proxy's sign-out, because that is
+  where they switch account; the proxy's sign-out is linked from there
 
 ### Requirement: Applications are shared within the organisation
 Every signed-in colleague SHALL be able to open, continue and approve every application;

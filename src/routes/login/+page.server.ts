@@ -8,20 +8,27 @@ import type { Actions, PageServerLoad } from './$types';
 
 const attempts = new SignInAttempts();
 
+/**
+ * Signed in here on purpose — with a password or the company account — there is
+ * nothing to do on this page. Signed in only by the proxy's header, this is
+ * where a colleague switches to another account, so it stays open to them.
+ */
+const signedInHere = (locals: App.Locals) => locals.user !== null && !locals.viaProxy;
+
 export const load: PageServerLoad = async ({ locals, url }) => {
-	if (locals.user) throw redirect(303, '/');
+	if (signedInHere(locals)) throw redirect(303, '/');
 	return {
 		oidcAvailable: Boolean(config.oidcIssuer && config.oidcClientId),
-		next: safeReturnPath(url.searchParams.get('next') ?? '/')
+		next: safeReturnPath(url.searchParams.get('next') ?? '/'),
+		// Who the gateway says they are, so the page can offer to carry on as them.
+		gatewayUser: locals.viaProxy && locals.user ? locals.user.display_name : null,
+		gatewayLogoutUrl: locals.viaProxy ? (config.proxyAuthLogoutUrl ?? null) : null
 	};
 };
 
 export const actions: Actions = {
 	default: async ({ request, cookies, getClientAddress, locals }) => {
-		// Someone already signed in — behind the proxy, that is every colleague —
-		// has no password to try here, and their failed attempts were what could
-		// lock the administrator out.
-		if (locals.user) throw redirect(303, '/');
+		if (signedInHere(locals)) throw redirect(303, '/');
 
 		const form = await request.formData();
 		const username = String(form.get('username') ?? '').trim();
@@ -35,7 +42,7 @@ export const actions: Actions = {
 		const address = attemptAddress(
 			getClientAddress(),
 			request.headers.get('x-forwarded-for'),
-			config.proxyAuthTrustedIps
+			config.proxyAuthEnabled
 		);
 		const wait = attempts.waitFor(address, username);
 		if (wait > 0) {

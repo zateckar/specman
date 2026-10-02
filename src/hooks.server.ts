@@ -56,27 +56,19 @@ export const handle: Handle = async ({ event, resolve }) => {
 		return new Response('Cross-site requests are not accepted.', { status: 403 });
 	}
 
-	// The proxy's assertion is read first and re-read every request. It is not
-	// turned into a session on purpose: a session would have to be revalidated
-	// against the directory later by something, and nothing would. Read this way,
-	// an account the directory disables stops working here on the next request.
+	// A session comes first: it exists only because someone signed in here on
+	// purpose — with a password or the company account — and behind the proxy that
+	// is how an administrator reaches the account that makes them one. Ending it
+	// hands them back to whoever the proxy says they are.
 	//
-	// The peer is whatever the platform reports as the client address. Behind one
-	// proxy that is the proxy. If the deployment sets `ADDRESS_HEADER`, or puts
-	// several hops in front, it is whatever that arrangement produces — which is
-	// why `PROXY_AUTH_TRUSTED_IPS` is the operator's to get right and cannot be
-	// worked out from in here.
-	let peer: string | null = null;
-	try {
-		peer = event.getClientAddress();
-	} catch {
-		// adapter-node throws when it is told to read an address header that the
-		// request does not carry. No address means no trusted peer.
-	}
+	// The proxy's assertion is re-read every request rather than turned into a
+	// session: a session would have to be revalidated against the directory later
+	// by something, and nothing would. Read this way, an account the directory
+	// disables stops working here on the next request.
+	const fromSession = userForSession(event.cookies.get(SESSION_COOKIE));
+	const fromProxy = fromSession ? null : userForProxyHeaders((name) => event.request.headers.get(name));
 
-	const fromProxy = userForProxyHeaders((name) => event.request.headers.get(name), peer);
-
-	event.locals.user = fromProxy ?? userForSession(event.cookies.get(SESSION_COOKIE));
+	event.locals.user = fromSession ?? fromProxy;
 	event.locals.viaProxy = fromProxy !== null;
 
 	if (!event.locals.user && !isPublic(event.url.pathname)) {

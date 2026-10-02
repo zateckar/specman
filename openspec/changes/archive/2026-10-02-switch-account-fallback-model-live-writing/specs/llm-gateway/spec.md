@@ -1,58 +1,4 @@
-# LLM gateway access
-
-## Purpose
-
-Every model call in Specman goes to the primary gateway, which speaks the Anthropic Messages
-API shape but is not answered by Claude, or — when that gateway is not configured or is not
-answering — to Google's Gemini. The gateway's failure modes are not Claude's, and they are
-not obvious from the response — a routing failure looks like a bug in the caller, and an
-exhausted token budget looks like a parser fault. This capability is where those facts are
-absorbed, and where the choice between the two providers is made, so no other capability has
-to know either.
-
-What any particular installation runs behind that gateway — which models, routed how, and
-which of them misbehave — is configuration, not behaviour, and is deliberately not recorded
-here or anywhere else in this repository.
-
-## Source
-
-- `src/lib/server/env.ts`
-- `src/lib/server/llm/gateway.ts`
-- `src/lib/server/llm/gemini.ts`
-- `src/lib/server/llm/gemini-format.ts`
-- `src/lib/server/llm/fallback.ts`
-- `src/lib/server/llm/transport.ts`
-- `src/lib/server/llm/types.ts`
-- `src/lib/server/llm/parallel.ts`
-- `src/routes/health/llm/+server.ts`
-
-## Requirements
-
-### Requirement: A failed or incomplete stream never completes successfully
-The client SHALL surface SSE errors, token truncation and EOF without a success terminator
-as failures, and SHALL emit done only after message_stop or the explicit DONE sentinel.
-
-#### Scenario: A stream fails after returning partial text
-- **WHEN** the gateway emits an error after some text
-- **THEN** the caller receives a failure and cannot persist the partial draft as a completed turn
-
-#### Scenario: A connection ends or the output budget runs out
-- **WHEN** a response reaches EOF without a success terminator or reports max_tokens
-- **THEN** no successful done event is emitted
-
-#### Scenario: An empty response completes successfully
-- **WHEN** the stream emits a success terminator with no text
-- **THEN** it completes successfully because silence is a valid finding-free verification response
-
-#### Scenario: Silence that spent the whole budget
-- **WHEN** a stream completes with no text and its output-token count has reached the
-  ceiling, from a backend that did not report max_tokens
-- **THEN** it fails as having run out of room, because that is the model reasoning until it
-  was cut off, and accepting it let a starved check read as a clean one
-
-#### Scenario: Transport chunks split CRLF delimiters
-- **WHEN** an SSE frame's line endings arrive across separate chunks
-- **THEN** the complete frame is still parsed and its terminal status is respected
+## ADDED Requirements
 
 ### Requirement: Gemini answers when the primary gateway cannot
 A model call SHALL go to the primary gateway when it is configured, and to Gemini when it is
@@ -108,6 +54,8 @@ finished, and failed when it ran out of budget.
 - **WHEN** it returns thought summaries
 - **THEN** they are never the answer, as with the primary's thinking
 
+## MODIFIED Requirements
+
 ### Requirement: Bearer authentication
 The client SHALL authenticate with an `Authorization: Bearer` header to the primary gateway.
 
@@ -134,33 +82,6 @@ Configuration SHALL be read through `src/lib/server/env.ts` rather than
 - **THEN** the file's value is not used, because an empty variable is set; the test suite
   blanks the Gemini key this way so no fallback test reaches Google
 
-### Requirement: Transient routing failures are retried
-The client SHALL treat a 400 matching a known transient shape as retryable, because retrying
-re-rolls which backend the request routes to.
-
-#### Scenario: A backend rejects what another would accept
-- **WHEN** a tools request returns HTTP 400 matching a transient shape
-- **THEN** the call is retried rather than surfaced as a failure
-
-#### Scenario: The request is malformed
-- **WHEN** a 400 does not match a known transient shape
-- **THEN** it is surfaced to the caller rather than retried
-
-#### Scenario: An installation has a backend of its own that misbehaves
-- **WHEN** its signature is given in configuration
-- **THEN** it is retried too, because naming somebody's broken backend in source would
-  publish which models they run and which of them are faulty
-
-#### Scenario: The stream reports an overloaded backend before any text
-- **WHEN** a streamed response opens with 200 and then sends an `error` frame of an
-  overloaded, rate-limited, timed-out or internal kind, before any text has been passed on
-- **THEN** the request is made again, as a 429 or a 5xx would be, because the gateway reports
-  the same condition either way and the turn failed on the first busy backend
-
-#### Scenario: The stream fails after text
-- **WHEN** the same error arrives once text has been passed on
-- **THEN** it is not retried, because starting again would repeat the reply to the reader
-
 ### Requirement: A call that has gone quiet is given up on
 A gateway call SHALL fail when it sends nothing for longer than a configurable limit,
 `LLM_IDLE_TIMEOUT_MS`, three minutes unless set, and the request SHALL be abandoned with it.
@@ -179,36 +100,6 @@ A gateway call SHALL fail when it sends nothing for longer than a configurable l
 - **WHEN** the primary reaches the limit and Gemini is configured
 - **THEN** the primary is not asked again at the same limit, and Gemini is asked instead,
   because four waits of three minutes is a quarter of an hour before the fallback is tried
-
-### Requirement: Reasoning output is stripped
-The client SHALL remove `thinking` blocks from responses before returning them, since the
-reasoning model emits them and no caller wants them in the document.
-
-#### Scenario: The reasoning model answers
-- **WHEN** a response contains both thinking and text blocks
-- **THEN** only the text reaches the caller
-
-### Requirement: A call's budget covers its reasoning
-Every call SHALL be given a `max_tokens` large enough for the model's reasoning as well as
-its answer, because a model that thinks before it writes spends the same budget on both.
-
-#### Scenario: A call returns nothing
-- **WHEN** the result is empty and the output-token count sits exactly on the ceiling
-- **THEN** the budget is the cause, not the parser — three features failed this way while
-  looking like logic bugs, one returning zero characters at 4000 that works at 12000
-
-#### Scenario: A tool call runs out mid-argument
-- **WHEN** the budget ends inside a tool argument
-- **THEN** the gateway answers 400 with nothing usable, so tool calls get a generous floor
-  and long output is never put in a tool argument at all
-
-### Requirement: Concurrent work is capped
-Fan-out across chapters SHALL run through a concurrency-limited runner rather than issuing
-every call at once.
-
-#### Scenario: A document with twelve chapters is checked
-- **WHEN** per-chapter calls are issued
-- **THEN** no more than three are in flight at any moment
 
 ### Requirement: The gateway can be diagnosed without the application
 `GET /health/llm` SHALL report which backend served each of a requested number of calls, to

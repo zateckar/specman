@@ -3,6 +3,7 @@
 	import AgentChat from '$lib/components/AgentChat.svelte';
 	import ChapterIndex from '$lib/components/ChapterIndex.svelte';
 	import DocumentPreview from '$lib/components/DocumentPreview.svelte';
+	import { describeActivity, wordCount, type Activity } from '$lib/activity';
 	import { nextChapter } from '$lib/next-chapter';
 	import { readFrames } from '$lib/sse';
 
@@ -95,7 +96,17 @@
 	type ChatTurn = { role: 'user' | 'assistant'; content: string; options?: AnswerOption[] };
 	type AnswerOption = { label: string; recommended: boolean };
 
-	let running = $state<{ key: string; title: string; turns: ChatTurn[] } | null>(null);
+	let running = $state<{
+		key: string;
+		title: string;
+		turns: ChatTurn[];
+		/** What the assistant is doing, as the turn last said. */
+		activity: Activity | null;
+		/** The chapter being written, its text so far, and how long it is. */
+		writing: { key: string; words: number } | null;
+	} | null>(null);
+	/** Chapter text as it arrives, per chapter. Not state: the preview is fed through `applyChapter`. */
+	const drafting = new Map<string, string>();
 	/** Which pane a narrow window shows. Wide windows show both and ignore it. */
 	let pane = $state<'chat' | 'document'>('chat');
 	let errorMessage = $state('');
@@ -107,6 +118,26 @@
 	// where their answer went rather than assuming it was dropped.
 	const busyElsewhere = $derived(running !== null && running.key !== activeKey ? running.title : '');
 	const shownTurns = $derived<ChatTurn[]>(busyHere ? running!.turns : (data.messages as ChatTurn[]));
+	const activityText = $derived.by(() => {
+		if (!running) return '';
+		const key = running.activity?.chapter ?? null;
+		const title = key ? (chapters.find((c) => c.key === key)?.title ?? null) : null;
+		return describeActivity(running.activity, title, running.writing?.key === key ? running.writing.words : 0);
+	});
+
+	/**
+	 * More of a chapter the assistant is writing. Shown in the preview as it
+	 * arrives; nothing is saved until the turn is, and the refresh at the end of
+	 * the turn puts the stored text back if it fails.
+	 */
+	function applyDraft(body: Record<string, any>) {
+		if (!running) return;
+		const key = String(body.chapter);
+		const text = typeof body.markdown === 'string' ? body.markdown : (drafting.get(key) ?? '') + String(body.delta ?? '');
+		drafting.set(key, text);
+		applyChapter(key, text);
+		running.writing = { key, words: wordCount(text) };
+	}
 
 	const saveState = $derived<'saved' | 'saving' | 'not-recorded'>(
 		running !== null ? 'saving' : commitFailed ? 'not-recorded' : 'saved'
@@ -158,8 +189,11 @@
 				...(data.messages as ChatTurn[]),
 				{ role: 'user', content: message },
 				{ role: 'assistant', content: '' }
-			]
+			],
+			activity: null,
+			writing: null
 		};
+		drafting.clear();
 		errorMessage = '';
 		commitFailed = false;
 		let delivered = false;
@@ -197,7 +231,14 @@
 					const body = payload as Record<string, any>;
 					if (name === 'text') updateLast((turn) => (turn.content += body.delta));
 					else if (name === 'options') updateLast((turn) => (turn.options = body.options));
-					else if (name === 'chapter') applyChapter(body.key, body.markdown);
+					else if (name === 'activity') {
+						if (running) running.activity = { doing: String(body.doing), chapter: body.chapter ?? null };
+					} else if (name === 'drafting') applyDraft(body);
+					else if (name === 'chapter') {
+						applyChapter(body.key, body.markdown);
+						// Saved now, so no longer "being written".
+						if (running?.writing?.key === body.key) running.writing = null;
+					}
 					else if (name === 'requirement') applyRequirement(body);
 					else if (name === 'decision') applyDecision(body);
 					else if (name === 'state') applyState(body.key, body.status, body.openQuestions);
@@ -262,7 +303,7 @@
 		if (running) return;
 
 		const key = activeKey;
-		running = { key, title: chatTitle, turns: [...(data.messages as ChatTurn[])] };
+		running = { key, title: chatTitle, turns: [...(data.messages as ChatTurn[])], activity: null, writing: null };
 		appendTurn({ role: 'assistant', content: question });
 
 		try {
@@ -342,6 +383,7 @@
 			written={!!active?.content_md?.trim()}
 			turns={shownTurns}
 			busy={busyHere}
+			activity={activityText}
 			{busyElsewhere}
 			{saveState}
 			{errorMessage}
@@ -362,6 +404,7 @@
 		activeKey={data.activeKey}
 		{pendingChanges}
 		projectId={data.project.id}
+		writingKey={running?.writing?.key ?? null}
 	/>
 </div>
 

@@ -1,4 +1,7 @@
 import { config } from '../env';
+import { mayAskNext, ModelRouting, type Route } from './fallback';
+import { GeminiProvider } from './gemini';
+import { GatewayError, MAX_ATTEMPTS, Stalled, backoffMs, sleep, withinIdleLimit } from './transport';
 import type {
 	LlmProvider,
 	StreamEvent,
@@ -7,6 +10,8 @@ import type {
 	ToolRequest,
 	ToolResponse
 } from './types';
+
+export { GatewayError };
 
 /**
  * Client for the LLM gateway.
@@ -59,23 +64,8 @@ const RETRYABLE_400_MARKERS = [
 	...config.retryable400
 ];
 
-const MAX_ATTEMPTS = 4;
-
 /** Truncation is fatal on this gateway, so never send a stingy budget with tools. */
 const MIN_TOOL_MAX_TOKENS = 1500;
-
-export class GatewayError extends Error {
-	readonly status: number;
-	readonly body: string;
-	readonly retryable: boolean;
-	constructor(message: string, status: number, body: string, retryable: boolean) {
-		super(message);
-		this.status = status;
-		this.body = body;
-		this.retryable = retryable;
-		this.name = 'GatewayError';
-	}
-}
 
 /** An error the gateway sent inside a stream it had already started. */
 class StreamInterrupted extends GatewayError {
@@ -87,47 +77,11 @@ class StreamInterrupted extends GatewayError {
 /** The in-stream equivalents of a 429 or a 5xx. */
 const RETRYABLE_STREAM_ERRORS = ['overloaded_error', 'api_error', 'rate_limit_error', 'timeout_error'];
 
-/**
- * How long the gateway may go without sending anything.
- *
- * A reasoning model streams its thinking as it goes, so silence this long is a
- * backend that has stopped, not one that is thinking hard. Without a limit, a
- * stalled call held the turn — and the colleague's "writing" mark — for ever.
- */
-function idleLimitMs(): number {
-	const configured = Number(process.env.LLM_IDLE_TIMEOUT_MS);
-	return Number.isFinite(configured) && configured > 0 ? configured : 180_000;
-}
-
-/** `stop` abandons the request itself, so a stalled call does not linger after it is given up on. */
-async function withinIdleLimit<T>(work: Promise<T>, doing: 'answer' | 'continue', stop: () => void): Promise<T> {
-	let timer: ReturnType<typeof setTimeout> | undefined;
-	const limit = idleLimitMs();
-	const expired = new Promise<never>((_, reject) => {
-		timer = setTimeout(() => {
-			stop();
-			reject(new GatewayError(`The gateway did not ${doing} within ${Math.round(limit / 1000)} seconds.`, 504, '', true));
-		}, limit);
-	});
-	try {
-		return await Promise.race([work, expired]);
-	} finally {
-		clearTimeout(timer);
-	}
-}
-
 function isRetryable(status: number, body: string): boolean {
 	if (status === 429 || status >= 500) return true;
 	if (status === 400) return RETRYABLE_400_MARKERS.some((m) => body.includes(m));
 	return false;
 }
-
-function backoffMs(attempt: number): number {
-	// 300ms, 900ms, 2.7s — with jitter so concurrent turns don't retry in lockstep.
-	return Math.round(300 * 3 ** (attempt - 1) * (0.75 + Math.random() * 0.5));
-}
-
-const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
 interface AnthropicContentBlock {
 	type: string;
@@ -159,6 +113,17 @@ async function postJson(body: unknown, signal?: AbortSignal): Promise<Response> 
 
 export class GatewayProvider implements LlmProvider {
 	readonly id = 'llm-gateway';
+
+	/**
+	 * @param retryStalls Whether a call that went silent for the whole idle limit
+	 *   is made again. Not when there is a fallback to ask instead: four waits of
+	 *   three minutes each is a quarter of an hour before Gemini is tried.
+	 */
+	private readonly retryStalls: () => boolean;
+
+	constructor(retryStalls: () => boolean = () => true) {
+		this.retryStalls = retryStalls;
+	}
 
 	/**
 	 * Streamed, tool-free generation. Used for chapter prose and chat replies.
@@ -220,6 +185,7 @@ export class GatewayProvider implements LlmProvider {
 			} catch (cause) {
 				if (signal?.aborted) throw cause;
 				if (attempt === MAX_ATTEMPTS) throw cause;
+				if (cause instanceof Stalled && !this.retryStalls()) throw cause;
 				await sleep(backoffMs(attempt));
 				continue;
 			}
@@ -367,6 +333,7 @@ export class GatewayProvider implements LlmProvider {
 				if (req.signal?.aborted) throw cause;
 				lastError = cause;
 				if (attempt === MAX_ATTEMPTS) break;
+				if (cause instanceof Stalled && !this.retryStalls()) break;
 				await sleep(backoffMs(attempt));
 				continue;
 			}
@@ -431,4 +398,82 @@ export class GatewayProvider implements LlmProvider {
 	}
 }
 
-export const gateway = new GatewayProvider();
+/** Neither the primary gateway nor Gemini is set up. */
+export class NoModelConfigured extends Error {
+	constructor() {
+		super('No language model is configured. Set LLM_URL, LLM_API_KEY and LLM_MODEL, or GEMINI_API_KEY. See .env.example.');
+		this.name = 'NoModelConfigured';
+	}
+}
+
+const describe = (cause: unknown) => (cause instanceof Error ? cause.message : String(cause));
+const label = (route: Route) => (route === 'primary' ? 'the primary gateway' : 'Gemini');
+
+/**
+ * Every model call goes through here: to the primary gateway when it is
+ * configured and answering, and to Gemini when it is not. The rule for when a
+ * failed call may go elsewhere is in `fallback.ts`.
+ */
+export class ModelProvider implements LlmProvider {
+	readonly id = 'models';
+	readonly routing = new ModelRouting();
+	readonly primary: LlmProvider;
+	readonly fallback: LlmProvider;
+
+	constructor(primary: LlmProvider, fallback: LlmProvider) {
+		this.primary = primary;
+		this.fallback = fallback;
+	}
+
+	private order(): Route[] {
+		const order = this.routing.order(config.primaryConfigured, Boolean(config.geminiKey));
+		if (order.length === 0) throw new NoModelConfigured();
+		return order;
+	}
+
+	private provider(route: Route): LlmProvider {
+		return route === 'primary' ? this.primary : this.fallback;
+	}
+
+	async *streamChat(req: StreamRequest): AsyncIterable<StreamEvent> {
+		const order = this.order();
+		for (const [index, route] of order.entries()) {
+			let passedOn = false;
+			try {
+				for await (const event of this.provider(route).streamChat(req)) {
+					if (event.type === 'text') passedOn = true;
+					yield event;
+				}
+				this.routing.succeeded(route);
+				return;
+			} catch (cause) {
+				if (!req.signal?.aborted) this.routing.failed(route);
+				const next = order[index + 1];
+				if (!next || !mayAskNext(passedOn, Boolean(req.signal?.aborted))) throw cause;
+				console.warn(`[llm] ${label(route)} failed (${describe(cause)}); asking ${label(next)} instead`);
+			}
+		}
+	}
+
+	async callWithTools(req: ToolRequest): Promise<ToolResponse> {
+		const order = this.order();
+		for (const [index, route] of order.entries()) {
+			try {
+				const result = await this.provider(route).callWithTools(req);
+				this.routing.succeeded(route);
+				return result;
+			} catch (cause) {
+				if (!req.signal?.aborted) this.routing.failed(route);
+				const next = order[index + 1];
+				if (!next || !mayAskNext(false, Boolean(req.signal?.aborted))) throw cause;
+				console.warn(`[llm] ${label(route)} failed (${describe(cause)}); asking ${label(next)} instead`);
+			}
+		}
+		throw new NoModelConfigured();
+	}
+}
+
+export const gateway = new ModelProvider(
+	new GatewayProvider(() => !config.geminiKey),
+	new GeminiProvider()
+);

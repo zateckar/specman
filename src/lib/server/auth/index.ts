@@ -1,7 +1,7 @@
 import { randomBytes, scrypt, scryptSync, timingSafeEqual } from 'node:crypto';
 import { db, countUsers, getUser, getUserByUsername } from '../db';
 import { config } from '../env';
-import { mayAssertIdentity, readForwardedIdentity } from '../llm/forwarded';
+import { readForwardedIdentity } from '../llm/forwarded';
 import type { User } from '../db/types';
 
 const SESSION_DAYS = 14;
@@ -151,27 +151,20 @@ export const SESSION_COOKIE = 'specman_session';
  * later by something, and "later, by something" is the shape this codebase has a
  * rule against.
  *
- * Returns null whenever the request asserts nothing, is not allowed to assert
- * it, or names an account that signs in another way — with a password or through
- * company sign-in. A proxy header is a string the caller chose, and a matching
- * name is not proof of anything.
+ * The header is believed whenever proxy sign-in is on. Turning it on is the
+ * operator saying the proxy is the only route here and overwrites the header;
+ * a list of addresses kept beside that said the same thing again, and while it
+ * was empty, rights granted on the people page silently did nothing.
+ *
+ * Returns null whenever the request asserts nothing, or names an account that
+ * signs in another way — with a password or through company sign-in. A header
+ * naming "admin" is not the administrator's password.
  */
-export function userForProxyHeaders(
-	header: (name: string) => string | null,
-	peer: string | null
-): User | null {
+export function userForProxyHeaders(header: (name: string) => string | null): User | null {
 	if (!config.proxyAuthEnabled) return null;
 
 	const identity = readForwardedIdentity(header);
 	if (!identity) return null;
-
-	if (!mayAssertIdentity(peer, config.proxyAuthTrustedIps)) {
-		console.warn(
-			`[proxy-auth] refused "${identity.username}" asserted by ${peer ?? 'an unknown peer'}` +
-				' — not in PROXY_AUTH_TRUSTED_IPS'
-		);
-		return null;
-	}
 
 	const local = db()
 		.prepare(
@@ -211,7 +204,7 @@ export function userForProxyHeaders(
 		if (local.created_via === '') {
 			db().prepare(`UPDATE users SET created_via = 'proxy' WHERE id = ?`).run(local.id);
 		}
-		return withheldRights(getUser(local.id) ?? null);
+		return getUser(local.id) ?? null;
 	}
 
 	// Registered as an ordinary user, exactly as company sign-in does. What
@@ -230,46 +223,19 @@ export function userForProxyHeaders(
 }
 
 /**
- * The user as a header may present them.
+ * Says once, at boot, what the configuration trusts.
  *
- * With no trusted peers configured, anyone who can reach the port can send the
- * header, so naming a colleague who was later made an administrator would be
- * the whole system. Rights granted on the people page are honoured through the
- * header only once the server can check who sent it; until then that colleague
- * works here as an ordinary user, and the bootstrap password still gets an
- * administrator in.
- */
-function withheldRights(user: User | null): User | null {
-	if (!user || !user.is_admin || config.proxyAuthTrustedIps.length > 0) return user;
-	return { ...user, is_admin: 0 };
-}
-
-/**
- * Says once, at boot, what the configuration actually trusts.
- *
- * An operator who has not set `PROXY_AUTH_TRUSTED_IPS` has decided — usually
- * without knowing it — that any caller who can reach the port may claim to be
- * any user. That is correct behind a proxy and catastrophic in front of one, and
- * the difference is invisible from inside the application.
+ * Correct behind a proxy and catastrophic in front of one, and the difference is
+ * invisible from inside the application — so the log says which it assumes.
  */
 export function reportProxyAuthPosture(): void {
 	if (!config.proxyAuthEnabled) {
 		console.info('[proxy-auth] disabled — X-Forwarded-User is ignored');
 		return;
 	}
-
-	const trusted = config.proxyAuthTrustedIps;
-	if (trusted.length > 0) {
-		console.info(`[proxy-auth] enabled, trusting ${trusted.length} peer(s): ${trusted.join(', ')}`);
-		return;
-	}
-
-	console.warn(
-		'[proxy-auth] enabled with NO trusted peers configured. Any caller that can reach this ' +
-			'port may sign in as any account the proxy registered, and register new ones, by ' +
-			'sending X-Forwarded-User. Administrator rights are not honoured through the header ' +
-			'until the sender can be checked, so administrators must use a password or company ' +
-			'sign-in. This is only safe if a reverse proxy is the sole route here and it overwrites ' +
-			'that header. Set PROXY_AUTH_TRUSTED_IPS, or PROXY_AUTH_ENABLED=false if there is no proxy.'
+	console.info(
+		'[proxy-auth] enabled — X-Forwarded-User is believed from any caller, so the reverse proxy ' +
+			'must be the only route here and must overwrite that header. Set PROXY_AUTH_ENABLED=false ' +
+			'if there is no proxy.'
 	);
 }

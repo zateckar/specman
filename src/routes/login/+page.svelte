@@ -9,6 +9,20 @@
 		<h1>Sign in</h1>
 		<p class="sub">Specman helps you describe the application you want built.</p>
 
+		<!-- Reached through the company gateway, which has already said who this
+		     is. Carrying on needs nothing; the form below is for another account,
+		     such as an administrator's. -->
+		{#if data.gatewayUser}
+			<div class="gateway">
+				<p>The company gateway signed you in as <strong>{data.gatewayUser}</strong>.</p>
+				<a class="continue" href={data.next} data-sveltekit-reload>Continue as {data.gatewayUser}</a>
+				<p class="note">Or sign in with another account below.</p>
+				{#if data.gatewayLogoutUrl}
+					<a class="away" href={data.gatewayLogoutUrl} data-sveltekit-reload>Sign out of the company gateway</a>
+				{/if}
+			</div>
+		{/if}
+
 		{#if form?.message}
 			<p class="error">{form.message}</p>
 		{/if}
@@ -35,7 +49,9 @@
 		{#if data.oidcAvailable}
 			<a class="sso" href="/login/oidc">Sign in with your company account</a>
 
-			<details open={Boolean(form?.message)}>
+			<!-- Open for someone the gateway already signed in: another account is what
+			     they came here for, and it is usually the administrator's password. -->
+			<details open={Boolean(form?.message) || Boolean(data.gatewayUser)}>
 				<summary>Use a local account instead</summary>
 				{@render passwordForm()}
 				<p class="note">
@@ -139,5 +155,39 @@
 		font-size: 12.5px;
 		color: var(--ink-soft);
 		margin: 12px 0 0;
+	}
+
+	.gateway {
+		background: var(--accent-soft);
+		border-radius: 7px;
+		padding: 12px 14px;
+		margin-bottom: 18px;
+		font-size: 14px;
+	}
+
+	.gateway p {
+		margin: 0 0 10px;
+	}
+
+	.gateway .note {
+		margin: 10px 0 0;
+	}
+
+	.continue {
+		display: block;
+		text-align: center;
+		padding: 9px;
+		border-radius: 7px;
+		border: 1px solid var(--accent);
+		background: #fff;
+		color: var(--accent);
+		font-weight: 600;
+		text-decoration: none;
+	}
+
+	.away {
+		display: inline-block;
+		margin-top: 8px;
+		font-size: 12.5px;
 	}
 </style>

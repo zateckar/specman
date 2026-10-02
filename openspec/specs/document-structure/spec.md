@@ -120,6 +120,15 @@ whole-document view SHALL leave it out.
 - **WHEN** the whole document is shown
 - **THEN** set-aside chapters are not among it, as they are not in the handoff
 
+### Requirement: A chapter being written is marked as unsaved
+The document pane SHALL mark the chapter the assistant is writing as being written, in place
+of its status, until the turn saves it.
+
+#### Scenario: Watching a chapter arrive
+- **WHEN** the chapter's text is streaming into the pane
+- **THEN** it is labelled as being written rather than with its stored status, because the text
+  shown is not saved until the turn is, and a failed turn puts the stored text back
+
 ### Requirement: Sub-chapter position is relative to the parent
 Ordering SHALL be stored relative to the parent so a parent can move without renumbering
 anything beneath it.

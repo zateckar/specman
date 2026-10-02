@@ -77,7 +77,11 @@ import {
 } from '../src/lib/server/llm/archimate.ts';
 import { renderMarkdown, safeUrl } from '../src/lib/safe-markdown.ts';
 import { createSink, sseFrame } from '../src/lib/server/llm/sink.ts';
-import { attemptAddress, mayAssertIdentity, readForwardedIdentity } from '../src/lib/server/llm/forwarded.ts';
+import { attemptAddress, readForwardedIdentity } from '../src/lib/server/llm/forwarded.ts';
+import { ending, geminiBody, geminiModelPath, geminiRetryable, readGeminiPayload } from '../src/lib/server/llm/gemini-format.ts';
+import { ModelRouting, PRIMARY_REST_MS, mayAskNext } from '../src/lib/server/llm/fallback.ts';
+import { DRAFT_EVERY_MS, TurnProgress } from '../src/lib/server/llm/progress.ts';
+import { describeActivity, wordCount } from '../src/lib/activity.ts';
 import { safeReturnPath } from '../src/lib/server/llm/return-path.ts';
 import { describeFailure } from '../src/lib/server/llm/failures.ts';
 import { FREE_ATTEMPTS, SignInAttempts } from '../src/lib/server/llm/attempts.ts';
@@ -1951,25 +1955,12 @@ check(
 	'novak.jan'
 );
 
-// Who may claim to be someone. With nothing configured, anyone may — which is
-// the documented default and the reason the server warns at boot.
-check('with no list configured, any peer may assert', mayAssertIdentity('203.0.113.9', []), true);
-check('a listed peer may assert', mayAssertIdentity('10.0.0.4', ['10.0.0.4']), true);
-check('an unlisted peer may not', mayAssertIdentity('203.0.113.9', ['10.0.0.4']), false);
-check('an unknown peer may not, once a list exists', mayAssertIdentity(null, ['10.0.0.4']), false);
-
-// An IPv4 peer arriving mapped into IPv6 is the same machine. An operator should
-// not have to know the socket did that to write the address down.
-check('an IPv4-mapped peer matches its plain form', mayAssertIdentity('::ffff:10.0.0.4', ['10.0.0.4']), true);
-check('and the other way round', mayAssertIdentity('10.0.0.4', ['::ffff:10.0.0.4']), true);
-check('a blank entry does not match everything', mayAssertIdentity('10.0.0.9', ['', '10.0.0.4']), false);
-
 // Which address a failed password is counted against. Behind the proxy, every
 // attempt came from the proxy, and one person's typos locked out everyone.
-check('behind a trusted proxy, the caller it saw is counted', attemptAddress('10.0.0.4', '198.51.100.7, 192.0.2.1', ['10.0.0.4']), '192.0.2.1');
-check('an untrusted peer cannot choose its own address', attemptAddress('203.0.113.9', '192.0.2.1', ['10.0.0.4']), '203.0.113.9');
-check('with no proxy configured the header is ignored', attemptAddress('203.0.113.9', '192.0.2.1', []), '203.0.113.9');
-check('a trusted proxy that sent no header is counted itself', attemptAddress('10.0.0.4', null, ['10.0.0.4']), '10.0.0.4');
+check('behind the proxy, the caller it saw is counted', attemptAddress('10.0.0.4', '198.51.100.7, 192.0.2.1', true), '192.0.2.1');
+check('without proxy sign-in the header is nobody\'s word', attemptAddress('203.0.113.9', '192.0.2.1', false), '203.0.113.9');
+check('a proxy that sent no header is counted itself', attemptAddress('10.0.0.4', null, true), '10.0.0.4');
+check('an empty header is no address', attemptAddress('10.0.0.4', ' , ', true), '10.0.0.4');
 
 console.log('\n--- one writer at a time, per repository ---');
 
@@ -2304,6 +2295,158 @@ console.log('\n--- keeping a quiet stream open ---');
 	sink.disconnect();
 	sink.ping();
 	check('and is not sent once the browser has gone', frames.length, 1);
+}
+
+console.log('\n--- asking Gemini ---');
+
+{
+	const body = geminiBody({
+		system: 'Be brief.',
+		messages: [
+			{ role: 'user', content: 'Hello' },
+			{ role: 'assistant', content: 'Hi' },
+			{ role: 'user', content: 'Again' }
+		],
+		maxTokens: 16000
+	});
+	check('the system prompt is an instruction, not a turn', body.systemInstruction, { parts: [{ text: 'Be brief.' }] });
+	check('the assistant speaks as the model', body.contents.map((turn) => turn.role), ['user', 'model', 'user']);
+	check('the whole budget is passed on', body.generationConfig, { maxOutputTokens: 16000 });
+	check('a prose call carries no tools', [body.tools, body.toolConfig], [undefined, undefined]);
+
+	const schema = { type: 'object', properties: { status: { type: 'string', enum: ['done'] } }, required: ['status'] };
+	const forced = geminiBody({
+		messages: [{ role: 'user', content: 'Record it' }],
+		maxTokens: 1500,
+		tools: [{ name: 'record', description: 'Record', input_schema: schema }],
+		forceTool: 'record'
+	});
+	check('a tool keeps its JSON Schema as it is', forced.tools[0].functionDeclarations[0].parametersJsonSchema, schema);
+	check('a forced tool is the only one allowed', forced.toolConfig, {
+		functionCallingConfig: { mode: 'ANY', allowedFunctionNames: ['record'] }
+	});
+	check('no system prompt, no instruction', 'systemInstruction' in forced, false);
+
+	const chunk = readGeminiPayload({
+		candidates: [{ content: { parts: [{ text: 'weighing it', thought: true }, { text: 'Hello' }] } }],
+		modelVersion: 'gemini-2.5-flash'
+	});
+	check('a thought is never the answer', [chunk.text, chunk.thinking], ['Hello', 'weighing it']);
+	check('the serving model is reported', chunk.model, 'gemini-2.5-flash');
+	check('a chunk mid-answer has not finished', chunk.finishReason, null);
+
+	const last = readGeminiPayload({
+		candidates: [{ content: { parts: [{ text: '.' }] }, finishReason: 'STOP' }],
+		usageMetadata: { candidatesTokenCount: 40, thoughtsTokenCount: 900 }
+	});
+	check('the last chunk says how it finished', last.finishReason, 'STOP');
+	check('reasoning counts against the budget with the answer', last.outputTokens, 940);
+
+	const call = readGeminiPayload({
+		candidates: [{ content: { parts: [{ functionCall: { name: 'record', args: { status: 'done' } } }] }, finishReason: 'STOP' }]
+	});
+	check('a function call is read as a tool call', call.calls, [{ name: 'record', input: { status: 'done' } }]);
+
+	check('a refused question finishes with the reason', readGeminiPayload({ promptFeedback: { blockReason: 'SAFETY' } }).finishReason, 'SAFETY');
+	check('an error frame is an error', readGeminiPayload({ error: { code: 503, status: 'UNAVAILABLE', message: 'busy' } }).error, {
+		code: 503, status: 'UNAVAILABLE', message: 'busy'
+	});
+
+	check('STOP is the only ordinary ending', [ending('STOP'), ending('MAX_TOKENS'), ending('SAFETY'), ending('MALFORMED_FUNCTION_CALL')],
+		['complete', 'out-of-room', 'refused', 'refused']);
+	check('busy and failing are worth asking again', [geminiRetryable(429), geminiRetryable(503), geminiRetryable(200, 'RESOURCE_EXHAUSTED')], [true, true, true]);
+	check('a bad request or a bad key is not', [geminiRetryable(400), geminiRetryable(403)], [false, false]);
+	check('a model named with its prefix is the same model', geminiModelPath('models/gemini-flash-latest'), 'gemini-flash-latest');
+}
+
+console.log('\n--- which model answers ---');
+
+{
+	let now = 1_000_000;
+	const routing = new ModelRouting(() => now);
+	check('the primary is asked first, Gemini after', routing.order(true, true), ['primary', 'fallback']);
+	check('without Gemini, only the primary', routing.order(true, false), ['primary']);
+	check('without the primary, Gemini alone', routing.order(false, true), ['fallback']);
+	check('with neither, nobody', routing.order(false, false), []);
+
+	routing.failed('primary');
+	check('a primary that has just failed is asked second', routing.order(true, true), ['fallback', 'primary']);
+	check('but still asked, when it is all there is', routing.order(true, false), ['primary']);
+	now += PRIMARY_REST_MS - 1;
+	check('for the whole of its rest', routing.order(true, true)[0], 'fallback');
+	now += 1;
+	check('and first again after it', routing.order(true, true)[0], 'primary');
+
+	routing.failed('primary');
+	routing.succeeded('primary');
+	check('a primary that answers is trusted again at once', routing.order(true, true)[0], 'primary');
+	routing.failed('fallback');
+	check('Gemini failing does not rest the primary', routing.order(true, true)[0], 'primary');
+
+	check('a call that failed before passing anything on goes elsewhere', mayAskNext(false, false), true);
+	check('one that already passed text on does not — it would be repeated', mayAskNext(true, false), false);
+	check('nor one the caller gave up on', mayAskNext(false, true), false);
+}
+
+console.log('\n--- showing the writing as it happens ---');
+
+{
+	const parser = new ChapterStreamParser();
+	parser.push('<chapter key="overview">\n# Overview\n\nFleet cars are booked');
+	check('an open chapter is visible while it is written', [parser.writing.tag, parser.writing.attrs.key, parser.writing.index], ['chapter', 'overview', 0]);
+	check('without the characters that might begin its closing tag',
+		parser.writing.body.endsWith('booked'), false);
+	check('but with what is safely written', parser.writing.body.includes('# Overview'), true);
+	parser.push(' by staff.</chapter>');
+	check('between blocks nothing is being written', parser.writing, null);
+	parser.push('<requirement scope="now">Cars');
+	check('the next block has the next place', parser.writing.index, 1);
+}
+
+{
+	let now = 0;
+	const progress = new TurnProgress(() => now);
+	const key = (attrs) => (attrs.key === 'nowhere' ? null : attrs.key || 'overview');
+	const open = (index, tag, body, attrs = {}) => ({ index, tag, attrs, body });
+
+	let update = progress.observe(open(0, 'chapter', 'Fleet', { key: 'overview' }), [], false, key);
+	check('opening a chapter says which one is being written', update.activity, { doing: 'writing', chapter: 'overview' });
+	check('and sends what is there at once', update.drafts, [{ chapter: 'overview', delta: 'Fleet' }]);
+
+	now += DRAFT_EVERY_MS - 1;
+	update = progress.observe(open(0, 'chapter', 'Fleet cars', { key: 'overview' }), [], false, key);
+	check('more text within the interval waits', [update.activity, update.drafts], [undefined, []]);
+	now += 1;
+	update = progress.observe(open(0, 'chapter', 'Fleet cars are', { key: 'overview' }), [], false, key);
+	check('and is sent as only what is new', update.drafts, [{ chapter: 'overview', delta: ' cars are' }]);
+
+	update = progress.observe(null, [{ tag: 'chapter', body: 'Fleet cars are booked.' }], false, key);
+	check('a closed chapter is sent whole, as it will be saved', update.drafts, [{ chapter: 'overview', markdown: 'Fleet cars are booked.' }]);
+	check('and between blocks the assistant is thinking', update.activity, { doing: 'thinking', chapter: null });
+
+	update = progress.observe(open(1, 'requirement', 'Cars'), [{ tag: 'chapter', body: '' }], false, key);
+	check('a rule being written is noted, not sent', [update.activity, update.drafts], [{ doing: 'noting', chapter: null }, []]);
+
+	update = progress.observe(null, [{ tag: 'chapter', body: '' }, { tag: 'requirement', body: 'Cars' }], true, key);
+	check('the reply is the reply', update.activity, { doing: 'replying', chapter: null });
+	update = progress.observe(null, [{ tag: 'chapter', body: '' }, { tag: 'requirement', body: 'Cars' }], false, key);
+	check('and a pause in it is still the reply', update.activity, undefined);
+
+	const lost = new TurnProgress(() => now);
+	update = lost.observe(open(0, 'chapter', 'Text', { key: 'nowhere' }), [], false, key);
+	check('a chapter that cannot be placed is still named as writing', update.activity, { doing: 'writing', chapter: null });
+	check('but nothing of it reaches a chapter it may not belong to', update.drafts, []);
+}
+
+{
+	check('the chat says which chapter is being written, and how far', describeActivity({ doing: 'writing', chapter: 'overview' }, 'Overview', 420),
+		'Writing “Overview” — 420 words so far…');
+	check('before any words, no count', describeActivity({ doing: 'writing', chapter: 'overview' }, 'Overview', 0), 'Writing “Overview”…');
+	check('a chapter without a title is still being written', describeActivity({ doing: 'writing', chapter: null }, null, 1), 'Writing the chapter — 1 word so far…');
+	check('before anything, thinking', describeActivity(null, null), 'Thinking…');
+	check('the second call has its own words', describeActivity({ doing: 'checking', chapter: 'overview' }, 'Overview'), 'Checking what is still open…');
+	check('as does the commit', describeActivity({ doing: 'saving', chapter: null }, null), 'Saving to the history…');
+	check('markdown marks are not words', wordCount('# Overview\n\n- Fleet cars — booked by *staff*.\n'), 6);
 }
 
 console.log(`\n${pass} passed, ${fail} failed`);

@@ -34,6 +34,7 @@ import {
 } from '$lib/server/llm/agent';
 import { parseOptions, reconcileAssessment } from '$lib/server/llm/questions';
 import { presence } from '$lib/server/llm/presence';
+import { TurnProgress } from '$lib/server/llm/progress';
 import { createSink, type TurnSink } from '$lib/server/llm/sink';
 import { commitDocument } from '$lib/server/proposals';
 import type { Chapter } from '$lib/server/db/types';
@@ -67,6 +68,9 @@ function draftTarget(written: string, chapters: Chapter[], active: Chapter | nul
  *
  * Events:
  *   text     { delta }                     — conversational reply, token by token
+ *   activity { doing, chapter }            — what the assistant is doing: thinking,
+ *                                            writing, noting, replying, checking, saving
+ *   drafting { chapter, delta | markdown } — a chapter as it is being written; not saved
  *   chapter  { key, markdown }             — a chapter the agent rewrote
  *   requirement { ... }                    — a rule the agent settled
  *   decision { ... }                       — something settled, and by whom
@@ -138,6 +142,17 @@ export const POST: RequestHandler = async ({ request, locals }) => {
 				if (chapter.applicable === 0) setChapterApplicable(project.id, chapter.key, true);
 			};
 
+			// What the assistant is doing while nothing it writes is for the chat —
+			// the chapter comes first and the reply last. See `llm/progress.ts`.
+			const progress = new TurnProgress();
+			const chapterFor = (attrs: Record<string, string>) =>
+				draftTarget((attrs.key ?? '').trim(), chapters, active)?.key ?? null;
+			const report = (replied: boolean) => {
+				const update = progress.observe(parser.writing, parser.blocks, replied, chapterFor);
+				if (update.activity) send('activity', update.activity);
+				for (const draft of update.drafts) send('drafting', draft);
+			};
+
 			try {
 				const conversation = toChatMessages(history, message);
 
@@ -161,6 +176,7 @@ export const POST: RequestHandler = async ({ request, locals }) => {
 							reply += visible;
 							send('text', { delta: visible });
 						}
+						report(visible.trim().length > 0);
 					}
 					// `thinking` events are intentionally dropped — reasoning output is
 					// never shown to the user, and never stored in the transcript.
@@ -171,6 +187,7 @@ export const POST: RequestHandler = async ({ request, locals }) => {
 					reply += tail;
 					send('text', { delta: tail });
 				}
+				report(tail.trim().length > 0);
 
 				// Answers the agent offered for the question it just asked. Stored with
 				// the message so they survive a reload, not just this stream.
@@ -385,6 +402,9 @@ export const POST: RequestHandler = async ({ request, locals }) => {
 				if (assessKey) {
 					const chapter = getChapter(project.id, assessKey);
 					if (chapter) {
+						// A second model call, after the reply has finished: without a
+						// word, the reply looked done and the box stayed locked.
+						send('activity', { doing: 'checking', chapter: assessKey });
 						const assessment = reconcileAssessment(
 							await assessChapter({
 								chapter,
@@ -429,6 +449,7 @@ export const POST: RequestHandler = async ({ request, locals }) => {
 
 				// --- Record the change on the proposal branch.
 				if (touched.length > 0) {
+					send('activity', { doing: 'saving', chapter: null });
 					try {
 						const titles = touched
 							.map((k) => getChapter(project.id, k)?.title ?? k)

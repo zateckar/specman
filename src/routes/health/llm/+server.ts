@@ -7,7 +7,8 @@ import type { RequestHandler } from './$types';
  * Diagnostics for the gateway.
  *
  * Exercises both call shapes and reports which backend actually served each —
- * the only way to see the load-balancer routing that drives the retry logic.
+ * the only way to see the load-balancer routing that drives the retry logic,
+ * and whether the primary gateway or Gemini answered.
  *
  * GET /health/llm?runs=3
  *
@@ -101,8 +102,16 @@ export const GET: RequestHandler = async ({ url, locals }) => {
 	const okCount = (list: unknown[]) => list.filter((r: any) => r.ok).length;
 
 	return json({
-		gateway: config.gatewayUrl,
-		models: { prose: config.proseModel, tools: config.toolModel },
+		// Either may be absent: an installation with only a Gemini key is a working
+		// one, and reading the primary's settings there threw before anything ran.
+		providers: {
+			primary: config.primaryConfigured
+				? { gateway: config.gatewayUrl, models: { prose: config.proseModel, tools: config.toolModel } }
+				: null,
+			gemini: config.geminiKey ? { model: config.geminiModel } : null,
+			// Passed over for a while after failing, so Gemini answered instead.
+			primaryResting: gateway.routing.resting()
+		},
 		runs,
 		summary: {
 			prose: `${okCount(prose)}/${runs}`,

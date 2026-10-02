@@ -186,6 +186,17 @@ innocent.** The document revision counted the assessor's verdict as a change, so
 whose turn only asked a question back failed someone else's slower turn and threw away what
 it had written. Optimistic concurrency is only as good as its idea of what a change is.
 
+**A setting that is documented and read is not a feature.** `GEMINI_API_KEY` and
+`GEMINI_MODEL` were in `.env.example`, described as the fallback, and read by `env.ts` —
+and nothing called them. An installation with only Gemini configured failed every assistant
+feature on `LLM_URL`. The documentation check proves every file is described; it cannot
+prove a described setting is used. Grep for the getter, not the variable.
+
+**Slow and silent feel the same.** A turn streamed text for its whole length, and the user
+saw an empty bubble for most of it, because the model writes the chapter first and the reply
+last. Nothing was slow that had not been slow before; it was only invisible. Say what is
+happening before making it happen faster.
+
 ## Where to go next
 
 Nothing in this plan is outstanding. These are the gaps, and each is a candidate for the
@@ -231,11 +242,13 @@ first folder under `openspec/changes/`:
   journal have no recoverable authorization record.
 - **Proxy sign-in trusts a header.** `X-Forwarded-User` is a string the caller chose. It is
   safe only while the proxy overwrites it on every request *and* nothing else can reach the
-  port. `PROXY_AUTH_TRUSTED_IPS` makes the second checkable here; the first is the proxy's
-  configuration and cannot be verified from inside the application. Confirmed by the
-  operator on 2026-09-29: the proxy overwrites, so the assumption holds for this
-  deployment and for no other. See
-  `openspec/changes/archive/2026-09-29-sign-in-through-the-reverse-proxy/proposal.md`.
+  port. Neither can be verified from inside the application, and since 2026-10-02 neither is
+  checked: leaving `PROXY_AUTH_ENABLED` on is the operator saying both hold, and rights
+  granted on the People page apply through the header. `PROXY_AUTH_TRUSTED_IPS` was removed
+  at the operator's request — kept beside the switch it said the same thing again, and while
+  it was empty administrators lost their rights without a word. Confirmed by the operator on
+  2026-09-29: the proxy overwrites, so the assumption holds for this deployment and for no
+  other. See `openspec/changes/archive/2026-09-29-sign-in-through-the-reverse-proxy/proposal.md`.
 - **A commit is attributed to one chapter and may carry another's work.** A repository has
   one working tree and `commitAll` stages all of it, so when two turns overlap, whichever
   commits first sweeps up whatever the other has already written. Observed with two
@@ -263,12 +276,18 @@ first folder under `openspec/changes/`:
   capability, not a setting.
 - **Unsent answers live in the browser tab.** A draft survives switching chapters, not a
   reload or a second tab.
-- **Administrator rights through the proxy need `PROXY_AUTH_TRUSTED_IPS`.** With it unset,
-  anyone who can reach the port can send the header, so a person the gateway signs in is
-  treated as an ordinary user whatever the People page says. Behind the compose file's
-  loopback binding that is every proxied administrator until the gateway's address — as the
-  container sees it, usually the Docker bridge — is configured. Administrators can still sign
-  in with a password or a company account.
+- **A session outranks the proxy.** Someone who signs in here with a password stays that
+  account until they sign out, whoever the gateway says they are — that is what lets an
+  administrator behind the proxy reach their own account. It also means a password session
+  outlives the directory disabling the person the gateway knew; the password is its own
+  credential, and the session its own fourteen days.
+- **Gemini is asked only before anything was passed on.** A primary that fails part-way
+  through a reply fails the turn, because the half already parsed cannot be unparsed; the next
+  call goes to Gemini first. A primary that is merely slow, rather than silent, is waited for.
+- **The chapter shown while it is written is not the chapter saved.** It is the raw block as it
+  streams; the saved text is normalised — its heading tidied — and replaces it when the turn
+  records it. A turn that fails puts the stored chapter back only when the page refreshes at
+  its end.
 - **Repositories are found again only under `data/repos/<slug>`.** The path is stored whole.
   A server started from another folder follows each repository to that place in its own
   folder at boot; one moved anywhere else needs `projects.repo_path` corrected by hand. A

@@ -17,6 +17,10 @@ process.env.ADMIN_PASSWORD = '';
 process.env.LLM_URL = 'https://fixture.invalid';
 process.env.LLM_API_KEY = 'fixture';
 process.env.LLM_MODEL = 'fixture';
+// Blank, not absent: absent, the real key in `.env` is read, and a fallback test
+// would ask Google for real.
+process.env.GEMINI_API_KEY = '';
+process.env.GEMINI_BASE_URL = 'https://gemini.invalid/v1beta';
 process.env.OIDC_ISSUER = 'https://fixture.invalid';
 process.env.OIDC_CLIENT_ID = 'fixture';
 process.env.OIDC_CLIENT_SECRET = 'fixture';
@@ -70,7 +74,10 @@ const proposals = await import('../src/lib/server/proposals.ts');
 const repo = await import('../src/lib/server/git/repo.ts');
 const { completeLogin, OidcNameCollision } = await import('../src/lib/server/auth/oidc.ts');
 const auth = await import('../src/lib/server/auth/index.ts');
-const { GatewayProvider, gateway } = await import('../src/lib/server/llm/gateway.ts');
+const { GatewayProvider, ModelProvider, gateway } = await import('../src/lib/server/llm/gateway.ts');
+const { GeminiProvider } = await import('../src/lib/server/llm/gemini.ts');
+const loginPage = await import('../src/routes/login/+page.server.ts');
+const logout = await import('../src/routes/logout/+server.ts');
 const { verifyDocument } = await import('../src/lib/server/llm/verification.ts');
 const { sameStatement } = await import('../src/lib/server/llm/requirements.ts');
 const chat = await import('../src/routes/api/chat/+server.ts');
@@ -150,18 +157,40 @@ try {
 
   // The mirror: a header naming a company sign-in account is not that subject.
   const proxyHeaders = (name) => (headerName) => headerName.toLowerCase() === 'x-forwarded-user' ? name : null;
-  check('the proxy cannot adopt a company sign-in account', auth.userForProxyHeaders(proxyHeaders('new-colleague'), '127.0.0.1'), null);
-  check('but resumes an account the proxy made', auth.userForProxyHeaders(proxyHeaders('proxy-colleague'), '127.0.0.1')?.username, 'proxy-colleague');
-  // Promoted on the people page. With nobody's address checked, the header is
-  // anyone's to send, so the rights do not come with it.
+  check('the proxy cannot adopt a company sign-in account', auth.userForProxyHeaders(proxyHeaders('new-colleague')), null);
+  check('but resumes an account the proxy made', auth.userForProxyHeaders(proxyHeaders('proxy-colleague'))?.username, 'proxy-colleague');
+  // Promoted on the people page. Proxy sign-in on is the operator vouching for
+  // the header, so the rights come with it.
   database.prepare("UPDATE users SET is_admin = 1 WHERE username = 'proxy-colleague'").run();
-  const trustedBefore = process.env.PROXY_AUTH_TRUSTED_IPS;
-  delete process.env.PROXY_AUTH_TRUSTED_IPS;
-  check('an unchecked header does not carry administrator rights', auth.userForProxyHeaders(proxyHeaders('proxy-colleague'), '10.9.9.9')?.is_admin, 0);
-  process.env.PROXY_AUTH_TRUSTED_IPS = '127.0.0.1';
-  check('a header from a trusted peer does', auth.userForProxyHeaders(proxyHeaders('proxy-colleague'), '127.0.0.1')?.is_admin, 1);
-  if (trustedBefore === undefined) delete process.env.PROXY_AUTH_TRUSTED_IPS; else process.env.PROXY_AUTH_TRUSTED_IPS = trustedBefore;
+  check('rights granted on the people page come with the header', auth.userForProxyHeaders(proxyHeaders('proxy-colleague'))?.is_admin, 1);
   database.prepare("UPDATE users SET is_admin = 0 WHERE username = 'proxy-colleague'").run();
+
+  // Switching from the gateway's account to one's own.
+  auth.createUser({ username: 'switch-admin', password: 'own password', isAdmin: true });
+  check('a header naming a password account is still refused', auth.userForProxyHeaders(proxyHeaders('switch-admin')), null);
+  const viaGateway = { user: auth.userForProxyHeaders(proxyHeaders('proxy-colleague')), viaProxy: true };
+  const signInAt = new URL('https://fixture.invalid/login?next=/projects/1');
+  const signInPage = await loginPage.load({ locals: viaGateway, url: signInAt });
+  check('the gateway\'s colleague reaches the sign-in page, which names them',
+    [signInPage.gatewayUser, signInPage.next], [viaGateway.user.display_name, '/projects/1']);
+  const signedIn = { user: store.getUserByUsername('switch-admin'), viaProxy: false };
+  check('someone who signed in here is sent on', (await Promise.resolve(loginPage.load({ locals: signedIn, url: signInAt })).catch((thrown) => thrown)).status, 303);
+  const jar = new Map();
+  const cookies = {
+    get: (name) => jar.get(name), set: (name, value) => jar.set(name, value), delete: (name) => jar.delete(name)
+  };
+  const switched = await loginPage.actions.default({
+    request: new Request('https://fixture.invalid/login', {
+      method: 'POST', body: new URLSearchParams({ username: 'switch-admin', password: 'own password', next: '/projects/1' })
+    }),
+    cookies, getClientAddress: () => '10.0.0.4', locals: viaGateway
+  }).catch((thrown) => thrown);
+  check('behind the gateway, a password signs in to its own account', [switched.status, switched.location], [303, '/projects/1']);
+  check('and the session is that account, with its rights', auth.userForSession(jar.get(auth.SESSION_COOKIE))?.is_admin, 1);
+  const session = jar.get(auth.SESSION_COOKIE);
+  const signedOut = await Promise.resolve(logout.POST({ cookies })).catch((thrown) => thrown);
+  check('signing out leads to the sign-in page', [signedOut.status, signedOut.location], [303, '/login']);
+  check('and ends the session, handing back to the gateway', [jar.has(auth.SESSION_COOKIE), auth.userForSession(session)], [false, null]);
 
   // A name with no password costs the same hash as a wrong password, so the
   // reply does not say which names exist.
@@ -611,6 +640,82 @@ try {
   const recovered = (await readStream()).filter(e => e.type === 'text').map(e => e.text).join('');
   check('an in-stream overload before any text is retried', [streamCalls, recovered], [2, 'Recovered']);
   globalThis.fetch = realFetch;
+
+  console.log('\n--- Gemini, and falling back to it ---');
+  {
+    const geminiChunk = (parts, extra = {}) => frame({ candidates: [{ content: { role: 'model', parts }, ...extra }], modelVersion: 'gemini-fixture-2' });
+    const asked = [];
+    let primary = () => new Response('{"error":"unauthorised"}', { status: 401 });
+    let gemini = () => new Response(geminiChunk([{ text: 'From ' }]) + geminiChunk([{ text: 'Gemini' }], { finishReason: 'STOP' }));
+    globalThis.fetch = async (url, init) => {
+      const to = String(url).startsWith('https://gemini.invalid') ? 'gemini' : 'primary';
+      asked.push({ to, url: String(url), headers: init.headers, body: JSON.parse(init.body) });
+      return to === 'gemini' ? gemini() : primary();
+    };
+    const read = async (provider) => {
+      const events = [];
+      for await (const item of provider.streamChat({ system: 'Be brief.', messages: [{ role: 'user', content: 'Hello' }] })) events.push(item);
+      return events;
+    };
+    const text = (events) => events.filter((e) => e.type === 'text').map((e) => e.text).join('');
+    const fresh = () => new ModelProvider(new GatewayProvider(() => !process.env.GEMINI_API_KEY), new GeminiProvider());
+    process.env.GEMINI_API_KEY = 'gemini-fixture';
+
+    const alone = await read(new GeminiProvider());
+    check('Gemini streams an answer', text(alone), 'From Gemini');
+    check('and says which model served it', alone.at(-1), { type: 'done', servedBy: 'gemini-fixture-2', outputTokens: 0 });
+    check('asked at its streaming endpoint, with its own key',
+      [asked[0].url.endsWith(':streamGenerateContent?alt=sse'), asked[0].headers['x-goog-api-key']], [true, 'gemini-fixture']);
+    check('with the system prompt as an instruction', asked[0].body.systemInstruction, { parts: [{ text: 'Be brief.' }] });
+
+    gemini = () => new Response(geminiChunk([{ text: 'Half a' }]));
+    await rejects('a Gemini stream that never says how it finished is not complete', () => read(new GeminiProvider()), /before it was complete/);
+    gemini = () => new Response(geminiChunk([{ text: 'Half a' }], { finishReason: 'MAX_TOKENS' }));
+    await rejects('nor one that ran out of budget', () => read(new GeminiProvider()), /ran out of room/);
+    gemini = () => new Response(geminiChunk([], { finishReason: 'SAFETY' }));
+    await rejects('and a refusal is not an empty answer', () => read(new GeminiProvider()), /declined/);
+
+    gemini = () => Response.json({
+      candidates: [{ content: { parts: [{ functionCall: { name: 'record', args: { status: 'complete' } } }] }, finishReason: 'STOP' }],
+      modelVersion: 'gemini-fixture-2'
+    });
+    const tool = await new GeminiProvider().callWithTools({
+      messages: [{ role: 'user', content: 'Record it' }],
+      tools: [{ name: 'record', description: 'Record', input_schema: { type: 'object', properties: { status: { type: 'string' } }, required: ['status'] } }],
+      forceTool: 'record'
+    });
+    check('a forced Gemini tool call comes back as a tool call', [tool.calls, tool.servedBy], [[{ name: 'record', input: { status: 'complete' } }], 'gemini-fixture-2']);
+    check('asked to use that tool and no other', asked.at(-1).body.toolConfig.functionCallingConfig.allowedFunctionNames, ['record']);
+
+    gemini = () => new Response(geminiChunk([{ text: 'Answered by Gemini' }], { finishReason: 'STOP' }));
+    asked.length = 0;
+    const models = fresh();
+    check('a primary that refuses is answered by Gemini', text(await read(models)), 'Answered by Gemini');
+    check('after asking the primary once', asked.map((a) => a.to), ['primary', 'gemini']);
+    asked.length = 0;
+    await read(models);
+    check('the next call goes to Gemini straight away', asked.map((a) => a.to), ['gemini']);
+
+    asked.length = 0;
+    primary = () => new Response(textFrame('From the primary') + stopFrame);
+    check('a working primary answers itself', text(await read(fresh())), 'From the primary');
+    check('and Gemini is not asked', asked.map((a) => a.to), ['primary']);
+
+    asked.length = 0;
+    primary = () => new Response(textFrame('<chapter key="overview">Half') + frame({ type: 'error', error: { type: 'invalid_request_error' } }));
+    await rejects('a primary that fails mid-answer is not answered again elsewhere', () => read(fresh()), /interrupted/);
+    check('so Gemini is never asked to repeat it', asked.map((a) => a.to), ['primary']);
+
+    const url = process.env.LLM_URL;
+    delete process.env.LLM_URL;
+    asked.length = 0;
+    check('with no primary configured, Gemini answers', text(await read(fresh())), 'Answered by Gemini');
+    check('and the primary is not tried', asked.map((a) => a.to), ['gemini']);
+    process.env.GEMINI_API_KEY = '';
+    await rejects('with neither, the call says nothing is set up', () => read(fresh()), (cause) => cause.name === 'NoModelConfigured');
+    process.env.LLM_URL = url;
+    globalThis.fetch = realFetch;
+  }
 
   // A reply whose changes are refused leaves no claim in the transcript.
   const refused = fixtureProject('refused-reply');

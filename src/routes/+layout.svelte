@@ -16,17 +16,11 @@
 				<a class="admin" href="/admin/users">People</a>
 			{/if}
 			<span class="who">{data.user.display_name}</span>
-			{#if !data.viaProxy}
-				<form method="POST" action="/logout">
-					<button type="submit" class="link">Sign out</button>
-				</form>
-			{:else if data.proxyLogoutUrl}
-				<a class="link" href={data.proxyLogoutUrl} data-sveltekit-reload>Sign out</a>
-			{:else}
-				<span class="who" title="You were signed in by the company gateway. Closing the browser ends it.">
-					signed in by the gateway
-				</span>
-			{/if}
+			<!-- For everyone, the gateway's colleagues included: the sign-in page it
+			     leads to is where they switch to another account. -->
+			<form method="POST" action="/logout">
+				<button type="submit" class="link">Sign out</button>
+			</form>
 		{/if}
 	</header>
 	{@render children()}

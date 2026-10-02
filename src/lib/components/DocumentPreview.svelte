@@ -46,7 +46,8 @@
 		findings = [],
 		activeKey,
 		pendingChanges,
-		projectId
+		projectId,
+		writingKey = null
 	}: {
 		projectName: string;
 		chapters: ChapterView[];
@@ -56,6 +57,11 @@
 		activeKey: string | null;
 		pendingChanges: boolean;
 		projectId: number;
+		/**
+		 * The chapter the assistant is writing right now. Its text here is what has
+		 * arrived so far and is not saved; a turn that fails puts the stored text back.
+		 */
+		writingKey?: string | null;
 	} = $props();
 
 	// Decisions the assistant made on the user's behalf. Surfaced where they are
@@ -169,7 +175,9 @@
 			>
 				<h3>
 					{chapter.title}
-					{#if chapter.applicable === false}
+					{#if chapter.key === writingKey}
+						<span class="badge writing">being written…</span>
+					{:else if chapter.applicable === false}
 						<span class="badge">not needed</span>
 					{:else}
 						<span class="badge {chapter.status}">
@@ -382,6 +390,11 @@
 	.badge.complete {
 		background: var(--accent-soft);
 		color: var(--ok);
+	}
+
+	.badge.writing {
+		background: var(--accent);
+		color: #fff;
 	}
 
 	.body {
