@@ -221,8 +221,9 @@ that thinks before it writes spends the same budget on both.
 - **WHEN** a call reads a whole chapter or document
 - **THEN** it is given at least 16 000 tokens, and at least twice the most its kind has used:
   a turn or a drafted chapter 32 000, where one used 14 261; a mock-up's page 64 000, where a
-  compact one used 25 168. Room unused costs nothing, because a call stops when its answer is
-  done; a longer document, or a model that deliberates more, still fits
+  compact one used 25 168; an overview 32 000, and 48 000 asked again, where one used 5 361.
+  Room unused costs nothing, because a call stops when its answer is done; a longer document,
+  or a model that deliberates more, still fits
 - **AND** the price is waiting: a call that reasons without end fails only once its room is
   spent, so twice the room is twice the wait before a retry, and that is accepted for answers
   that fit

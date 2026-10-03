@@ -174,6 +174,7 @@
 		{#if !drafting}
 			<a class="handoff" href="/projects/{projectId}/diagram">Diagram</a>
 			<a class="handoff" href="/projects/{projectId}/mockup">Mock-up</a>
+			<a class="handoff" href="/projects/{projectId}/overview">Overview &amp; costs</a>
 		{/if}
 		<a class="handoff" href="/projects/{projectId}/export">For a developer</a>
 		{#if drafting}

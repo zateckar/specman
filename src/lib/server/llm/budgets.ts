@@ -61,5 +61,16 @@ export const SCREENS_BUDGET = 16_000;
 /** Writing a mock-up's page. A compact page has used 25 168. */
 export const MOCKUP_BUDGET = 64_000;
 
+/**
+ * Writing an overview: a page of prose and two short lists, after reading the
+ * whole document and weighing it — as much reading as a drafted chapter. It has
+ * used 4 513 and 5 361, each at the first attempt in under a minute (measured on
+ * 2026-10-03).
+ */
+export const OVERVIEW_BUDGET = 32_000;
+
+/** Writing it again, when the first ran out of room or was not an overview. */
+export const OVERVIEW_RETRY_BUDGET = 48_000;
+
 /** A prose call that names no budget of its own. */
 export const DEFAULT_BUDGET = 16_000;

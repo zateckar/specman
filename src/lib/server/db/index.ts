@@ -1552,6 +1552,45 @@ export function latestMockup(projectId: number): StoredMockup | undefined {
 	};
 }
 
+/* -------------------------------------------------------------- overviews */
+
+export interface StoredOverview {
+	/** The settled judgements, as `llm/overview.ts` wrote them; read with `readOverview`. */
+	content: unknown;
+	/** The document revision it was made from. */
+	document_revision: number;
+	created_at: string | null;
+}
+
+/**
+ * Keep an overview as the application's, replacing the one before. Nothing is
+ * stored for an application deleted while its overview was being made.
+ */
+export function saveOverview(projectId: number, content: unknown, documentRevision: number): void {
+	db()
+		.prepare(
+			`INSERT INTO overviews (project_id, content, document_revision)
+			 SELECT id, ?, ? FROM projects WHERE id = ?
+			 ON CONFLICT (project_id) DO UPDATE SET
+			   content = excluded.content,
+			   document_revision = excluded.document_revision,
+			   created_at = datetime('now')`
+		)
+		.run(JSON.stringify(content), documentRevision, projectId);
+}
+
+export function latestOverview(projectId: number): StoredOverview | undefined {
+	const row = db().prepare('SELECT * FROM overviews WHERE project_id = ?').get(projectId) as
+		| Record<string, unknown>
+		| undefined;
+	if (!row) return undefined;
+	return {
+		content: parseJson<unknown>(row.content as string, null),
+		document_revision: Number(row.document_revision),
+		created_at: asIsoTime(row.created_at as string)
+	};
+}
+
 /* ------------------------------------------------------------ verifications */
 
 export interface VerificationRow {

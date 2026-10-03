@@ -144,6 +144,27 @@ import {
 	worthAnotherTry
 } from '../src/lib/server/llm/mockup.ts';
 import { longCalls } from '../src/lib/server/llm/parallel.ts';
+import {
+	BASELINE,
+	buildOverviewPrompt,
+	buildReport,
+	byHand,
+	CATALOGUE,
+	DAY_RATE,
+	extractOverview,
+	MAX_PART_DAYS,
+	overviewRequest,
+	readOverview,
+	renderReport,
+	REPORT_POLICY,
+	reportFileName,
+	reportHeaders,
+	running as runningCosts,
+	settleOverview,
+	shareOfWork,
+	toBlocks,
+	withAi
+} from '../src/lib/server/llm/overview.ts';
 
 let pass = 0;
 let fail = 0;
@@ -2532,7 +2553,7 @@ console.log('\n--- how much room each call is given ---');
 	check('no call that reads a chapter or a document has less than 16 000',
 		all.filter(([, room]) => room < 16_000).map(([name]) => name), []);
 	// The most each kind has been seen to use, on the live gateway.
-	const measured = { TURN_BUDGET: 14_261, DRAFT_BUDGET: 14_261, SCREENS_BUDGET: 4_606, MOCKUP_BUDGET: 25_168 };
+	const measured = { TURN_BUDGET: 14_261, DRAFT_BUDGET: 14_261, SCREENS_BUDGET: 4_606, MOCKUP_BUDGET: 25_168, OVERVIEW_BUDGET: 5_361 };
 	check('each is at least twice the most its kind has been seen to use',
 		Object.entries(measured).filter(([name, used]) => budgets[name] < 2 * used).map(([name]) => name), []);
 	check('asked again, a draft is given more room than the first time', budgets.DRAFT_RETRY_BUDGET > budgets.DRAFT_BUDGET, true);
@@ -3045,6 +3066,187 @@ console.log('\n--- drafting a whole document ---');
 		[mockupHeaders()['content-security-policy'], mockupHeaders()['cache-control'], mockupHeaders()['x-content-type-options']], [MOCKUP_POLICY, 'no-store', 'nosniff']);
 	check('the file is named for the application', [mockupFileName('pool-cars'), mockupFileName('"; x'), mockupFileName('')],
 		['pool-cars-mock-up.html', 'x-mock-up.html', 'application-mock-up.html']);
+}
+
+console.log('\n--- the business and technical overview ---');
+
+{
+	// The shape the served models write: talk around it, a fence, a table header
+	// in the work, Czech prose, a size as a word, a service not in the list, and
+	// the last section's closing tag dropped.
+	const reply = `Here is the overview.
+
+\`\`\`
+<pitch>
+Rezervace služebních aut na jednom místě. Zaměstnanci si auto zarezervují sami a fleet office vidí obsazenost.
+</pitch>
+
+<business-case>
+## Problém
+Dnes se rezervuje e-mailem.
+- méně e-mailů
+- **přehled** o vytížení
+</business-case>
+
+<business-complexity level="medium">
+Tři skupiny uživatelů.
+</business-complexity>
+
+<technical-complexity>
+High: napojení na SAP a na docházku.
+</technical-complexity>
+
+<work>
+Part | Person-days
+---|---
+Rezervační formulář | 8
+- Přehled obsazenosti: 5 days
+Napojení na SAP | 3-5
+Správa | 1,5
+Migrace | 1000
+Nothing to count here
+</work>
+
+<azure>
+service | size | why
+app-service | m | dva uzly kvůli dostupnosti
+sql | small | rezervace
+sql | l |
+SAP connector | - | napojení
+monitoring | s
+</azure>
+
+<assumptions>
+- Asi 300 uživatelů.
+\`\`\``;
+	const read = extractOverview(reply);
+	check('the pitch is read without the talk around it', read.pitch.startsWith('Rezervace služebních aut'), true);
+	check('a level is read from its attribute, or from a first line that names it',
+		[read.businessComplexity, read.technicalComplexity],
+		[{ level: 'medium', reasons: 'Tři skupiny uživatelů.' }, { level: 'high', reasons: 'napojení na SAP a na docházku.' }]);
+	check('the work is read in either form, a range as its middle, a comma as a decimal point, a slip capped',
+		read.work, [
+			{ name: 'Rezervační formulář', days: 8 },
+			{ name: 'Přehled obsazenosti', days: 5 },
+			{ name: 'Napojení na SAP', days: 4 },
+			{ name: 'Správa', days: 1.5 },
+			{ name: 'Migrace', days: MAX_PART_DAYS }
+		]);
+	check('services are read from the list, a size as a word, and the header is not a service',
+		read.services.map((s) => [s.key, s.size]), [['app-service', 'm'], ['sql', 's'], ['sql', 'l'], ['monitoring', 's']]);
+	check('a service not in the list is kept by name, not priced', read.unpriced, ['SAP connector']);
+	check('a section whose closing tag was dropped still ends at the end of the reply',
+		read.assumptions.includes('300 uživatelů'), true);
+	check('a reply with no pitch, or no work, is not an overview',
+		[extractOverview(reply.replace(/<pitch>[\s\S]*?<\/pitch>/, '')), extractOverview(reply.replace(/<work>[\s\S]*?<\/work>/, ''))], [null, null]);
+	check('nor is talk with no sections at all', extractOverview('I could not write it.'), null);
+	check('a level that is none of the three is no level', extractOverview(reply.replace('level="medium"', 'level="LEVEL"')).businessComplexity.level, null);
+
+	const settled = settleOverview(read, { reach: 'company' });
+	check('the same service named twice is counted once, at its larger size',
+		settled.services.filter((s) => s.key === 'sql').map((s) => s.size), ['l']);
+	check('what every application needs is counted whether named or not',
+		BASELINE.every((key) => settled.services.some((s) => s.key === key)), true);
+	check('and the services read in the catalogue\'s order',
+		settled.services.map((s) => s.key), CATALOGUE.map((s) => s.key).filter((key) => settled.services.some((s) => s.key === key)));
+	check('nothing is said to be settled when the reply made every judgement', settled.settled, []);
+
+	const bare = settleOverview({ ...read, services: [], businessComplexity: { level: null, reasons: '' }, technicalComplexity: { level: null, reasons: '' } }, { reach: 'external' });
+	check('with no hosting chosen, App Service is counted', bare.services.some((s) => s.key === 'app-service'), true);
+	check('reached from outside the company, a front door with a firewall is counted', bare.services.some((s) => s.key === 'front-door'), true);
+	check('a missing rating is derived from the work and the reach, and says so',
+		[bare.technicalComplexity.level, bare.businessComplexity.level, bare.settled.length], ['high', 'high', 4]);
+	check('a team tool with no hosting gets the smallest',
+		settleOverview({ ...read, services: [] }, { reach: 'team' }).services.find((s) => s.key === 'app-service').size, 's');
+	check('nobody outside the company, no front door', settled.services.some((s) => s.key === 'front-door'), false);
+
+	// The figures: 50 days of building at medium technical complexity.
+	const fifty = { work: [{ name: 'All of it', days: 50 }], technicalComplexity: { level: 'medium', reasons: '' } };
+	const people = byHand(fifty);
+	check('by hand: the building, and what Specman adds to it in half days',
+		people.rows.map((r) => r.days), [50, 6, 12.5, 5, 6]);
+	check('the total is the rows as shown, costed at the day rate',
+		[people.days, people.cost, people.cost === people.rows.reduce((sum, r) => sum + r.days, 0) * DAY_RATE], [79.5, 47_700, true]);
+	check('the range is wider above than below, rounded to the thousand', [people.costLow, people.costHigh, people.daysLow, people.daysHigh], [38_000, 72_000, 64, 119]);
+	check('and the calendar follows from the team', [people.people, people.weeks], [3, 7]);
+	const ai = withAi(fifty);
+	check('with AI: people look in to direct and review, little is managed, and its usage is costed on top',
+		[ai.rows.map((r) => r.days), ai.usage, ai.cost], [[5, 4, 6, 1, 2], 2000, 18 * DAY_RATE + 2000]);
+	check('and hosting takes fewer days, because it writes the pipelines and templates too',
+		[ai.rows[4].days < people.rows[4].days, withAi({ ...fifty, technicalComplexity: { level: 'high', reasons: '' } }).rows[4].days], [true, 2]);
+	check('so the application asked about fits into two weeks: 43 days of building at medium complexity',
+		[withAi({ ...fifty, work: [{ name: 'All', days: 43 }] }).days, withAi({ ...fifty, work: [{ name: 'All', days: 43 }] }).weeks], [16, 2]);
+	check('the AI route costs less than by hand, and takes fewer people', [ai.cost < people.cost, ai.people < people.people], [true, true]);
+	check('directing it takes more of the building as the technology gets harder',
+		withAi({ ...fifty, technicalComplexity: { level: 'high', reasons: '' } }).rows[0].days > ai.rows[0].days, true);
+	const slower = [];
+	// From two days: below that, every row is the half-day minimum on both routes.
+	for (const days of [2, 5, 10, 20, 35, 50, 120, 300, 800]) {
+		for (const level of ['low', 'medium', 'high']) {
+			const shape = { work: [{ name: 'All', days }], technicalComplexity: { level, reasons: '' } };
+			const [hand, assisted] = [byHand(shape), withAi(shape)];
+			if (assisted.weeks > hand.weeks || assisted.cost >= hand.cost) slower.push([days, level]);
+		}
+	}
+	check('at any size, the AI route is neither slower nor dearer than by hand', slower, []);
+	check('a tiny piece of work is never shown as no work', withAi({ ...fifty, work: [{ name: 'x', days: 0.5 }] }).rows.every((r) => r.days >= 0.5), true);
+
+	const run = runningCosts({ ...fifty, services: [{ key: 'app-service', size: 'm', why: '' }, { key: 'key-vault', size: 's', why: '' }] });
+	check('running: production is the services\' sum, other environments a share of it, a year twelve months',
+		[run.production, run.nonProduction, run.monthly, run.yearly], [232, 93, 325, 3900]);
+	check('and support is a share of building it by hand, rounded to the hundred below ten thousand', run.support, 7200);
+
+	check('the catalogue prices every service at three sizes, never less for a larger one',
+		CATALOGUE.filter((s) => !(s.sizes.s.monthly >= 0 && s.sizes.s.monthly <= s.sizes.m.monthly && s.sizes.m.monthly <= s.sizes.l.monthly)).map((s) => s.key), []);
+	const prompt = buildOverviewPrompt();
+	check('the prompt lists every service it may choose, from the table that prices them',
+		CATALOGUE.filter((s) => s.key !== 'entra-id' && !prompt.includes(`- ${s.key}:`)).map((s) => s.key), []);
+	check('and asks for no money, because the code counts', /Write no money/.test(prompt), true);
+	check('asked again, it is told why and to start at once',
+		[buildOverviewPrompt(true).includes('COULD NOT BE USED'), prompt.includes('COULD NOT BE USED')], [true, false]);
+	check('the request carries the document and what the triage said',
+		overviewRequest('# Pool cars', 'used by a single team', true),
+		'# Pool cars\n\n---\n\nThis application is used by a single team. It changes an application that already exists.\n\nWrite the overview of this application now.');
+
+	check('what is kept reads back as it was', readOverview(JSON.parse(JSON.stringify(settled))), settled);
+	check('what this module would not have written is not read',
+		[readOverview(null), readOverview({ pitch: 'x', work: [] }), readOverview({ ...settled, services: [{ key: 'mainframe', size: 's' }] }).services],
+		[null, null, []]);
+
+	const thirds = shareOfWork([{ name: 'a', days: 1 }, { name: 'b', days: 1 }, { name: 'c', days: 1 }]);
+	check('each part is shown as its share of the building, adding up to exactly 100',
+		[thirds.map((s) => s.percent), shareOfWork(read.work).reduce((sum, s) => sum + s.percent, 0)], [[34, 33, 33], 100]);
+	check('the largest remainders get the rounding, so a share is never more than a point off',
+		shareOfWork([{ name: 'a', days: 8 }, { name: 'b', days: 5 }, { name: 'c', days: 4 }, { name: 'd', days: 1.5 }]).map((s) => s.percent), [43, 27, 22, 8]);
+	check('a part too small for a whole per cent is shown as under one, and nothing is lost',
+		[shareOfWork([{ name: 'big', days: 300 }, { name: 'tiny', days: 0.5 }]).map((s) => s.percent),
+			renderReport(buildReport({ ...settled, work: [{ name: 'big', days: 300 }, { name: 'tiny', days: 0.5 }] }, { name: 'x', madeOn: '', stale: false })).includes('under 1%')],
+		[[100, 0], true]);
+	check('text is shown as paragraphs and lists, never markup',
+		toBlocks('## Heading\nOne **line**\nand more.\n- a\n- b\n\nLast.'),
+		[{ kind: 'paragraph', text: 'Heading' }, { kind: 'paragraph', text: 'One line' }, { kind: 'paragraph', text: 'and more.' }, { kind: 'list', items: ['a', 'b'] }, { kind: 'paragraph', text: 'Last.' }]);
+	check('a section asked for as short lines is a list, bullets or not',
+		toBlocks('One.\nTwo.\n\n- Three.', true), [{ kind: 'list', items: ['One.', 'Two.', 'Three.'] }]);
+	check('but one line alone is a sentence, not a list of one', toBlocks('Only this.', true), [{ kind: 'paragraph', text: 'Only this.' }]);
+
+	const hostile = { ...settled, pitch: 'Fine <script>alert(1)</script> <img src=x onerror=alert(2)>' };
+	const file = renderReport(buildReport(hostile, { name: 'Cars --> <b>', madeOn: '2026-10-03', stale: false }));
+	check('the file runs nothing: the model\'s words are escaped and there is no script',
+		[/<script/i.test(file), /<img/i.test(file), file.includes('&lt;script&gt;')], [false, false, true]);
+	check('nothing in the name ends its comment early', file.split('-->').length, 2);
+	const parts = file.slice(file.indexOf('What the building consists of'), file.indexOf('Running it on Azure'));
+	check('what the building consists of is told in shares of the work, not person-days',
+		[/Share of the work/.test(parts), /Person-days/.test(parts), /width:\d+%/.test(parts)], [true, false, true]);
+	check('it carries its own policy, for a file opened from a disk', file.includes(`content="${REPORT_POLICY}"`), true);
+	check('it says when it was made, and that it is an estimate', [file.includes('2026-10-03'), /estimates for planning, not a quote/.test(file)], [true, true]);
+	check('it says it is out of date only when it is',
+		[/has changed since/.test(file), /has changed since/.test(renderReport(buildReport(settled, { name: 'x', madeOn: '', stale: true })))], [false, true]);
+	check('every figure in it is calculated, not written by the model',
+		file.includes(new Intl.NumberFormat('en-GB', { style: 'currency', currency: 'EUR', maximumFractionDigits: 0 }).format(byHand(settled).cost)), true);
+	check('it is sent with the same policy and may not be framed',
+		[reportHeaders()['content-security-policy'].startsWith(REPORT_POLICY), /frame-ancestors 'none'/.test(reportHeaders()['content-security-policy'])], [true, true]);
+	check('the file is named for the application', [reportFileName('pool-cars'), reportFileName('"; x'), reportFileName('')],
+		['pool-cars-overview.html', 'x-overview.html', 'application-overview.html']);
 }
 
 console.log(`\n${pass} passed, ${fail} failed`);

@@ -33,6 +33,7 @@ import { describeProfile, toProfile } from './llm/profile';
 import { reconcileAssessment } from './llm/questions';
 import { toRequirementDraft } from './llm/requirements';
 import { stopMockup } from './mockups';
+import { stopOverview } from './overviews';
 import { commitDocument, nameDraftProposal, writeAndCommit } from './proposals';
 import { withRepo } from './git/repo';
 
@@ -402,6 +403,7 @@ export async function deleteDraft(project: Project, user: Pick<User, 'id' | 'is_
 		// Its row went with the application, and nothing would keep what it made;
 		// the call would otherwise run on for minutes. Only once the deletion stands.
 		stopMockup(project.id);
+		stopOverview(project.id);
 		try {
 			// A page reading the history can hold a file open on Windows for a moment.
 			rmSync(project.repo_path, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 });

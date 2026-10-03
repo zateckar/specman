@@ -170,6 +170,16 @@ CREATE TABLE IF NOT EXISTS mockups (
   created_at        TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
+-- The latest business and technical overview of each application: the
+-- assistant's judgements as JSON, from which every figure is calculated when it
+-- is shown. Outside the document like the mock-up, and replaced the same way.
+CREATE TABLE IF NOT EXISTS overviews (
+  project_id        INTEGER PRIMARY KEY REFERENCES projects(id) ON DELETE CASCADE,
+  content           TEXT NOT NULL,
+  document_revision INTEGER NOT NULL,
+  created_at        TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
 -- The result of a whole-document check. One row per run; the latest is shown.
 -- Kept rather than recomputed because the check costs several gateway calls.
 CREATE TABLE IF NOT EXISTS verifications (

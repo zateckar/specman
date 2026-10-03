@@ -112,7 +112,7 @@ export function createSlots(limit: number): Slots {
 }
 
 /**
- * The long streamed calls nobody is waiting on — drafted chapters and mock-ups —
+ * The long streamed calls nobody is waiting on — drafted chapters, mock-ups and overviews —
  * three at a time across the whole installation, not per job. Each runs for
  * minutes on a shared gateway, and everyone's conversation waits behind them.
  */

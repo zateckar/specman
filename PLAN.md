@@ -254,6 +254,12 @@ first folder under `openspec/changes/`:
   deciding who may throw that away is the open question, not the mechanism.
 - **Importing an ArchiMate file back.** The export is one-way: a model edited in Archi cannot
   be brought back in, and the next *Draw again* would overwrite it in any case.
+- **The company's own figures in the overview.** The day rate, the shares added to the
+  building, the AI usage rate and the reference architecture's catalogue are constants in
+  `llm/overview.ts`, in euros. They are Specman's reasonable defaults, not Škoda's: the
+  company's supplier rates, its Azure agreement and its real reference architecture would make
+  the figures worth quoting. An administrator page, stored in the database like the standards,
+  is the natural home; a currency other than euros comes with it.
 
 ### Known limits, written down so they are not rediscovered
 
@@ -312,7 +318,7 @@ first folder under `openspec/changes/`:
   presence: a restart ends it, and the workspace then offers to draft the rest rather than
   starting again at boot, where a chapter that fails every time would fail on every restart.
   A second process neither sees a running draft nor refuses a turn beside it. At most three
-  long calls — drafted chapters and mock-ups together — run at once across the installation,
+  long calls — drafted chapters, mock-ups and overviews together — run at once across the installation,
   queued in arrival order (`longCalls` in `llm/parallel.ts`).
 - **A mock-up can still reach out a little.** It runs sandboxed, with a policy that lets it load,
   fetch and send nothing, in the frame and in the downloaded file. A sandboxed frame can
@@ -343,6 +349,13 @@ first folder under `openspec/changes/`:
   stored until the end, so the last mock-up stays, and the page that was following it says it
   stopped. It is not part of the document, the review or the handoff, and only the latest is
   kept.
+- **An overview's figures are as good as its constants.** The assistant's judgements —
+  person-days per part, services and sizes — are the only inputs that vary; everything else is a
+  stated rate, share or list price. The Azure prices were read from Azure's published list on
+  2026-10-03 and are not refreshed: a price that changes is wrong until someone edits the
+  catalogue. Stored judgements are re-costed with whatever the catalogue says when they are shown,
+  so an edit reaches every overview at once, and a service removed from it stops being counted.
+  Like a mock-up, one being made lives in this process, and only the latest is kept.
 - **How an account signs in is recorded, not inferred.** `users.created_via` exists because
   the people page derived it from the password and company-account columns, and an account
   the gateway signs in has neither — so it reported everybody in a proxied installation as

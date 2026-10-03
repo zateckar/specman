@@ -1264,6 +1264,8 @@ try {
   const { UNCHECKED_CHAPTER } = await import('../src/lib/server/llm/draft.ts');
   const mockupApi = await import('../src/routes/api/mockup/+server.ts');
   const mockups = await import('../src/lib/server/mockups.ts');
+  const overviewApi = await import('../src/routes/api/overview/+server.ts');
+  const overviews = await import('../src/lib/server/overviews.ts');
   const admin = store.getUser(1);
   database.prepare("INSERT INTO users (username, display_name) VALUES ('drafting-colleague', 'A colleague')").run();
   const colleague = database.prepare("SELECT * FROM users WHERE username = 'drafting-colleague'").get();
@@ -1353,6 +1355,7 @@ try {
   check('a whole-document check is refused while drafting', statusOf(await verifyApi.POST(event({ projectId: running.id })).catch((e) => e)), 409);
   check('the diagram is refused while drafting', statusOf(await architectureApi.POST(event({ projectId: running.id })).catch((e) => e)), 409);
   check('a mock-up is refused while drafting', statusOf(await mockupApi.POST(event({ projectId: running.id })).catch((e) => e)), 409);
+  check('an overview is refused while drafting', statusOf(await overviewApi.POST(event({ projectId: running.id })).catch((e) => e)), 409);
   check('approving is refused while drafting', (await approveForm(running)).status, 409);
   check('a second run is refused while one is going', statusOf(await draftApi.POST(event({ projectId: running.id })).catch((e) => e)), 409);
   stub.hold.resolve();
@@ -1394,6 +1397,8 @@ try {
   check('a whole-document check and an open question asked leave the mark', isAiDraft(finished), true);
   store.saveMockup(finished.id, '<!DOCTYPE html><html><body>Mock</body></html>', store.getProject(finished.id).document_revision);
   check('so does a mock-up kept of it', isAiDraft(finished), true);
+  store.saveOverview(finished.id, { pitch: 'Pool cars.' }, store.getProject(finished.id).document_revision);
+  check('and an overview kept of it', isAiDraft(finished), true);
 
   // Anything of a person's ends it, without any of these paths clearing a flag.
   const answered = await drafted('Draft answered');
@@ -1489,6 +1494,7 @@ try {
     check('with everything stored against it',
       database.prepare('SELECT COUNT(*) AS n FROM decisions WHERE project_id = ?').get(finished.id).n, 0);
     check('its mock-up included', store.latestMockup(finished.id), undefined);
+    check('and its overview', store.latestOverview(finished.id), undefined);
     await rejects('a writer queued behind the deletion does not make its history again',
       () => proposals.commitDocument(finished, 'Late check'), (cause) => cause.name === 'ApplicationDeleted');
     check('so no folder came back', existsSync(finished.repo_path), false);
@@ -1507,6 +1513,7 @@ try {
 
   // A mock-up being made of a draft that is deleted is stopped, once the deletion stands.
   const pictured = await drafted('Draft with a mock-up');
+  const summed = await drafted('Draft with an overview');
   const draftingStream = gateway.streamChat;
   gateway.streamChat = async function* (req) {
     await new Promise((resolve, reject) => req.signal?.addEventListener('abort', () => reject(req.signal.reason), { once: true }));
@@ -1517,6 +1524,11 @@ try {
   check('which can still be deleted', await drafting.deleteDraft(store.getProject(pictured.id), admin), 'deleted');
   await until(() => !mockups.isMakingMockup(pictured.id));
   check('and the mock-up being made of it stops', mockups.isMakingMockup(pictured.id), false);
+  await overviewApi.POST(event({ projectId: summed.id }));
+  check('an overview is being made of a draft', overviews.isMakingOverview(summed.id), true);
+  check('which can still be deleted', await drafting.deleteDraft(store.getProject(summed.id), admin), 'deleted');
+  await until(() => !overviews.isMakingOverview(summed.id));
+  check('and the overview being made of it stops', overviews.isMakingOverview(summed.id), false);
   gateway.streamChat = draftingStream;
   }
 
@@ -1696,6 +1708,140 @@ try {
   const stopped = await made(sketched.id);
   check('one being made can be stopped, and says so', [stopped.running, stopped.problem], [false, 'Stopped before it was finished.']);
   check('and keeps the last mock-up', store.latestMockup(sketched.id).html, keptBefore);
+  stub.hold = null;
+  gateway.streamChat = realStream;
+  }
+
+  {
+  console.log('\n--- making an overview ---');
+  const overviewApi = await import('../src/routes/api/overview/+server.ts');
+  const overviews = await import('../src/lib/server/overviews.ts');
+  const overviewPage = await import('../src/routes/projects/[id]/overview/+page.server.ts');
+  const downloadRoute = await import('../src/routes/projects/[id]/overview/download/+server.ts');
+  const { REPORT_POLICY } = await import('../src/lib/server/llm/overview.ts');
+  const { GatewayError } = await import('../src/lib/server/llm/gateway.ts');
+  const admin = store.getUser(1);
+  const done = { type: 'done', servedBy: 'fixture', outputTokens: 10 };
+  const reply = (pitch) => `<pitch>${pitch}</pitch>
+<business-case>Fewer emails.</business-case>
+<business-complexity level="low">One team.</business-complexity>
+<technical-complexity level="medium">One integration.</technical-complexity>
+<work>
+Booking form | 10
+Overview of the fleet | 10
+</work>
+<azure>
+sql | s | bookings
+mainframe | - | old records
+</azure>
+<assumptions>About fifty users.</assumptions>`;
+
+  // A model that writes the overview in two parts and can be held between them.
+  const stub = { replies: [], calls: [], hold: null, halfway: null };
+  gateway.streamChat = async function* (req) {
+    if (!req.system.includes('<business-case>')) { yield done; return; }
+    stub.calls.push({ brief: req.system.includes('COULD NOT BE USED'), maxTokens: req.maxTokens, request: req.messages[0].content });
+    const text = stub.replies.shift() ?? reply('Default pitch.');
+    if (text instanceof Error) throw text;
+    yield { type: 'thinking', text: 'Weighing it…' };
+    const half = Math.floor(text.length / 2);
+    yield { type: 'text', text: text.slice(0, half) };
+    if (stub.hold) {
+      stub.halfway?.resolve();
+      await new Promise((resolve, reject) => {
+        stub.hold.promise.then(resolve);
+        req.signal?.addEventListener('abort', () => reject(req.signal.reason), { once: true });
+      });
+    }
+    yield { type: 'text', text: text.slice(half) };
+    yield done;
+  };
+  const made = async (id) => {
+    for (let i = 0; i < 3000 && overviews.isMakingOverview(id); i++) await new Promise((r) => setTimeout(r, 10));
+    return overviews.overviewView({ id });
+  };
+  const post = (projectId) => overviewApi.POST(event({ projectId })).catch((thrown) => thrown);
+  const routeEvent = (project) => ({ params: { id: String(project.id) }, locals: { user: admin } });
+
+  const summed = fixtureProject('overview-project');
+  stub.calls = [];
+  check('nothing written is refused before any call', [(await post(summed.id)).status, stub.calls.length], [422, 0]);
+  check('the page loads with nothing made and nothing running',
+    (await overviewPage.load({ params: { id: String(summed.id) }, locals: { user: admin } })).view,
+    { running: false, phase: null, written: 0, retrying: false, problem: null, made: null });
+  check('a download with nothing made says so', await downloadRoute.GET(routeEvent(summed)).catch((e) => e.status), 404);
+
+  store.updateChapterState(summed.id, 'overview', { contentMd: 'Employees book pool cars by the day.' });
+  const before = store.getProject(summed.id).document_revision;
+  stub.hold = deferred();
+  stub.halfway = deferred();
+  const started = await post(summed.id);
+  check('an overview is started and the request returns at once', [started.status, (await started.json()).running], [202, true]);
+  await stub.halfway.promise;
+  const midway = overviews.overviewView({ id: summed.id });
+  check('its progress is what has been written so far', [midway.phase, midway.written > 0], ['writing', true]);
+  check('asked again meanwhile, it is followed rather than doubled', [(await post(summed.id)).status, stub.calls.length], [202, 1]);
+  stub.hold.resolve();
+  stub.hold = null;
+  const first = await made(summed.id);
+  check('the call was given the document and what the triage said, with room to think',
+    [stub.calls[0].request.includes('Employees book pool cars'), /This application is .*personal data/.test(stub.calls[0].request), stub.calls[0].maxTokens],
+    [true, true, budgets.OVERVIEW_BUDGET]);
+  check('the overview is kept, from the document as it was read', [first.made?.report.pitch[0].text, store.latestOverview(summed.id).document_revision], ['Default pitch.', before]);
+  check('keeping it is not a write to the document', store.getProject(summed.id).document_revision, before);
+  check('every figure is calculated: twenty days of building, by hand',
+    [first.made.report.byHand.rows[0].days, first.made.report.byHand.days, first.made.report.byHand.cost], [20, 35.5, 35.5 * 600]);
+  check('the reference architecture is counted, and what is not in it is named, not priced',
+    [first.made.report.running.services.some((s) => s.name.startsWith('Secrets')), first.made.report.unpriced], [true, ['mainframe']]);
+  check('it is not out of date', first.made.stale, false);
+
+  const downloaded = await downloadRoute.GET(routeEvent(summed));
+  const file = await downloaded.text();
+  check('the download is one file named for the application, with a policy that loads nothing',
+    [downloaded.headers.get('content-disposition'), downloaded.headers.get('content-security-policy').startsWith(REPORT_POLICY), file.startsWith('<!DOCTYPE html>'), /<script/i.test(file)],
+    ['attachment; filename="overview-project-overview.html"', true, true, false]);
+  check('and it carries the pitch, and says nothing of being out of date', [file.includes('Default pitch.'), /has changed since/.test(file)], [true, false]);
+
+  store.updateChapterState(summed.id, 'overview', { contentMd: 'Employees book pool cars by the hour.' });
+  check('the document changed since it was made, and the page says so',
+    (await overviewPage.load({ params: { id: String(summed.id) }, locals: { user: admin } })).view.made.stale, true);
+  check('and so does the file saved now', /has changed since/.test(await (await downloadRoute.GET(routeEvent(summed))).text()), true);
+
+  stub.calls = [];
+  stub.replies = ['I could not write it this time.', reply('Second pitch.')];
+  await post(summed.id);
+  const refreshed = await made(summed.id);
+  check('a reply that is not an overview is asked for once more, with more room',
+    stub.calls.map((c) => [c.brief, c.maxTokens]), [[false, budgets.OVERVIEW_BUDGET], [true, budgets.OVERVIEW_RETRY_BUDGET]]);
+  check('and refreshing replaces it, made from the changed document',
+    [refreshed.made.report.pitch[0].text, refreshed.made.stale], ['Second pitch.', false]);
+
+  stub.calls = [];
+  stub.replies = [new GatewayError('The gateway ran out of room before completing its response.'), reply('Third pitch.')];
+  await post(summed.id);
+  check('running out of room gets the second attempt too', [stub.calls.length, (await made(summed.id)).made.report.pitch[0].text], [2, 'Third pitch.']);
+
+  stub.calls = [];
+  stub.replies = [new GatewayError('Gateway stream failed with 502')];
+  await post(summed.id);
+  const failed = await made(summed.id);
+  check('a failed call is said in words, and not tried again here',
+    [failed.problem?.startsWith('The overview could not be made.'), stub.calls.length], [true, 1]);
+  check('and the last overview stays', failed.made.report.pitch[0].text, 'Third pitch.');
+
+  stub.replies = ['Nothing.', 'Nothing again.'];
+  await post(summed.id);
+  check('two replies that are not overviews say so, and the last stays',
+    [(await made(summed.id)).problem, store.latestOverview(summed.id).content.pitch], ['The assistant did not write an overview this time. Try again in a minute.', 'Third pitch.']);
+
+  stub.hold = deferred();
+  stub.halfway = deferred();
+  await post(summed.id);
+  await stub.halfway.promise;
+  await (await overviewApi.DELETE({ url: new URL(`https://fixture.invalid/api/overview?project=${summed.id}`), locals: { user: admin } })).json();
+  const stopped = await made(summed.id);
+  check('one being made can be stopped, and says so', [stopped.running, stopped.problem], [false, 'Stopped before it was finished.']);
+  check('and keeps the last overview', store.latestOverview(summed.id).content.pitch, 'Third pitch.');
   stub.hold = null;
   gateway.streamChat = realStream;
   }
