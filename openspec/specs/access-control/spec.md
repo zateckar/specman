@@ -309,13 +309,20 @@ each request and SHALL NOT convert it into a session of its own.
 
 ### Requirement: Applications are shared within the organisation
 Every signed-in colleague SHALL be able to open, continue and approve every application;
-who created one SHALL be recorded but SHALL NOT restrict who may work on it.
+who created one SHALL be recorded but SHALL NOT restrict who may work on it. Only an
+untouched draft MAY be deleted, and only by its creator or an administrator.
 
 #### Scenario: A colleague opens someone else's application
 - **WHEN** a signed-in user opens an application another user created
 - **THEN** they may read it, answer its questions and approve its changes, because a design
   document is commissioned by a team and the person who happened to create it is not its
   only owner; presence on the page is what tells two colleagues they are both at work
+
+#### Scenario: A colleague's untouched draft
+- **WHEN** someone other than its creator or an administrator would delete a draft nobody has
+  touched
+- **THEN** it is refused, though they may open it and work on it, because throwing a draft
+  away is the decision of whoever asked for it, while working on it is anyone's
 
 #### Scenario: Nobody is signed in
 - **WHEN** a request for an application or its endpoints carries no identity

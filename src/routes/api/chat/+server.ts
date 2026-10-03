@@ -37,6 +37,7 @@ import { presence } from '$lib/server/llm/presence';
 import { TurnProgress } from '$lib/server/llm/progress';
 import { createSink, type TurnSink } from '$lib/server/llm/sink';
 import { commitDocument } from '$lib/server/proposals';
+import { isDrafting, STILL_DRAFTING } from '$lib/server/drafting';
 import type { Chapter } from '$lib/server/db/types';
 import type { RequestHandler } from './$types';
 
@@ -93,6 +94,9 @@ export const POST: RequestHandler = async ({ request, locals }) => {
 
 	const project = getProject(projectId);
 	if (!project) throw error(404, 'No such project');
+	// Before the message is stored: kept, it would mark the draft as someone's
+	// work over a turn that could record nothing.
+	if (isDrafting(project.id)) throw error(409, STILL_DRAFTING);
 	const revision = documentRevision(project.id);
 
 	const chapters = projectChapters(project.id);

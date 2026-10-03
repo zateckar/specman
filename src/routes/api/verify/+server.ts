@@ -11,6 +11,7 @@ import {
 import { TRANSCRIPT_TURNS, verifyDocument } from '$lib/server/llm/verification';
 import { summariseIssues } from '$lib/server/llm/issues';
 import { writeVerification } from '$lib/server/proposals';
+import { isDrafting, STILL_DRAFTING } from '$lib/server/drafting';
 import type { RequestHandler } from './$types';
 
 /**
@@ -27,6 +28,9 @@ export const POST: RequestHandler = async ({ request, locals }) => {
 
 	const project = getProject(projectId);
 	if (!project) throw error(404, 'No such project');
+	// It compares the revision at the end of several calls, so it would fail after
+	// the wait — or check half a document.
+	if (isDrafting(project.id)) throw error(409, STILL_DRAFTING);
 	const revision = documentRevision(project.id);
 
 	const chapters = projectChapters(project.id);

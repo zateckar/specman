@@ -50,6 +50,13 @@ export interface Project {
 	kind: 'new' | 'change';
 	/** Monotonic guard for asynchronous computations over the whole document. */
 	document_revision: number;
+	/** `generated` when the assistant drafted the whole document at creation. */
+	origin: 'interview' | 'generated';
+	/**
+	 * The revision the draft left the document at. Equal to `document_revision`
+	 * only while nothing but the drafter has written; see `llm/draft.ts`.
+	 */
+	drafted_revision: number | null;
 }
 
 /** now = build it; later = agreed but not yet; out = explicitly not doing. */

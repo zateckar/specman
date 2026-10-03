@@ -940,7 +940,7 @@ try {
     const con = store.listProjects().find((p) => p.name === 'Con');
     check('a Windows device name is not used as a folder', con.slug, 'con-app');
     check('and its repository exists', existsSync(join(con.repo_path, '.git')), true);
-    const loaded = await home.load({});
+    const loaded = await home.load({ locals: { user: store.getUser(1) } });
     const card = loaded.projects.find((p) => p.id === con.id);
     check('the home card counts what the index counts', card.total, store.projectChapters(con.id).filter((c) => c.applicable !== 0).length);
 
@@ -1078,6 +1078,250 @@ try {
   store.setChapterApplicable(inheriting.id, 'security', true);
   check('and bringing it back again adds nothing twice', standardRules().length, 1);
   store.updateStandard(securityStandard.id, { active: false });
+
+  console.log('\n--- drafting a whole document ---');
+  {
+  const drafting = await import('../src/lib/server/drafting.ts');
+  const draftApi = await import('../src/routes/api/draft/+server.ts');
+  const askApi = await import('../src/routes/api/ask/+server.ts');
+  const { UNCHECKED_CHAPTER } = await import('../src/lib/server/llm/draft.ts');
+  const admin = store.getUser(1);
+  database.prepare("INSERT INTO users (username, display_name) VALUES ('drafting-colleague', 'A colleague')").run();
+  const colleague = database.prepare("SELECT * FROM users WHERE username = 'drafting-colleague'").get();
+
+  check('an application from before drafts reads as an interview',
+    [store.getProject(999).origin, store.getProject(999).drafted_revision], ['interview', null]);
+
+  // A model that drafts whatever chapter it is asked for — with a rule filed
+  // under another chapter and a reference, the same rule twice, and a decision
+  // mislabelled as the user's — and can be held, failed or emptied per chapter.
+  const stub = { hold: null, holdUnless: null, fail: new Set(), emptyOnce: new Set(), noDecision: new Set(), calls: [] };
+  const done = { type: 'done', servedBy: 'fixture', outputTokens: 10 };
+  gateway.streamChat = async function* (req) {
+    if (!req.system.includes('WRITE THESE, IN THIS ORDER')) { yield done; return; }
+    const key = /\(key: ([^)]+)\)/.exec(req.system)[1];
+    stub.calls.push({ key, brief: req.system.includes('DID NOT FINISH'), maxTokens: req.maxTokens });
+    if (stub.hold && key !== stub.holdUnless) {
+      await new Promise((resolve, reject) => {
+        stub.hold.promise.then(resolve);
+        req.signal?.addEventListener('abort', () => reject(req.signal.reason), { once: true });
+      });
+    }
+    if (stub.fail.has(key)) throw new Error('Simulated drafting outage');
+    if (stub.emptyOnce.delete(key)) { yield { type: 'text', text: 'I could not write it.' }; yield done; return; }
+    const rule = `<requirement chapter="overview" ref="REQ-001" scope="now">The ${key} rule must hold.\nWHEN it is used\nTHEN it works</requirement>`;
+    yield { type: 'text', text: `<chapter key="${key}">Drafted ${key} prose.</chapter>${rule}${rule.replace(' ref="REQ-001"', '')}` +
+      (stub.noDecision.has(key) ? '' : `<decision source="user" chapter="overview">Chose ${key}.\nWhy: sensible</decision>`) };
+    yield done;
+  };
+  gateway.callWithTools = async () => ({
+    calls: [{ name: 'record_chapter_state', input: { status: 'complete', open_questions: [] } }],
+    text: '', servedBy: 'fixture', attempts: 1
+  });
+
+  const draftForm = (name, fields = {}) => ({ locals: { user: admin }, request: new Request('https://fixture.invalid/?/create', {
+    method: 'POST', body: new URLSearchParams({ name, description: 'Book a pool car for a day', reach: 'team', personalData: 'no', start: 'draft', ...fields })
+  }) });
+  const settled = async (id) => {
+    for (let i = 0; i < 3000 && drafting.isDrafting(id); i++) await new Promise((r) => setTimeout(r, 10));
+  };
+  const until = async (test) => {
+    for (let i = 0; i < 3000 && !test(); i++) await new Promise((r) => setTimeout(r, 10));
+  };
+  const startDrafted = async (name) => {
+    process.chdir(root);
+    try {
+      const result = await home.actions.create(draftForm(name)).catch((thrown) => thrown);
+      if (result.status !== 303) throw new Error(`creating "${name}" answered ${result.status}`);
+    } finally {
+      process.chdir(cwd);
+    }
+    return store.listProjects().find((p) => p.name === name);
+  };
+  const drafted = async (name) => {
+    const project = await startDrafted(name);
+    await settled(project.id);
+    return store.getProject(project.id);
+  };
+  const isAiDraft = (project) => drafting.draftView(store.getProject(project.id), admin).untouched;
+  const statusOf = (thrown) => thrown?.status;
+  const leaves = (id) => {
+    const chapters = store.projectChapters(id);
+    const parents = new Set(chapters.map((c) => c.parent_key).filter(Boolean));
+    return chapters.filter((c) => c.applicable !== 0 && !parents.has(c.key));
+  };
+
+  process.chdir(root);
+  try {
+    const nothing = await home.actions.create(draftForm('Draft from nothing', { description: '' }));
+    check('a draft with nothing to draft from is refused in words', [nothing.status, /describe/i.test(nothing.data.message)], [400, true]);
+    check('and creates nothing', store.listProjects().some((p) => p.name === 'Draft from nothing'), false);
+    const long = await home.actions.create(draftForm('Draft at length', { description: 'x'.repeat(2001) }));
+    check('a description past the limit is refused', long.status, 400);
+  } finally {
+    process.chdir(cwd);
+  }
+
+  // While the draft runs: everything that would race it waits.
+  stub.hold = deferred();
+  const running = await startDrafted('Pool car draft');
+  check('a draft runs on after the page has gone to the workspace', drafting.isDrafting(running.id), true);
+  check('and the page says so, marked as the assistant\'s', [drafting.draftView(running, admin).state, isAiDraft(running)], ['running', true]);
+  check('a turn is refused while drafting', statusOf(await chat.POST(event({ projectId: running.id, chapterKey: 'overview', message: 'Mine' })).catch((e) => e)), 409);
+  check('and its message was not stored', store.recentMessages(running.id, 'overview').length, 0);
+  check('an open question is refused while drafting',
+    statusOf(await askApi.POST(event({ projectId: running.id, chapterKey: 'overview', question: 'Who?' })).catch((e) => e)), 409);
+  check('a whole-document check is refused while drafting', statusOf(await verifyApi.POST(event({ projectId: running.id })).catch((e) => e)), 409);
+  check('the diagram is refused while drafting', statusOf(await architectureApi.POST(event({ projectId: running.id })).catch((e) => e)), 409);
+  check('approving is refused while drafting', (await approveForm(running)).status, 409);
+  check('a second run is refused while one is going', statusOf(await draftApi.POST(event({ projectId: running.id })).catch((e) => e)), 409);
+  stub.hold.resolve();
+  stub.hold = null;
+  await settled(running.id);
+
+  const finished = store.getProject(running.id);
+  const chapters = leaves(finished.id);
+  check('every chapter that applies was drafted', chapters.every((c) => c.content_md.includes('Drafted')), true);
+  check('a chapter the triage set aside was not', store.getChapter(finished.id, 'telemetry').content_md, '');
+  check('the Overview was drafted first', stub.calls[0].key, 'overview');
+  const decisions = store.projectDecisions(finished.id);
+  check('every decision is the assistant\'s and awaits confirmation',
+    decisions.every((d) => d.source === 'agent' && d.status === 'proposed'), true);
+  check('a decision is filed in the chapter that made it', decisions.find((d) => d.statement === 'Chose security.')?.chapter_key, 'security');
+  const securityRules = store.chapterRequirements(finished.id, 'security').filter((r) => r.source !== 'standard');
+  check('a rule is filed in its own chapter, once', securityRules.map((r) => r.statement), ['The security rule must hold.']);
+  check('the revision chain held to the end', finished.drafted_revision, finished.document_revision);
+  check('so the finished draft is untouched and finished',
+    [isAiDraft(finished), drafting.draftView(finished, admin).state], [true, 'finished']);
+  const history = (await repo.log(finished.repo_path, 50)).map((entry) => entry.message);
+  check('each chapter was committed as it landed, under its own name',
+    chapters.every((c) => history.includes(`Draft ${c.title}`)), true);
+  const securityCommit = (await simpleGit(finished.repo_path).raw(['log', '--grep=^Draft Security$', '--name-only', '--format=']))
+    .split('\n').filter((path) => path.startsWith('docs/'));
+  check('and a chapter\'s commit holds that chapter alone', securityCommit.length, 1);
+  check('the proposal is named for what it holds', proposals.openProposal(finished.id).title, 'Drafted by the assistant');
+  const homeData = await home.load({ locals: { user: admin } });
+  check('its card carries the mark, and its creator may delete it',
+    [homeData.projects.find((p) => p.id === finished.id).draft.untouched, homeData.projects.find((p) => p.id === finished.id).draft.canDelete], [true, true]);
+  const colleagueHome = await home.load({ locals: { user: colleague } });
+  check('a colleague sees the mark but no way to delete it',
+    [colleagueHome.projects.find((p) => p.id === finished.id).draft.untouched, colleagueHome.projects.find((p) => p.id === finished.id).draft.canDelete], [true, false]);
+  check('nor can a colleague delete it anyway', await drafting.deleteDraft(finished, colleague), 'forbidden');
+
+  // Looking is not touching.
+  await verifyApi.POST(event({ projectId: finished.id }));
+  await askApi.POST(event({ projectId: finished.id, chapterKey: 'overview', question: 'Who books the cars?' }));
+  check('a whole-document check and an open question asked leave the mark', isAiDraft(finished), true);
+
+  // Anything of a person's ends it, without any of these paths clearing a flag.
+  const answered = await drafted('Draft answered');
+  gateway.callWithTools = async () => ({ calls: [], text: '', servedBy: 'fixture', attempts: 1 });
+  await (await chat.POST(event({ projectId: answered.id, chapterKey: 'overview', message: 'Hello?' }))).text();
+  check('an answer that changed nothing ends the mark', isAiDraft(answered), false);
+  check('and deleting it is refused', await drafting.deleteDraft(store.getProject(answered.id), admin), 'touched');
+  gateway.callWithTools = async () => ({
+    calls: [{ name: 'record_chapter_state', input: { status: 'complete', open_questions: [] } }],
+    text: '', servedBy: 'fixture', attempts: 1
+  });
+
+  const confirmed = await drafted('Draft confirmed');
+  await decisionsApi.POST(event({ projectId: confirmed.id, id: store.projectDecisions(confirmed.id)[0].id, action: 'confirm' }));
+  check('a confirmed assumption ends the mark', isAiDraft(confirmed), false);
+
+  const discarded = await drafted('Draft discarded');
+  await decisionsApi.POST(event({ projectId: discarded.id, id: store.projectDecisions(discarded.id)[0].id, action: 'discard' }));
+  check('a rejected assumption ends the mark', isAiDraft(discarded), false);
+
+  const included = await drafted('Draft included');
+  await proposals.includeChapter(included, 'telemetry');
+  check('an included chapter ends the mark', isAiDraft(included), false);
+  check('and the chapter it brought in is offered for drafting, without saying the draft stopped',
+    [drafting.draftView(store.getProject(included.id), admin).state, drafting.draftView(store.getProject(included.id), admin).remaining],
+    ['undrafted', [store.getChapter(included.id, 'telemetry').title]]);
+
+  const approved = await drafted('Draft approved');
+  await approveLatest(approved, proposals.openProposal(approved.id));
+  check('an approval ends the mark', isAiDraft(approved), false);
+
+  const together = await drafted('Draft confirmed together');
+  const allRight = await (await decisionsApi.POST(event({ projectId: together.id, action: 'confirm-chapter', chapterKey: 'security' }))).json();
+  check('a chapter\'s assumptions are confirmed together', [allRight.confirmed,
+    store.projectDecisions(together.id).filter((d) => d.chapter_key === 'security' && d.status !== 'confirmed').length], [1, 0]);
+  check('in one commit', (await repo.log(together.repo_path, 5)).map((e) => e.message)[0], 'Confirm the assumptions in Security');
+  check('and that ends the mark too', isAiDraft(together), false);
+
+  // A person's write between two chapters breaks the chain for good, and a
+  // chapter they got to first is not overwritten.
+  stub.hold = deferred();
+  stub.holdUnless = 'overview';
+  const raced = await startDrafted('Draft raced');
+  await until(() => drafting.draftView(store.getProject(raced.id), admin).writing.length > 0 &&
+    store.getChapter(raced.id, 'overview').content_md !== '');
+  store.addMessage(raced.id, 'security', 'user', 'Security is mine to describe.');
+  store.confirmDecision(raced.id, store.projectDecisions(raced.id).find((d) => d.chapter_key === 'overview').id);
+  stub.hold.resolve();
+  stub.hold = null;
+  stub.holdUnless = null;
+  await settled(raced.id);
+  const afterRace = store.getProject(raced.id);
+  check('a write between two chapters breaks the chain for good',
+    [afterRace.drafted_revision < afterRace.document_revision, isAiDraft(afterRace)], [true, false]);
+  check('the draft still finishes the other chapters', store.getChapter(raced.id, 'operations').content_md.includes('Drafted'), true);
+  check('but not one a person got to first', store.getChapter(raced.id, 'security').content_md, '');
+
+  // A chapter that fails, one that comes back empty once, and one with no decision.
+  stub.fail.add('integration');
+  stub.emptyOnce.add('data');
+  stub.noDecision.add('licenses');
+  stub.calls = [];
+  const rough = await drafted('Draft rough');
+  stub.fail.clear();
+  stub.noDecision.clear();
+  check('an empty reply is asked for once more, with more room and briefly',
+    stub.calls.filter((c) => c.key === 'data').map((c) => [c.brief, c.maxTokens]), [[false, 16000], [true, 24000]]);
+  check('and the second answer is kept', store.getChapter(rough.id, 'data').content_md.includes('Drafted'), true);
+  check('a chapter whose reply recorded no decision still has one to check',
+    store.projectDecisions(rough.id).filter((d) => d.chapter_key === 'licenses').map((d) => [d.statement, d.status]),
+    [[UNCHECKED_CHAPTER.statement, 'proposed']]);
+  const roughView = drafting.draftView(store.getProject(rough.id), admin);
+  check('a failed chapter is named, and the draft reads as stopped',
+    [roughView.state, roughView.failed, roughView.untouched], ['stopped', [store.getChapter(rough.id, 'integration').title], true]);
+  check('nothing of the failed chapter was saved',
+    [store.getChapter(rough.id, 'integration').content_md, store.projectDecisions(rough.id).some((d) => d.chapter_key === 'integration')], ['', false]);
+  await (await draftApi.POST(event({ projectId: rough.id }))).json();
+  await settled(rough.id);
+  check('drafting the rest finishes it, still untouched',
+    [drafting.draftView(store.getProject(rough.id), admin).state, isAiDraft(rough)], ['finished', true]);
+
+  // Deleting.
+  process.chdir(root);
+  const deleteForm = (project, user) => ({ locals: { user }, request: new Request('https://fixture.invalid/?/delete', {
+    method: 'POST', body: new URLSearchParams({ project: String(project.id) })
+  }) });
+  try {
+    const refused = await home.actions.delete(deleteForm(answered, admin)).catch((e) => e);
+    check('a touched application cannot be deleted from the page', [refused.status, /someone has worked/i.test(refused.data.deleteMessage)], [409, true]);
+    const gone = await home.actions.delete(deleteForm(finished, admin)).catch((e) => e);
+    check('its creator deletes an untouched draft', [gone.status, store.getProject(finished.id)], [303, undefined]);
+    check('and its folder is gone', existsSync(finished.repo_path), false);
+    check('with everything stored against it',
+      database.prepare('SELECT COUNT(*) AS n FROM decisions WHERE project_id = ?').get(finished.id).n, 0);
+    await rejects('a writer queued behind the deletion does not make its history again',
+      () => proposals.commitDocument(finished, 'Late check'), (cause) => cause.name === 'ApplicationDeleted');
+    check('so no folder came back', existsSync(finished.repo_path), false);
+  } finally {
+    process.chdir(cwd);
+  }
+
+  stub.hold = deferred();
+  const midway = await startDrafted('Draft deleted midway');
+  check('a draft still being written can be deleted', await drafting.deleteDraft(store.getProject(midway.id), admin), 'deleted');
+  check('the draft stopped, and nothing of it is left', [drafting.isDrafting(midway.id), store.getProject(midway.id), existsSync(midway.repo_path)], [false, undefined, false]);
+  stub.hold.resolve();
+  stub.hold = null;
+  await new Promise((r) => setTimeout(r, 50));
+  check('nothing it was still doing brought the folder back', existsSync(midway.repo_path), false);
+  }
 } finally {
   globalThis.fetch = realFetch;
   gateway.streamChat = realStream;

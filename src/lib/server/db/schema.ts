@@ -244,5 +244,12 @@ export const ADDED_COLUMNS: Array<{ table: string; column: string; definition: s
 	// in has neither a password nor a linked company account, and the people page
 	// otherwise reports the normal case — everyone, in the usual deployment — as
 	// unable to sign in at all.
-	{ table: 'users', column: 'created_via', definition: `TEXT NOT NULL DEFAULT ''` }
+	{ table: 'users', column: 'created_via', definition: `TEXT NOT NULL DEFAULT ''` },
+
+	// How an application was started: 'interview', or 'generated' when the
+	// assistant drafted the whole of it. The default is the backfill — every
+	// application from before this was started by interview. `drafted_revision` is
+	// the document revision the draft left it at; see `llm/draft.ts`.
+	{ table: 'projects', column: 'origin', definition: `TEXT NOT NULL DEFAULT 'interview'` },
+	{ table: 'projects', column: 'drafted_revision', definition: 'INTEGER' }
 ];

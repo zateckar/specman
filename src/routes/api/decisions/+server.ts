@@ -1,6 +1,6 @@
 import { error, json } from '@sveltejs/kit';
-import { getDecision, getProject } from '$lib/server/db';
-import { DecisionNotFound, recordDecision } from '$lib/server/proposals';
+import { getDecision, getProject, projectDecisions } from '$lib/server/db';
+import { confirmChapter, DecisionNotFound, recordDecision } from '$lib/server/proposals';
 import type { RequestHandler } from './$types';
 
 /**
@@ -11,14 +11,33 @@ import type { RequestHandler } from './$types';
 export const POST: RequestHandler = async ({ request, locals }) => {
 	if (!locals.user) throw error(401, 'Not signed in');
 
-	const { projectId, id, action } = (await request.json()) as {
+	const { projectId, id, action, chapterKey } = (await request.json()) as {
 		projectId: number;
 		id: number;
-		action: 'confirm' | 'discard';
+		action: 'confirm' | 'discard' | 'confirm-chapter';
+		chapterKey?: string;
 	};
 
 	const project = getProject(projectId);
 	if (!project) throw error(404, 'No such project');
+
+	// Every assumption in one chapter at once — for someone who has read a drafted
+	// chapter and agrees with it. One commit, not one per assumption.
+	if (action === 'confirm-chapter') {
+		if (!chapterKey) throw error(400, 'No chapter given');
+		try {
+			const confirmed = await confirmChapter(project, chapterKey);
+			return json({ chapterKey, confirmed });
+		} catch (cause) {
+			console.error('[decisions] could not record the chapter confirmation:', cause);
+			const left = projectDecisions(project.id).filter(
+				(d) => d.chapter_key === chapterKey && d.source !== 'user' && d.status !== 'confirmed'
+			);
+			throw error(503, left.length === 0
+				? 'Your choice is saved, but it could not be added to the application’s history. It will be included when the next change is recorded.'
+				: 'Your choice has not been recorded. The repository could not finish its pending work. Check the document before trying again.');
+		}
+	}
 
 	const decision = getDecision(id);
 	if (!decision || decision.project_id !== project.id) {

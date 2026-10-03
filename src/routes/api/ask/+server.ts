@@ -1,6 +1,7 @@
 import { error, json } from '@sveltejs/kit';
 import { addMessage, getChapter, getProject, setMessageOptions } from '$lib/server/db';
 import { suggestOptions } from '$lib/server/llm/agent';
+import { isDrafting, STILL_DRAFTING } from '$lib/server/drafting';
 import type { RequestHandler } from './$types';
 
 /**
@@ -27,6 +28,8 @@ export const POST: RequestHandler = async ({ request, locals }) => {
 
 	const project = getProject(projectId);
 	if (!project) throw error(404, 'No such project');
+	// The conversation is closed while a draft runs; this would open it.
+	if (isDrafting(project.id)) throw error(409, STILL_DRAFTING);
 
 	const chapter = chapterKey ? getChapter(project.id, chapterKey) : null;
 	if (chapterKey && !chapter) throw error(404, 'No such chapter');

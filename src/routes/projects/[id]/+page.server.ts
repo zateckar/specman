@@ -10,6 +10,7 @@ import { effectiveStatus, pendingByChapter } from '$lib/server/llm/decisions';
 import { validateDocument } from '$lib/server/llm/validation';
 import { includeChapter, openProposal, proposalDiff, reviewRevision } from '$lib/server/proposals';
 import { stripChapterHeading } from '$lib/server/markdown';
+import { draftView } from '$lib/server/drafting';
 import type { Actions, PageServerLoad } from './$types';
 
 export const actions: Actions = {
@@ -46,9 +47,10 @@ export const actions: Actions = {
 	}
 };
 
-export const load: PageServerLoad = async ({ params, url }) => {
+export const load: PageServerLoad = async ({ params, url, locals }) => {
 	const project = getProject(Number(params.id));
 	if (!project) throw error(404, 'No such application');
+	const draft = project.origin === 'generated' && locals.user ? draftView(project, locals.user) : null;
 
 	const chapters = projectChapters(project.id);
 	const activeKey = url.searchParams.get('chapter');
@@ -116,6 +118,7 @@ export const load: PageServerLoad = async ({ params, url }) => {
 			options: m.options
 		})),
 		proposal: proposal ? { id: proposal.id, branch: proposal.branch } : null,
-		pendingChanges
+		pendingChanges,
+		draft
 	};
 };

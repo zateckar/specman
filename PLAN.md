@@ -192,6 +192,12 @@ and nothing called them. An installation with only Gemini configured failed ever
 feature on `LLM_URL`. The documentation check proves every file is described; it cannot
 prove a described setting is used. Grep for the getter, not the variable.
 
+**Work given up has to leave the queue.** Deleting a draft stops its job and waits for it to
+settle. Its chapters waiting for a drafting slot behind other people's long calls would have
+held the deletion for minutes, only to return the moment they got one, so the wait timed out
+and refused a deletion with nothing left to do. A queue that cannot be left makes "stop" mean
+"stop eventually". (From drafting a whole document, 2026-10-03.)
+
 **Slow and silent feel the same.** A turn streamed text for its whole length, and the user
 saw an empty bubble for most of it, because the model writes the chapter first and the reply
 last. Nothing was slow that had not been slow before; it was only invisible. Say what is
@@ -207,8 +213,10 @@ first folder under `openspec/changes/`:
   (github.com or Enterprise), and a target organisation.
 - **Streaming the verification run** if the ~80-second request proves too long behind a
   proxy.
-- **Deleting a project** — currently only possible from the database and `data/repos/`.
-  `deleteProject` exists, but only to undo a creation whose repository could not be made.
+- **Deleting a project someone has worked on** — still only possible from the database and
+  `data/repos/`. Since 2026-10-03 an untouched AI draft can be deleted by its creator or an
+  administrator (`whole-document-draft`); anything holding a person's work cannot, and
+  deciding who may throw that away is the open question, not the mechanism.
 - **Importing an ArchiMate file back.** The export is one-way: a model edited in Archi cannot
   be brought back in, and the next *Draw again* would overwrite it in any case.
 
@@ -258,7 +266,18 @@ first folder under `openspec/changes/`:
   would not fix it: `README.md`, `specman.manifest.json` and `decisions.md` are rewritten
   whole by every turn, so any two overlapping turns contend for them whatever is staged.
   Fixing it properly means a working tree per writer, which is the same change as making the
-  lock survive a second process.
+  lock survive a second process. The drafter does not add to this: its chapters land in
+  parallel, and written first and committed after, one commit named for one chapter carried
+  eight — so it writes each chapter and commits it as one held section (`writeAndCommit`).
+- **A draft is the assistant's only until someone touches it.** "AI draft" is derived from the
+  document revision, so nothing has to clear it — and nothing can bring it back. After the
+  first answer, confirmation or inclusion, the rules the draft invented read like any the
+  assistant wrote in an interview; only its unconfirmed decisions still say "decided for you".
+- **A draft runs in this process and is not resumed.** The job is in memory, like the lock and
+  presence: a restart ends it, and the workspace then offers to draft the rest rather than
+  starting again at boot, where a chapter that fails every time would fail on every restart.
+  A second process neither sees a running draft nor refuses a turn beside it. At most three
+  drafting calls run at once across the installation, queued in arrival order.
 - **How an account signs in is recorded, not inferred.** `users.created_via` exists because
   the people page derived it from the password and company-account columns, and an account
   the gateway signs in has neither — so it reported everybody in a proxied installation as

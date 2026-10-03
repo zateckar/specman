@@ -7,11 +7,19 @@ import { DEFAULT_CHAPTERS, DEFAULT_TEMPLATE } from './default-template';
 import { DEFAULT_STANDARDS } from './default-standards';
 import { chapterApplies, reasonForSkipping, toProfile, type Profile } from '../llm/profile';
 import { arrangeChapters, claimSectionKeys, distributeContent, reconcileSections } from '../llm/subchapters';
-import { nextRef } from '../llm/requirements';
+import { nextRef, sameStatement } from '../llm/requirements';
+import {
+	chaptersToDraft,
+	isUntouchedDraft,
+	UNCHECKED_CHAPTER,
+	type ChapterHoldings,
+	type DraftEvidence
+} from '../llm/draft';
 import { namesChapter } from '../llm/questions';
 import type {
 	AnswerOption,
 	Chapter,
+	ChapterStatus,
 	Decision,
 	Message,
 	Project,
@@ -592,6 +600,8 @@ export function createProject(args: {
 	repoPath: string;
 	profile?: Profile;
 	kind?: 'new' | 'change';
+	/** `generated` when the assistant is to draft the whole document. */
+	origin?: 'interview' | 'generated';
 }): Project {
 	// One transaction: a failure part-way through the chapters or the standards
 	// used to leave an application with some of its chapters, listed on the home
@@ -605,8 +615,8 @@ function insertProject(args: Parameters<typeof createProject>[0]): Project {
 
 	database
 		.prepare(
-			`INSERT INTO projects (name, slug, description, template_id, owner_id, repo_path, profile, kind)
-			 VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+			`INSERT INTO projects (name, slug, description, template_id, owner_id, repo_path, profile, kind, origin)
+			 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
 		)
 		.run(
 			args.name,
@@ -616,7 +626,8 @@ function insertProject(args: Parameters<typeof createProject>[0]): Project {
 			args.ownerId,
 			args.repoPath,
 			JSON.stringify(profile),
-			args.kind ?? 'new'
+			args.kind ?? 'new',
+			args.origin ?? 'interview'
 		);
 
 	const project = asRow<Project>(
@@ -653,7 +664,16 @@ function insertProject(args: Parameters<typeof createProject>[0]): Project {
 	}
 
 	inheritStandards(project.id, profile);
-	return project;
+
+	// The chain the draft keeps starts here, after the chapters and standards have
+	// moved the revision: nothing of anyone's is in the document yet.
+	if (args.origin === 'generated') {
+		database.prepare('UPDATE projects SET drafted_revision = document_revision WHERE id = ?').run(project.id);
+	}
+
+	// Read again: the row selected above predates every chapter and standard, and
+	// the revision they moved.
+	return getProject(project.id)!;
 }
 
 /**
@@ -778,11 +798,165 @@ export function setChapterApplicable(
 /**
  * Remove an application and everything stored against it.
  *
- * Only for undoing a creation whose repository could not be made; nothing in
- * the interface deletes an application. Every dependent table cascades.
+ * Only for undoing a creation whose repository could not be made. The interface
+ * deletes nothing but an untouched draft, through `deleteUntouchedDraft`. Every
+ * dependent table cascades.
  */
 export function deleteProject(id: number): void {
 	db().prepare('DELETE FROM projects WHERE id = ?').run(id);
+}
+
+/* ------------------------------------------------------------------- drafts */
+
+/**
+ * What people have put into each chapter: their messages, any decision, and
+ * rules other than inherited standards. A chapter missing from the map holds none.
+ */
+export function chapterHoldings(projectId: number, chapterKey?: string): Map<string, ChapterHoldings> {
+	const database = db();
+	const only = chapterKey === undefined ? '' : ' AND chapter_key = ?';
+	const params = chapterKey === undefined ? [projectId] : [projectId, chapterKey];
+	const count = (sql: string) =>
+		asRows<{ chapter_key: string; n: number }>(database.prepare(sql).all(...params));
+
+	const holdings = new Map<string, ChapterHoldings>();
+	const at = (key: string) => {
+		let found = holdings.get(key);
+		if (!found) {
+			found = { messages: 0, decisions: 0, rules: 0 };
+			holdings.set(key, found);
+		}
+		return found;
+	};
+	for (const row of count(`SELECT chapter_key, COUNT(*) AS n FROM messages
+			WHERE project_id = ? AND role = 'user' AND chapter_key IS NOT NULL${only} GROUP BY chapter_key`)) {
+		at(row.chapter_key).messages = Number(row.n);
+	}
+	for (const row of count(`SELECT chapter_key, COUNT(*) AS n FROM decisions
+			WHERE project_id = ?${only} GROUP BY chapter_key`)) {
+		at(row.chapter_key).decisions = Number(row.n);
+	}
+	for (const row of count(`SELECT chapter_key, COUNT(*) AS n FROM requirements
+			WHERE project_id = ? AND source <> 'standard'${only} GROUP BY chapter_key`)) {
+		at(row.chapter_key).rules = Number(row.n);
+	}
+	return holdings;
+}
+
+/** The facts `isUntouchedDraft` reads. Undefined for an application that is gone. */
+export function draftEvidence(projectId: number): DraftEvidence | undefined {
+	const row = asRow<{
+		origin: string;
+		document_revision: number;
+		drafted_revision: number | null;
+		user_messages: number;
+		reviewed: number;
+	}>(
+		db()
+			.prepare(
+				`SELECT origin, document_revision, drafted_revision,
+				        (SELECT COUNT(*) FROM messages m WHERE m.project_id = p.id AND m.role = 'user') AS user_messages,
+				        (SELECT COUNT(*) FROM proposals r WHERE r.project_id = p.id AND r.state <> 'draft')
+				      + (SELECT COUNT(*) FROM approval_intents a WHERE a.project_id = p.id) AS reviewed
+				   FROM projects p WHERE p.id = ?`
+			)
+			.get(projectId)
+	);
+	if (!row) return undefined;
+	return {
+		origin: row.origin,
+		documentRevision: Number(row.document_revision),
+		draftedRevision: row.drafted_revision === null ? null : Number(row.drafted_revision),
+		userMessages: Number(row.user_messages),
+		reviewed: Number(row.reviewed)
+	};
+}
+
+export function isUntouched(projectId: number): boolean {
+	const evidence = draftEvidence(projectId);
+	return !!evidence && isUntouchedDraft(evidence);
+}
+
+/**
+ * File one drafted chapter: its prose, its rules and its decisions, in one
+ * transaction. `taken` when the chapter is no longer the drafter's to write —
+ * someone has put something into it since the draft began, or it is gone — and
+ * nothing is written.
+ *
+ * The draft's revision follows the document only while nothing else has written
+ * to it; once anything has, the chain is broken for good and the application is
+ * no longer an untouched draft. See `llm/draft.ts`.
+ */
+export function recordDraftedChapter(
+	projectId: number,
+	chapterKey: string,
+	draft: {
+		prose: string;
+		rules: Array<{ statement: string; scope: string; scenarios: Array<{ when: string; then: string }>; existing: boolean }>;
+		decisions: Array<{ statement: string; rationale: string }>;
+		/** The completeness verdict, taken before the write so one commit holds both. */
+		status: ChapterStatus;
+		openQuestions: string[];
+	}
+): 'written' | 'taken' {
+	return atomically(() => {
+		const database = db();
+		const before = asRow<{ document_revision: number; drafted_revision: number | null }>(
+			database.prepare('SELECT document_revision, drafted_revision FROM projects WHERE id = ?').get(projectId)
+		);
+		if (!before) return 'taken';
+		const stillOpen = chaptersToDraft(projectChapters(projectId), chapterHoldings(projectId, chapterKey));
+		if (!stillOpen.some((c) => c.key === chapterKey)) return 'taken';
+
+		updateChapterState(projectId, chapterKey, {
+			status: draft.status,
+			openQuestions: draft.openQuestions,
+			contentMd: draft.prose
+		});
+
+		// Every rule is new: there is nothing of the draft's to change. One worded
+		// like a rule already here — a company standard, usually — or like one
+		// earlier in the same reply is the same rule.
+		const held = chapterRequirements(projectId, chapterKey).map((r) => r.statement);
+		for (const rule of draft.rules) {
+			if (held.some((statement) => sameStatement(statement, rule.statement))) continue;
+			held.push(rule.statement);
+			saveRequirement(projectId, { chapterKey, ...rule, source: 'agent' });
+		}
+
+		const decisions = draft.decisions.length > 0 ? draft.decisions : [UNCHECKED_CHAPTER];
+		for (const decision of decisions) {
+			saveDecision(projectId, { chapterKey, ...decision, source: 'agent' });
+		}
+
+		if (before.drafted_revision !== null && Number(before.drafted_revision) === Number(before.document_revision)) {
+			database.prepare('UPDATE projects SET drafted_revision = document_revision WHERE id = ?').run(projectId);
+		}
+		return 'written';
+	});
+}
+
+/**
+ * Delete an application only if it is still an untouched draft, judged in the
+ * same transaction as the deletion. Every dependent table cascades.
+ */
+export function deleteUntouchedDraft(projectId: number): boolean {
+	return atomically(() => {
+		if (!isUntouched(projectId)) return false;
+		db().prepare('DELETE FROM projects WHERE id = ?').run(projectId);
+		return true;
+	});
+}
+
+/** Confirm every assumption the assistant made in one chapter. How many were confirmed. */
+export function confirmChapterDecisions(projectId: number, chapterKey: string): number {
+	const result = db()
+		.prepare(
+			`UPDATE decisions SET status = 'confirmed', confirmed_at = datetime('now')
+			  WHERE project_id = ? AND chapter_key = ? AND source <> 'user' AND status <> 'confirmed'`
+		)
+		.run(projectId, chapterKey);
+	return Number(result.changes);
 }
 
 export function listProjects(): Project[] {

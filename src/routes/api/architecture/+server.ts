@@ -8,6 +8,7 @@ import {
 import { deriveArchitecture } from '$lib/server/llm/architect';
 import { layoutDiagram } from '$lib/server/llm/diagram';
 import { describeFailure } from '$lib/server/llm/failures';
+import { isDrafting, STILL_DRAFTING } from '$lib/server/drafting';
 import type { RequestHandler } from './$types';
 
 /**
@@ -28,6 +29,8 @@ export const POST: RequestHandler = async ({ request, locals }) => {
 
 	const project = getProject(projectId);
 	if (!project) throw error(404, 'No such project');
+	// It would draw, and keep, a picture of half a document.
+	if (isDrafting(project.id)) throw error(409, STILL_DRAFTING);
 
 	let model;
 	try {

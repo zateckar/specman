@@ -47,7 +47,7 @@ import {
 } from '../src/lib/server/llm/decisions.ts';
 import { requirementDelta, summariseDelta } from '../src/lib/server/llm/delta.ts';
 import { mergeIssues, summariseIssues, toIssue } from '../src/lib/server/llm/issues.ts';
-import { mapWithLimit } from '../src/lib/server/llm/parallel.ts';
+import { createSlots, mapWithLimit } from '../src/lib/server/llm/parallel.ts';
 import {
 	chapterApplies,
 	describeProfile,
@@ -88,6 +88,16 @@ import { FREE_ATTEMPTS, SignInAttempts } from '../src/lib/server/llm/attempts.ts
 import { createLocks } from '../src/lib/server/llm/lock.ts';
 import { createPresence } from '../src/lib/server/llm/presence.ts';
 import { readFrames } from '../src/lib/sse.ts';
+import {
+	asDraftBlock,
+	buildDraftPrompt,
+	chaptersToDraft,
+	draftedProse,
+	draftRequest,
+	draftState,
+	isUntouchedDraft,
+	UNCHECKED_CHAPTER
+} from '../src/lib/server/llm/draft.ts';
 
 let pass = 0;
 let fail = 0;
@@ -809,6 +819,50 @@ check(
 	await mapWithLimit([1, 2], 10, async (n) => n),
 	[1, 2]
 );
+
+{
+	// One limit shared by runs that know nothing of each other, as drafts started
+	// by different people are.
+	const slots = createSlots(2);
+	let now = 0;
+	let most = 0;
+	const order = [];
+	const job = (name, ms) => slots.run(async () => {
+		now += 1;
+		most = Math.max(most, now);
+		order.push(name);
+		await new Promise((r) => setTimeout(r, ms));
+		now -= 1;
+		return name;
+	});
+	const first = [job('a', 10), job('b', 10)];
+	const second = [job('c', 1), job('d', 1), job('e', 1)];
+	check('the rest wait their turn', [slots.busy, slots.waiting], [2, 3]);
+	check('every caller gets its own answer', await Promise.all([...first, ...second]), ['a', 'b', 'c', 'd', 'e']);
+	check('never more than the limit across callers', most, 2);
+	check('in the order they asked', order, ['a', 'b', 'c', 'd', 'e']);
+	check('and nothing is left holding a slot', [slots.busy, slots.waiting], [0, 0]);
+
+	const failing = createSlots(1);
+	const broken = failing.run(async () => { throw new Error('gateway down'); });
+	const after = failing.run(async () => 'next');
+	check('a failure is the caller\'s', await broken.then(() => 'ok', (e) => e.message), 'gateway down');
+	check('and still hands its slot on', await after, 'next');
+
+	const held = createSlots(1);
+	let release;
+	const holder = held.run(() => new Promise((r) => { release = r; }));
+	const stop = new AbortController();
+	const given = held.run(async () => 'ran', stop.signal);
+	const behind = held.run(async () => 'behind');
+	stop.abort(new Error('deleted'));
+	check('work given up while waiting leaves the queue at once',
+		[await given.then(() => 'ran', (e) => e.message), held.waiting], ['deleted', 1]);
+	release('held');
+	check('and the next in line still gets the slot', [await holder, await behind, held.busy], ['held', 'behind', 0]);
+	check('work given up before asking never queues',
+		await held.run(async () => 'ran', stop.signal).then(() => 'ran', (e) => e.message), 'deleted');
+}
 
 console.log('\n--- which chapters an application needs ---');
 
@@ -2187,6 +2241,18 @@ console.log('\n--- who else is in this document ---');
 	check('and once it finishes they go quiet like anyone else', presence.others(3, 21, 140_000), []);
 }
 
+{
+	// The drafter asks whether anybody at all is mid-turn, the asker included.
+	const presence = createPresence(45_000);
+	presence.seen(4, 30, 'Jan Novák', 0);
+	check('someone merely looking is not writing', presence.writing(4), false);
+	presence.setWriting(4, 30, true, 0);
+	check('a turn running is writing, even for the one asking', presence.writing(4), true);
+	check('in that application only', presence.writing(5), false);
+	presence.setWriting(4, 30, false, 0);
+	check('and stops when the turn does', presence.writing(4), false);
+}
+
 console.log('\n--- the folder an application lives in ---');
 
 check('a name becomes a folder name', baseSlug('Půjčování aut'), 'pujcovani-aut');
@@ -2447,6 +2513,103 @@ console.log('\n--- showing the writing as it happens ---');
 	check('the second call has its own words', describeActivity({ doing: 'checking', chapter: 'overview' }, 'Overview'), 'Checking what is still open…');
 	check('as does the commit', describeActivity({ doing: 'saving', chapter: null }, null), 'Saving to the history…');
 	check('markdown marks are not words', wordCount('# Overview\n\n- Fleet cars — booked by *staff*.\n'), 6);
+}
+
+console.log('\n--- drafting a whole document ---');
+{
+	const chapter = (key, extra = {}) => ({
+		key, title: key[0].toUpperCase() + key.slice(1), goal: '', purpose: `Purpose of ${key}`,
+		questions: [`Question about ${key}?`], criteria: [`${key} is settled`],
+		applicable: 1, parent_key: '', content_md: '', ...extra
+	});
+	const chapters = [
+		chapter('users'),
+		chapter('overview'),
+		chapter('security', { applicable: 0 }),
+		chapter('functionality'),
+		chapter('booking', { parent_key: 'functionality' }),
+		chapter('data', { content_md: 'Written by someone.' }),
+		chapter('telemetry'),
+		chapter('operations'),
+		chapter('integration')
+	];
+	const holdings = new Map([
+		['telemetry', { messages: 1, decisions: 0, rules: 0 }],
+		['operations', { messages: 0, decisions: 1, rules: 0 }],
+		['integration', { messages: 0, decisions: 0, rules: 1 }]
+	]);
+	check('a draft writes the Overview first, then what applies, in document order',
+		chaptersToDraft(chapters, holdings).map((c) => c.key), ['overview', 'users', 'booking']);
+	check('a chapter holding only company standards is still drafted',
+		chaptersToDraft([chapter('licenses')], new Map([['licenses', { messages: 0, decisions: 0, rules: 0 }]])).length, 1);
+
+	const evidence = { origin: 'generated', documentRevision: 7, draftedRevision: 7, userMessages: 0, reviewed: 0 };
+	check('a draft nobody has touched is untouched', isUntouchedDraft(evidence), true);
+	check('a write since the draft left it touches it', isUntouchedDraft({ ...evidence, documentRevision: 8 }), false);
+	check('so does an answer that changed nothing', isUntouchedDraft({ ...evidence, userMessages: 1 }), false);
+	check('so does an approval', isUntouchedDraft({ ...evidence, reviewed: 1 }), false);
+	check('an interview is never an untouched draft', isUntouchedDraft({ ...evidence, origin: 'interview' }), false);
+	check('nor is a draft that never recorded where it stopped', isUntouchedDraft({ ...evidence, draftedRevision: null }), false);
+
+	const state = (over) => draftState({ origin: 'generated', running: false, remaining: 0, written: 3, untouched: true, ...over });
+	check('an interview has no draft state', state({ origin: 'interview', remaining: 3 }), null);
+	check('a running draft is running whatever is left', state({ running: true, remaining: 4, written: 0 }), 'running');
+	check('an untouched draft with chapters left stopped', state({ remaining: 2 }), 'stopped');
+	check('a touched draft with chapters left has undrafted chapters, not a stopped draft',
+		state({ remaining: 2, untouched: false }), 'undrafted');
+	check('a draft that wrote nothing at all is empty', state({ remaining: 5, written: 0 }), 'empty');
+	check('a draft with nothing left finished, touched or not',
+		[state({}), state({ untouched: false })], ['finished', 'finished']);
+	check('a chapter the draft wrote is never left without an assumption to check',
+		[UNCHECKED_CHAPTER.statement.length > 0, UNCHECKED_CHAPTER.rationale.length > 0], [true, true]);
+
+	const prompt = buildDraftPrompt({
+		project: { name: 'Pool cars', description: 'Rezervace služebních aut na den', kind: 'change' },
+		profile: 'used across Škoda Auto; holds personal data',
+		chapter: chapter('security', { goal: 'Name what could go wrong.' }),
+		chapters: [{ key: 'overview', title: 'Overview', goal: 'Say what it is for.' }],
+		overview: 'Employees book pool cars.',
+		decidedElsewhere: [{ chapter: 'Users and roles', statement: 'Only the fleet office can block a car.' }],
+		standards: ['Data is encrypted at rest.']
+	});
+	check('the drafting prompt carries the description, the chapter and its questions',
+		['Rezervace služebních aut na den', 'Question about security?', 'security is settled'].every((s) => prompt.includes(s)), true);
+	check('it carries the Overview and what other chapters decided',
+		[prompt.includes('Employees book pool cars.'), prompt.includes('Only the fleet office can block a car.')], [true, true]);
+	check('it lists the standards not to restate', prompt.includes('Data is encrypted at rest.'), true);
+	check('an existing application is drafted as one', prompt.includes('IT ALREADY EXISTS') && prompt.includes('existing="true"'), true);
+	check('the Overview is not handed to itself',
+		buildDraftPrompt({ project: { name: 'X', description: 'Y', kind: 'new' }, profile: 'p', chapter: chapter('overview'),
+			chapters: [], overview: 'Old overview text', decidedElsewhere: [], standards: [] }).includes('Old overview text'), false);
+	check('a retry is told its last attempt did not finish, and a first attempt is not',
+		[buildDraftPrompt({ project: { name: 'X', description: 'Y', kind: 'new' }, profile: 'p', chapter: chapter('users'),
+			chapters: [], overview: '', decidedElsewhere: [], standards: [], brief: true }).includes('DID NOT FINISH'),
+		prompt.includes('DID NOT FINISH')], [true, false]);
+	check('the request names the chapter', draftRequest('Security'), 'Draft the chapter "Security" now.');
+
+	const drafts = (...entries) => new Map(entries);
+	check('prose named by key is this chapter\'s', draftedProse({ key: 'security', title: 'Security' },
+		drafts(['', 'unkeyed'], ['security', 'keyed'])), 'keyed');
+	check('prose with no key is this chapter\'s', draftedProse({ key: 'security', title: 'Security' }, drafts(['', 'unkeyed'])), 'unkeyed');
+	check('prose named by title is this chapter\'s', draftedProse({ key: 'security', title: 'Security' }, drafts([' security ', 'titled'])), 'titled');
+	check('prose for another chapter is nobody\'s', draftedProse({ key: 'security', title: 'Security' }, drafts(['overview', 'elsewhere'])), null);
+	check('an empty block is no prose', draftedProse({ key: 'security', title: 'Security' }, drafts(['security', '  \n'])), null);
+	const withoutHeading = (markdown) => markdown.replace(/^\s*#+\s*Security\s*$/m, '').trim();
+	check('a block that is only its own heading is no prose',
+		draftedProse({ key: 'security', title: 'Security' }, drafts(['security', '## Security\n']), withoutHeading), null);
+	check('the prose kept is the normalised prose',
+		draftedProse({ key: 'security', title: 'Security' }, drafts(['security', '# Security\n\nOnly staff sign in.']), withoutHeading),
+		'Only staff sign in.');
+
+	check('a drafted rule is filed here, as new',
+		asDraftBlock({ tag: 'requirement', attrs: { chapter: 'overview', ref: 'REQ-001', scope: 'later', existing: 'true' }, body: 'Rule' }),
+		{ tag: 'requirement', attrs: { scope: 'later', existing: 'true' }, body: 'Rule' });
+	check('a drafted removal is not a block', asDraftBlock({ tag: 'requirement', attrs: { ref: 'REQ-001', action: 'remove' }, body: '' }), null);
+	check('a decision labelled the user\'s is the assistant\'s',
+		asDraftBlock({ tag: 'decision', attrs: { source: 'user', chapter: 'overview' }, body: 'Choice' }),
+		{ tag: 'decision', attrs: { source: 'agent' }, body: 'Choice' });
+	check('options and section plans are not the draft\'s to write',
+		[asDraftBlock({ tag: 'options', attrs: {}, body: 'A' }), asDraftBlock({ tag: 'subchapters', attrs: {}, body: 'a: A' })], [null, null]);
 }
 
 console.log(`\n${pass} passed, ${fail} failed`);

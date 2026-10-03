@@ -32,6 +32,8 @@ export interface Presence {
 	setWriting(projectId: number, userId: number, writing: boolean, now: number): void;
 	/** Everyone else currently present, most recently seen first. */
 	others(projectId: number, userId: number, now: number): Watcher[];
+	/** Whether anyone at all, oneself included, has a turn running in this application. */
+	writing(projectId: number): boolean;
 	/** How many people are being tracked. For tests and diagnostics. */
 	readonly size: number;
 }
@@ -117,6 +119,16 @@ export function createPresence(ttlMs = 45_000): Presence {
 				.filter(([id, entry]) => id !== userId && present(entry, now) && entry.name)
 				.sort((a, b) => b[1].lastSeen - a[1].lastSeen)
 				.map(([, entry]) => ({ name: entry.name, writing: entry.writes > 0 }));
+		},
+
+		/**
+		 * Anyone mid-turn. Asked before the server starts writing into a document
+		 * on its own: a turn compares the revision it began from, and would be
+		 * refused as stale after the user had waited for it.
+		 */
+		writing(projectId: number): boolean {
+			const people = byProject.get(projectId);
+			return !!people && [...people.values()].some((entry) => entry.writes > 0);
 		},
 
 		get size() {

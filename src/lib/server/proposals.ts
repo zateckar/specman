@@ -5,6 +5,7 @@ import {
 	addMessage,
 	atomically,
 	clearMigrated,
+	confirmChapterDecisions,
 	documentRevision,
 	DocumentConflict,
 	confirmDecision,
@@ -95,6 +96,10 @@ function createProposal(projectId: number): Proposal {
  * reentrant — taking it again here would deadlock the turn against itself.
  */
 async function workingProposal(project: Project): Promise<Proposal> {
+	// A deleted draft's folder is gone, and with no proposals left either,
+	// `ensureRepo` would make it again for whichever writer was queued behind the
+	// deletion — a whole-document check, say — and leave an orphan on disk.
+	if (!getProject(project.id)) throw new ApplicationDeleted();
 	await recoverApproval(project);
 	// A proposal is made only once the repository has its first commit, so any
 	// proposal at all means there was a history here to lose.
@@ -146,6 +151,67 @@ async function commitWorkingDocument(project: Project, message: string): Promise
 	}
 
 	return commit;
+}
+
+/** The application was deleted while something was waiting to write to it. */
+export class ApplicationDeleted extends Error {
+	constructor() {
+		super('This application has been deleted.');
+		this.name = 'ApplicationDeleted';
+	}
+}
+
+/**
+ * Name a drafted application's proposal for what it holds. The first commit
+ * names it otherwise, and "Draft Overview" is a poor title for the whole draft.
+ */
+export function nameDraftProposal(projectId: number): void {
+	db()
+		.prepare(`UPDATE proposals SET title = 'Drafted by the assistant'
+		           WHERE project_id = ? AND state = 'draft' AND title = 'Design updates'`)
+		.run(projectId);
+}
+
+/**
+ * Every assumption in one chapter confirmed together, in one commit: someone who
+ * has read a drafted chapter and agrees with it should not need a click and a
+ * commit per assumption. How many were confirmed.
+ */
+export async function confirmChapter(project: Project, chapterKey: string): Promise<number> {
+	return withRepo(project.repo_path, async () => {
+		await recoverApproval(project);
+		const chapter = getChapter(project.id, chapterKey);
+		if (!chapter) return 0;
+		const confirmed = confirmChapterDecisions(project.id, chapterKey);
+		if (confirmed > 0) await commitWorkingDocument(project, `Confirm the assumptions in ${chapter.title}`);
+		return confirmed;
+	});
+}
+
+/**
+ * Write to the database and commit, as one held section, so the commit holds
+ * exactly what `write` wrote and nothing that landed beside it.
+ *
+ * For the drafter, whose chapters arrive in parallel. Written first and
+ * committed after, each commit took in every chapter stored since the last one,
+ * and a history entry named for one chapter carried eight. Nothing is
+ * committed when `write` declines; a commit that fails is returned rather than
+ * thrown, because what was written stays written and the next commit takes it.
+ */
+export async function writeAndCommit(
+	project: Project,
+	message: string,
+	write: () => boolean
+): Promise<{ written: boolean; failure: unknown }> {
+	return withRepo(project.repo_path, async () => {
+		if (!write()) return { written: false, failure: null };
+		try {
+			await commitWorkingDocument(project, message);
+			return { written: true, failure: null };
+		} catch (cause) {
+			return { written: true, failure: cause };
+		}
+	});
 }
 
 /** The decision is gone — another tab discarded it first. */

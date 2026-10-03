@@ -36,10 +36,12 @@
 		chapterKey,
 		chapterTitle,
 		written = false,
+		drafted = false,
 		turns,
 		busy,
 		activity = '',
 		busyElsewhere = '',
+		held = '',
 		saveState = 'saved',
 		errorMessage = '',
 		openQuestions,
@@ -53,12 +55,16 @@
 		chapterTitle: string;
 		/** Has prose already, even though nothing has been said about it here. */
 		written?: boolean;
+		/** Written by the assistant's draft, with nothing anyone has said about it. */
+		drafted?: boolean;
 		turns: ChatTurn[];
 		busy: boolean;
 		/** What the assistant is doing, in words — "Writing “Overview”…". */
 		activity?: string;
 		/** Title of another chapter still being written, if there is one. */
 		busyElsewhere?: string;
+		/** Why the conversation is closed for now — a draft being written. */
+		held?: string;
 		saveState?: 'saved' | 'saving' | 'not-recorded';
 		errorMessage?: string;
 		openQuestions: string[];
@@ -89,7 +95,9 @@
 	// Nothing can be sent while any turn is running. The page runs one turn at a
 	// time, so an answer sent while another chapter was still being written was
 	// cleared from the box and silently dropped.
-	const blocked = $derived(busy || !!busyElsewhere);
+	// Nor while the assistant drafts the document: a turn started then would be
+	// refused as stale after the wait, and the server refuses it anyway.
+	const blocked = $derived(busy || !!busyElsewhere || !!held);
 
 	// The box is disabled while the reply is written, which takes focus away
 	// from it. Hand it back when the reply is done, so the next answer can be
@@ -147,9 +155,11 @@
 	const startMessage = $derived(
 		!chapterKey
 			? "Let's review the document as a whole."
-			: written
-				? "Let's go through this chapter — check what's there and fill in what's missing."
-				: "Let's start this chapter."
+			: written && drafted
+				? "Let's go through this chapter — check what you assumed for me and change what doesn't fit."
+				: written
+					? "Let's go through this chapter — check what's there and fill in what's missing."
+					: "Let's start this chapter."
 	);
 
 	function onKeydown(event: KeyboardEvent) {
@@ -169,6 +179,8 @@
 			<!-- A turn keeps running when the user moves on, so say where it is
 			     rather than leaving them wondering whether it was lost. -->
 			<span class="thinking">Still writing {busyElsewhere}…</span>
+		{:else if held}
+			<span class="thinking">{held}</span>
 		{/if}
 		<span class="spacer"></span>
 		<span class="saved" class:working={saveState !== 'saved'} class:adrift={saveState === 'not-recorded'}>
@@ -185,7 +197,12 @@
 		{#if turns.length === 0}
 			<div class="intro">
 				<p>
-					{#if chapterKey && written}
+					{#if chapterKey && written && drafted}
+						<!-- "Already written" reads as the user's own work. This is the
+						     assistant's, and none of it has been checked. -->
+						The assistant drafted <strong>{chapterTitle}</strong> on its own — nothing in it has
+						been checked with you yet.
+					{:else if chapterKey && written}
 						<!-- Written elsewhere: as part of a chapter that was later split, or in
 						     passing while another chapter was being discussed. Saying "nothing
 						     has been written" here would contradict the document alongside it. -->
@@ -202,7 +219,10 @@
 					{#if !chapterKey}Start a review{:else if written}Go through it{:else}Start this chapter{/if}
 				</button>
 				<p class="hint">
-					{#if chapterKey && written}
+					{#if chapterKey && written && drafted}
+						I'll go through what I assumed with you and change whatever does not fit. Or confirm the
+						assumptions in the document if they are right.
+					{:else if chapterKey && written}
 						I'll check what is there with you and ask about anything still missing.
 					{:else if chapterKey}
 						I'll ask you a few questions and write the chapter from your answers. You can also

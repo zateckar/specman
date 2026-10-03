@@ -1,5 +1,7 @@
 <script lang="ts">
-	import { invalidateAll } from '$app/navigation';
+	import { tick } from 'svelte';
+	import { enhance } from '$app/forms';
+	import { goto, invalidateAll } from '$app/navigation';
 	import AgentChat from '$lib/components/AgentChat.svelte';
 	import ChapterIndex from '$lib/components/ChapterIndex.svelte';
 	import DocumentPreview from '$lib/components/DocumentPreview.svelte';
@@ -166,6 +168,9 @@
 			return 'You have been signed out. Sign in again in another tab, then send your answer — it is back in the box.';
 		}
 		if (response.status === 404) return 'This application could not be found any more. Reload the page.';
+		if (response.status === 409) {
+			return 'The assistant is still drafting this document. Your answer is back in the box — send it once the draft has finished.';
+		}
 		return 'Your answer could not be sent just now. It is back in the box — try again in a minute.';
 	}
 
@@ -357,9 +362,135 @@
 			clearInterval(timer);
 		};
 	});
+
+	/* --------------------------------------------------- a draft being written */
+
+	// Overwritten by polling while the draft runs; re-read with every refresh.
+	let draft = $derived(data.draft);
+	const draftRunning = $derived(draft?.state === 'running');
+	// "Nothing in it has been checked with you" stops being true the moment one of the
+	// chapter's assumptions is confirmed; a rejected one starts its conversation anyway.
+	const draftedUnchecked = $derived(
+		!!data.draft && !decisions.some((d) => d.chapter_key === data.activeKey && d.status === 'confirmed')
+	);
+
+	// Short: the banner above says the rest, and the header has the chapter's title to fit.
+	const held = $derived(draftRunning ? 'Waiting for the draft to finish…' : '');
+
+	// A draft takes minutes, and a page that changes nothing for that long looks
+	// broken. Polled, as presence is; the page is refreshed when a chapter lands.
+	$effect(() => {
+		if (!draftRunning) return;
+		const projectId = data.project.id;
+		let stopped = false;
+		const timer = setInterval(async () => {
+			try {
+				const response = await fetch(`/api/draft?project=${projectId}`);
+				if (!response.ok || stopped) return;
+				const view = await response.json();
+				const landed = view.done !== draft?.done || view.state !== draft?.state;
+				draft = view;
+				if (landed) await invalidateAll();
+			} catch {
+				// The next poll will try again; the draft carries on regardless.
+			}
+		}, 4000);
+		return () => {
+			stopped = true;
+			clearInterval(timer);
+		};
+	});
+
+	let draftError = $state('');
+	async function draftTheRest() {
+		draftError = '';
+		try {
+			const response = await fetch('/api/draft', {
+				method: 'POST',
+				headers: { 'content-type': 'application/json' },
+				body: JSON.stringify({ projectId: data.project.id })
+			});
+			if (!response.ok) {
+				draftError = (await response.json().catch(() => null))?.message ?? 'The draft could not be started just now.';
+				return;
+			}
+			draft = await response.json();
+		} catch {
+			draftError = 'The draft could not be started — the connection failed.';
+		}
+	}
+
+	// Asked once more in the page, with focus on the button that deletes and
+	// back on the one that asked if the draft is kept.
+	let confirmingDelete = $state(false);
+	let deleteError = $state('');
+	const focusOnMount = (node: HTMLElement) => node.focus();
+	async function keepDraft() {
+		confirmingDelete = false;
+		await tick();
+		document.getElementById('delete-draft')?.focus();
+	}
 </script>
 
 <svelte:head><title>{active ? `${active.title} — ` : ''}{data.project.name} — Specman</title></svelte:head>
+
+<!-- Outside the grid: the narrow-window layout places the grid's children by
+     position, and a banner among them would take a pane's place. -->
+{#if draft && draft.state && (draft.state !== 'finished' || draft.untouched)}
+	<div class="draft-banner" role="status">
+		{#if draft.untouched}<span class="ai-draft">AI draft</span>{/if}
+		<div class="draft-text">
+			{#if draft.state === 'running'}
+				<p>
+					The assistant is drafting this document — {draft.done} of {draft.total} chapters done.
+					{#if draft.writing.length > 0}Writing {draft.writing.join(', ')}.{/if}
+					It carries on if you leave this page.
+				</p>
+			{:else if draft.state === 'stopped'}
+				<p>
+					The draft stopped before it was finished. Not drafted yet: {draft.remaining.join(', ')}.
+					{#if draft.problem}{draft.problem}{/if}
+				</p>
+			{:else if draft.state === 'undrafted'}
+				<p>Not drafted: {draft.remaining.join(', ')}. You can answer questions about them, or let the assistant draft them.</p>
+			{:else if draft.state === 'empty'}
+				<p>Nothing could be drafted.{#if draft.problem}{' '}{draft.problem}{/if}</p>
+			{:else}
+				<p>
+					The assistant wrote this document on its own, and every choice in it is an assumption for
+					you to check. Confirm what fits, answer in a chapter to change what does not — or delete it
+					if it is no use.
+				</p>
+			{/if}
+			{#if draftError}<p class="draft-error" role="alert">{draftError}</p>{/if}
+			{#if deleteError}<p class="draft-error" role="alert">{deleteError}</p>{/if}
+		</div>
+		<div class="draft-actions">
+			{#if draft.state === 'stopped' || draft.state === 'undrafted' || draft.state === 'empty'}
+				<button type="button" class="draft-button" onclick={draftTheRest}>
+					{draft.state === 'empty' ? 'Try again' : draft.state === 'undrafted' ? 'Draft them' : 'Draft the rest'}
+				</button>
+			{/if}
+			{#if draft.canDelete}
+				{#if confirmingDelete}
+					<form method="POST" action="/?/delete" use:enhance={() => async ({ result }) => {
+						confirmingDelete = false;
+						if (result.type === 'redirect') await goto(result.location);
+						else if (result.type === 'failure') deleteError = String(result.data?.deleteMessage ?? 'The draft could not be deleted.');
+						else deleteError = 'The draft could not be deleted just now. Try again in a minute.';
+					}}>
+						<input type="hidden" name="project" value={data.project.id} />
+						<span>Delete this draft for good?</span>
+						<button type="submit" class="danger" use:focusOnMount>Delete</button>
+						<button type="button" onclick={keepDraft}>Keep it</button>
+					</form>
+				{:else}
+					<button type="button" id="delete-draft" class="quiet" onclick={() => (confirmingDelete = true)}>Delete draft</button>
+				{/if}
+			{/if}
+		</div>
+	</div>
+{/if}
 
 <div class="workspace" class:reading={pane === 'document'}>
 	<ChapterIndex {chapters} activeKey={data.activeKey} projectId={data.project.id} {others} />
@@ -381,10 +512,12 @@
 			chapterKey={data.activeKey}
 			chapterTitle={chatTitle}
 			written={!!active?.content_md?.trim()}
+			drafted={draftedUnchecked}
 			turns={shownTurns}
 			busy={busyHere}
 			activity={activityText}
 			{busyElsewhere}
+			{held}
 			{saveState}
 			{errorMessage}
 			{openQuestions}
@@ -405,10 +538,86 @@
 		{pendingChanges}
 		projectId={data.project.id}
 		writingKey={running?.writing?.key ?? null}
+		draftingKeys={draft?.writingKeys ?? []}
+		drafting={draftRunning}
 	/>
 </div>
 
 <style>
+	.draft-banner {
+		flex: 0 0 auto;
+		display: flex;
+		align-items: center;
+		gap: 12px;
+		padding: 9px 16px;
+		background: #f4f1fb;
+		border-bottom: 1px solid #ddd4f0;
+		font-size: 13px;
+	}
+
+	.draft-text {
+		flex: 1;
+		min-width: 0;
+	}
+
+	.draft-text p {
+		margin: 0;
+	}
+
+	/* The colours of "Decided for you" in the document: the assistant's, not yours. */
+	.ai-draft {
+		flex: 0 0 auto;
+		font-size: 10.5px;
+		font-weight: 600;
+		text-transform: uppercase;
+		letter-spacing: 0.04em;
+		padding: 2px 8px;
+		border-radius: 10px;
+		background: #fff;
+		border: 1px solid #ddd4f0;
+		color: #5b46a0;
+	}
+
+	.draft-error {
+		color: #8c2020;
+		margin-top: 4px !important;
+	}
+
+	.draft-actions,
+	.draft-actions form {
+		display: flex;
+		flex-wrap: wrap;
+		align-items: center;
+		gap: 8px;
+	}
+
+	.draft-actions button {
+		font-size: 12.5px;
+		padding: 4px 11px;
+		border-radius: 12px;
+		border: 1px solid #ddd4f0;
+		background: #fff;
+		color: #5b46a0;
+		white-space: nowrap;
+	}
+
+	.draft-actions .draft-button {
+		background: #5b46a0;
+		border-color: #5b46a0;
+		color: #fff;
+	}
+
+	.draft-actions .quiet:hover {
+		border-color: #c98a8a;
+		color: #8c2020;
+	}
+
+	.draft-actions .danger {
+		background: #a32626;
+		border-color: #a32626;
+		color: #fff;
+	}
+
 	.workspace {
 		flex: 1;
 		display: grid;

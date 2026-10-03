@@ -109,6 +109,14 @@ and blocks subsequent repository writers until recovery succeeds.
 - Identity proofs assume the OIDC library authenticates issuer+subject and SQLite allocates
   fresh user IDs and enforces identity uniqueness. They do not verify token cryptography,
   the identity provider, proxy headers, authorization policy or session lifecycle.
+- The drafter (`src/lib/server/drafting.ts`) is a writer outside the modelled protocol. It
+  writes chapters without the revision guard a turn uses, and relies instead on the
+  conversation, the whole-document check, the diagram and approval being refused while it
+  runs (in-process state, so one process only), on taking the repository lock for each
+  chapter's write and commit, and on re-checking inside that write that the chapter is still
+  its to write. Its job is detached: a deletion waits for the job's promise to settle, which
+  is the same `settle` assumption as above. Whether a draft is untouched is derived from the
+  revision triggers, so it inherits their mapping and nothing in it is proved.
 - Pending decisions and verification shown on the page still come from SQLite. Only the
   prose diff, requirement delta and approval/export revision are pinned to Git. Verification
   freshness is computed for server responses and review loads; open browsers do not receive

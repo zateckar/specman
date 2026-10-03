@@ -40,3 +40,73 @@ export async function mapWithLimit<T, R>(
 	await Promise.all(workers);
 	return results;
 }
+
+/** A limit shared by callers that know nothing of each other. */
+export interface Slots {
+	/**
+	 * Run `work` once fewer than the limit are running, in the order asked. Aborted
+	 * while still waiting, it leaves the queue and rejects with the signal's reason.
+	 */
+	run<T>(work: () => Promise<T>, signal?: AbortSignal): Promise<T>;
+	/** Running now. For tests and diagnostics. */
+	readonly busy: number;
+	/** Waiting for a slot. */
+	readonly waiting: number;
+}
+
+/**
+ * At most `limit` pieces of work at once, across every caller.
+ *
+ * `mapWithLimit` bounds one run. Drafts are started by different people at
+ * different moments, each its own run, so five colleagues drafting at once was
+ * fifteen long streams on a shared gateway — and everyone's conversation waited
+ * behind them. A slot is handed straight to the next in line when one finishes,
+ * so nobody can overtake the queue.
+ *
+ * Work given up while it waits leaves the queue at once. A deleted draft waits
+ * for its job to settle, and its chapters queued behind other people's long
+ * calls would otherwise hold the deletion until each got a slot only to return.
+ */
+export function createSlots(limit: number): Slots {
+	const max = Math.max(1, limit);
+	let busy = 0;
+	const queue: Array<() => void> = [];
+	const reason = (signal: AbortSignal) => signal.reason ?? new Error('Aborted');
+
+	async function run<T>(work: () => Promise<T>, signal?: AbortSignal): Promise<T> {
+		if (signal?.aborted) throw reason(signal);
+		if (busy < max) busy++;
+		else {
+			await new Promise<void>((resolve, reject) => {
+				const onAbort = () => {
+					const at = queue.indexOf(admit);
+					if (at >= 0) queue.splice(at, 1);
+					reject(reason(signal!));
+				};
+				const admit = () => {
+					signal?.removeEventListener('abort', onAbort);
+					resolve();
+				};
+				queue.push(admit);
+				signal?.addEventListener('abort', onAbort, { once: true });
+			});
+		}
+		try {
+			return await work();
+		} finally {
+			const next = queue.shift();
+			if (next) next();
+			else busy--;
+		}
+	}
+
+	return {
+		run,
+		get busy() {
+			return busy;
+		},
+		get waiting() {
+			return queue.length;
+		}
+	};
+}

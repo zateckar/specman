@@ -18,6 +18,7 @@ import {
 	UnrecordedChanges
 } from '$lib/server/proposals';
 import { log, manifestOnMain, manifestOnBranch } from '$lib/server/git/repo';
+import { isDrafting, STILL_DRAFTING } from '$lib/server/drafting';
 import { requirementDelta, summariseDelta, type ManifestRequirement } from '$lib/server/llm/delta';
 import type { Actions, PageServerLoad } from './$types';
 
@@ -86,6 +87,8 @@ export const actions: Actions = {
 	approve: async ({ params, request }) => {
 		const project = getProject(Number(params.id));
 		if (!project) throw error(404, 'No such application');
+		// Approving now would approve half a document.
+		if (isDrafting(project.id)) return fail(409, { message: STILL_DRAFTING });
 
 		const proposal = openProposal(project.id);
 		if (!proposal) return fail(409, { message: new StaleReview().message });

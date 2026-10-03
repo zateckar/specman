@@ -47,7 +47,9 @@
 		activeKey,
 		pendingChanges,
 		projectId,
-		writingKey = null
+		writingKey = null,
+		draftingKeys = [],
+		drafting = false
 	}: {
 		projectName: string;
 		chapters: ChapterView[];
@@ -62,6 +64,13 @@
 		 * arrived so far and is not saved; a turn that fails puts the stored text back.
 		 */
 		writingKey?: string | null;
+		/** Chapters the assistant's draft is writing now. Nothing of them is shown until saved. */
+		draftingKeys?: string[];
+		/**
+		 * A draft is running. The review and the diagram wait for it: either would
+		 * take half a document for the whole.
+		 */
+		drafting?: boolean;
 	} = $props();
 
 	// Decisions the assistant made on the user's behalf. Surfaced where they are
@@ -81,6 +90,25 @@
 				method: 'POST',
 				headers: { 'content-type': 'application/json' },
 				body: JSON.stringify({ projectId, id, action: 'confirm' })
+			});
+			if (!response.ok) {
+				const body = await response.json();
+				throw new Error(body.message ?? 'Your choice could not be recorded.');
+			}
+			await invalidateAll();
+		} catch (cause) {
+			decisionError = cause instanceof Error ? cause.message : 'Your choice could not be recorded.';
+		}
+	}
+
+	/** Every assumption in one chapter, for someone who has read it and agrees. */
+	async function confirmAll(chapterKey: string) {
+		decisionError = '';
+		try {
+			const response = await fetch('/api/decisions', {
+				method: 'POST',
+				headers: { 'content-type': 'application/json' },
+				body: JSON.stringify({ projectId, chapterKey, action: 'confirm-chapter' })
 			});
 			if (!response.ok) {
 				const body = await response.json();
@@ -143,9 +171,11 @@
 	{#if decisionError}<p class="decision-error" role="alert">{decisionError}</p>{/if}
 	<header>
 		<h2>{projectName}</h2>
-		<a class="handoff" href="/projects/{projectId}/diagram">Diagram</a>
+		{#if !drafting}<a class="handoff" href="/projects/{projectId}/diagram">Diagram</a>{/if}
 		<a class="handoff" href="/projects/{projectId}/export">For a developer</a>
-		{#if pendingChanges}
+		{#if drafting}
+			<span class="clean">Review once the draft is finished</span>
+		{:else if pendingChanges}
 			<a class="review" href="/projects/{projectId}/review">Review changes</a>
 		{:else}
 			<span class="clean">No pending changes</span>
@@ -175,7 +205,7 @@
 			>
 				<h3>
 					{chapter.title}
-					{#if chapter.key === writingKey}
+					{#if chapter.key === writingKey || draftingKeys.includes(chapter.key)}
 						<span class="badge writing">being written…</span>
 					{:else if chapter.applicable === false}
 						<span class="badge">not needed</span>
@@ -248,6 +278,11 @@
 									<button onclick={() => confirm(decision.id)}>That's right</button>
 								</div>
 							{/each}
+							{#if assumed.length > 1}
+								<div class="confirm-all">
+									<button onclick={() => confirmAll(chapter.key)}>All of these are right</button>
+								</div>
+							{/if}
 						</div>
 					{/if}
 				{/each}
@@ -546,6 +581,24 @@
 		border: 1px solid #ddd4f0;
 		background: #fff;
 		color: #5b46a0;
+		white-space: nowrap;
+	}
+
+	.confirm-all {
+		display: flex;
+		justify-content: flex-end;
+		border-top: 1px solid #ddd4f0;
+		margin-top: 4px;
+		padding-top: 7px;
+	}
+
+	.confirm-all button {
+		font-size: 12px;
+		padding: 4px 12px;
+		border-radius: 12px;
+		border: 1px solid #5b46a0;
+		background: #5b46a0;
+		color: #fff;
 		white-space: nowrap;
 	}
 
