@@ -1,9 +1,11 @@
 import { gateway } from './gateway';
 import { ChapterStreamParser } from './blocks';
+import { ASSESS_BUDGET, OPTIONS_BUDGET } from './budgets';
+import { documentContext } from './context';
 import { parseOptions } from './questions';
 import { describeProfile, toProfile } from './profile';
 import type { AnswerOption, Assessment } from './questions';
-import type { ChatMessage, ToolDef } from './types';
+import { textOf, type ChatMessage, type ToolDef } from './types';
 import type { Chapter, Project, Requirement } from '../db/types';
 
 /**
@@ -57,17 +59,6 @@ export const RECORD_STATE_TOOL: ToolDef = {
 		required: ['chapter_key', 'status', 'open_questions']
 	}
 };
-
-function chapterDigest(chapters: Chapter[], activeKey: string | null): string {
-	return chapters
-		.filter((c) => c.applicable !== 0)
-		.map((c) => {
-			const marker = c.key === activeKey ? '>' : ' ';
-			const open = c.open_questions.length ? ` — ${c.open_questions.length} open` : '';
-			return `${marker} [${c.status}] ${c.key}: ${c.title}${open}`;
-		})
-		.join('\n');
-}
 
 /** The profile is stored as JSON text; a broken value must not break a turn. */
 function parseProfile(raw: string | undefined): unknown {
@@ -123,13 +114,21 @@ in the order it should be read:
   reading is disorienting, so do it when the shape is wrong, not for neatness.`;
 }
 
+/**
+ * The part of a turn's prompt that stays the same while the colleague works
+ * through one chapter: how to behave, the application, the rest of the
+ * document, and what this chapter is for. Whatever changes each turn goes with
+ * the colleague's message instead — see `buildTurnState` in `context.ts` — so
+ * the gateway can serve all of this from its cache.
+ */
 export function buildSystemPrompt(
 	project: Project,
 	chapters: Chapter[],
 	active: Chapter | null,
-	activeRequirements: Requirement[] = []
+	requirements: Requirement[] = [],
+	rest = documentContext(chapters, requirements, active)
 ): string {
-	const overview = chapters.find((c) => c.key === 'overview');
+	const partial = [...rest.shown.values()].some((shown) => shown !== 'full');
 
 	const parts: string[] = [
 		`You are Specman, a design assistant. You are interviewing a colleague at Škoda Auto
@@ -167,7 +166,7 @@ Writing the document:
   said" or "TBD". If something is genuinely undecided, leave it out of the
   chapter and raise it as an open question instead.
 - Keep every chapter consistent with the others. If something you learn
-  contradicts another chapter, say so and offer to correct it.
+  contradicts another chapter, correct it and say so.
 
 Recording what must be true:
 - Chapter prose says what the application is *for*. A requirement says what it
@@ -248,49 +247,35 @@ from nothing. Establish how it works today before discussing what should change,
 and be clear in every chapter about which parts are already true and which are
 new. Mark a requirement that describes existing behaviour with existing="true".`
 				: ''
-		}`,
-
-		`Document status — background, so you can keep chapters consistent with each
-other. This is NOT a list of things to ask about now:
-${chapterDigest(chapters, active?.key ?? null)}`
+		}`
 	];
 
-	if (overview?.content_md && overview.key !== active?.key) {
-		parts.push(`Overview chapter (context for everything else):\n${overview.content_md}`);
+	if (rest.text) {
+		const reading = partial
+			? `
+
+The document is long, so not every chapter is shown whole. A chapter marked
+[outline] shows its headings and the first sentence of each paragraph;
+[rules only] shows its rules; [title only] shows that it exists. Read any of them
+in full with the read_chapter tool before relying on what it leaves out — above
+all before saying the colleague's answer agrees with it.`
+			: '';
+		parts.push(`THE REST OF THE DOCUMENT
+
+Every other chapter, with its rules. It is here so you can keep the chapters
+consistent with each other and never ask what another chapter already settles.
+It is NOT a list of things to ask about now.${reading}
+
+${rest.text}`);
 	}
 
 	if (active) {
-		const inherited = activeRequirements.filter((r) => r.source === 'standard');
-		const recorded = activeRequirements.length
-			? activeRequirements
-					.map(
-						(r) =>
-							`- ${r.ref} [${r.scope}]${r.source === 'standard' ? ' [company standard]' : ''} ${r.statement}`
-					)
-					.join('\n')
-			: '(nothing recorded yet)';
-
-		const standardsNote = inherited.length
-			? `
-
-Some of the above are marked [company standard]. They are already settled for
-every application at Škoda Auto — do not interview the user about them and do
-not ask them to confirm them. Mention them only if what the user describes would
-break one, and then say which, and ask whether this application really needs to
-differ.`
-			: '';
-
 		parts.push(
 			`You are working on the chapter "${active.title}" (key: ${active.key}).
-Its status is currently "${active.status}".
 ${active.goal ? `What this chapter is for: ${active.goal}` : ''}
 
 Purpose of this chapter:
 ${active.purpose}
-
-Already recorded as must-be-true (do not repeat these; change them by reference
-if the user contradicts one):
-${recorded}${standardsNote}
 
 Questions this chapter must work through:
 ${active.questions.map((q) => `- ${q}`).join('\n') || '- (none defined)'}
@@ -298,40 +283,9 @@ ${active.questions.map((q) => `- ${q}`).join('\n') || '- (none defined)'}
 It is complete when:
 ${active.criteria.map((c) => `- ${c}`).join('\n') || '- (no criteria defined)'}
 
-Current content:
-${active.content_md || '(empty — nothing written yet)'}
-
-Still open:
-${active.open_questions.map((q) => `- ${q}`).join('\n') || '(nothing recorded)'}`
-		);
-
-		// Last position deliberately: this is the rule the model is most likely to
-		// drop, and the one whose failure is most visible to the user — it starts
-		// interviewing about the next chapter while the index still shows this one.
-		parts.push(
-			`CHECK ALL OF THIS BEFORE YOU REPLY
-
-1. WRITE DOWN WHAT THEY JUST TOLD YOU. If the user's last message contained any
-   fact about this chapter, your reply MUST contain a
-   <chapter key="${active.key}"> block carrying the whole chapter, rewritten to
-   include it. Nothing is saved from your conversational text — only the blocks
-   are kept. A reply that just asks the next question throws their answer away,
-   and they will be asked the same thing again.
-
-2. Record anything now settled as a <requirement>, and anything you decided on
-   their behalf as a <decision source="agent">.
-
-3. Every question you ask must be about "${active.title}" and nothing else.
-   Never write "let's move on to ...", "now let's talk about ..." or "I'm moving
-   this conversation to ...". Switching chapters is the user's to do, by clicking
-   the index.
-
-4. If this chapter is finished, your ENTIRE reply is one sentence saying so.
-   Ask nothing, and do not suggest another chapter — the application offers the
-   next one itself, and a question here keeps this chapter from completing.
-
-Write the blocks first, then your short reply. A status of "complete" is not
-final — new information reopens the chapter.`
+What it says now, what is recorded in it and what is still open come with the
+colleague's latest message, together with a checklist to go through before you
+reply.`
 		);
 
 		// Only for a chapter that can actually be split, and only at top level:
@@ -376,7 +330,7 @@ export function toChatMessages(
 export function normaliseConversation(turns: ChatMessage[]): ChatMessage[] {
 	const messages: ChatMessage[] = [];
 	for (const turn of turns) {
-		const content = String(turn.content ?? '').trim();
+		const content = textOf(turn.content ?? '').trim();
 		if (!content) continue;
 		const last = messages.at(-1);
 		if (last && last.role === turn.role) last.content = `${last.content}\n\n${content}`;
@@ -388,8 +342,6 @@ export function normaliseConversation(turns: ChatMessage[]): ChatMessage[] {
 	return messages;
 }
 
-/** See where it is used. */
-const ASSESS_MAX_TOKENS = 6000;
 
 /**
  * Second call of the turn: assess the chapter and record its state.
@@ -459,7 +411,7 @@ this chapter in progress.`;
 			// reasons before calling the tool, and the reasoning comes out of this
 			// budget. On the default it could spend the lot and call nothing, and
 			// every retry would do the same.
-			maxTokens: ASSESS_MAX_TOKENS,
+			maxTokens: ASSESS_BUDGET,
 			signal: args.signal
 		});
 
@@ -528,7 +480,7 @@ cannot guess the shape of the answer, reply with an empty block.`;
 			// and thinking tokens come out of the same budget. At 400 it spent the
 			// lot deliberating and emitted no block at all. It reads the whole chapter
 			// first, so a long chapter needs room to reason about it too.
-			maxTokens: 4000,
+			maxTokens: OPTIONS_BUDGET,
 			signal: args.signal
 		})) {
 			if (event.type === 'text') text += event.text;

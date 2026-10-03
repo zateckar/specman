@@ -1242,6 +1242,27 @@ export function recentMessages(projectId: number, chapterKey: string | null, lim
 		.map((row) => ({ ...row, options: parseJson<AnswerOption[]>(row.options, []) }));
 }
 
+/**
+ * The transcript for one scope from its `offset`-th message on, oldest first.
+ * With `historyWindowStart`, the window a turn replays: one whose start stays
+ * put for several turns, so the gateway's cache can serve it.
+ */
+export function messagesFrom(projectId: number, chapterKey: string | null, offset: number): Message[] {
+	const scope = chapterKey ? 'chapter_key = ?' : 'chapter_key IS NULL';
+	const rows = db()
+		.prepare(`SELECT * FROM messages WHERE project_id = ? AND ${scope} ORDER BY id LIMIT -1 OFFSET ?`)
+		.all(...(chapterKey ? [projectId, chapterKey, offset] : [projectId, offset]));
+	return asRows<MessageRow>(rows).map((row) => ({ ...row, options: parseJson<AnswerOption[]>(row.options, []) }));
+}
+
+export function messageCount(projectId: number, chapterKey: string | null): number {
+	const scope = chapterKey ? 'chapter_key = ?' : 'chapter_key IS NULL';
+	const row = db()
+		.prepare(`SELECT COUNT(*) AS n FROM messages WHERE project_id = ? AND ${scope}`)
+		.get(...(chapterKey ? [projectId, chapterKey] : [projectId])) as { n: number };
+	return Number(row.n);
+}
+
 /* ------------------------------------------------------------- requirements */
 
 function hydrateRequirement(row: Record<string, unknown>): Requirement {
@@ -1489,6 +1510,44 @@ export function latestArchitecture(projectId: number): StoredArchitecture | unde
 	return {
 		elements: parseJson<unknown[]>(row.elements as string, []),
 		relations: parseJson<unknown[]>(row.relations as string, []),
+		created_at: asIsoTime(row.created_at as string)
+	};
+}
+
+/* ---------------------------------------------------------------- mockups */
+
+export interface StoredMockup {
+	html: string;
+	/** The document revision it was made from. */
+	document_revision: number;
+	created_at: string | null;
+}
+
+/**
+ * Keep a mock-up as the application's, replacing the one before. Nothing is
+ * stored for an application deleted while its mock-up was being made.
+ */
+export function saveMockup(projectId: number, html: string, documentRevision: number): void {
+	db()
+		.prepare(
+			`INSERT INTO mockups (project_id, html, document_revision)
+			 SELECT id, ?, ? FROM projects WHERE id = ?
+			 ON CONFLICT (project_id) DO UPDATE SET
+			   html = excluded.html,
+			   document_revision = excluded.document_revision,
+			   created_at = datetime('now')`
+		)
+		.run(html, documentRevision, projectId);
+}
+
+export function latestMockup(projectId: number): StoredMockup | undefined {
+	const row = db().prepare('SELECT * FROM mockups WHERE project_id = ?').get(projectId) as
+		| Record<string, unknown>
+		| undefined;
+	if (!row) return undefined;
+	return {
+		html: row.html as string,
+		document_revision: Number(row.document_revision),
 		created_at: asIsoTime(row.created_at as string)
 	};
 }

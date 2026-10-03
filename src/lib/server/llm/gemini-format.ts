@@ -10,6 +10,18 @@
  * Deliberately free of imports so `npm test` can load it directly.
  */
 
+/**
+ * The most Gemini's Flash models will write, reasoning included. A request for
+ * more is refused outright rather than cut down, so a budget chosen for the
+ * primary gateway is brought within it here.
+ */
+export const GEMINI_MAX_OUTPUT_TOKENS = 65_536;
+
+/** A budget as Gemini can be asked for it. */
+export function geminiRoom(maxTokens: number): number {
+	return Math.min(maxTokens, GEMINI_MAX_OUTPUT_TOKENS);
+}
+
 export interface PlainTurn {
 	role: 'user' | 'assistant';
 	content: string;
@@ -37,7 +49,7 @@ export function geminiBody(args: {
 		})),
 		// The whole budget, reasoning included: Gemini counts its thinking against
 		// the same ceiling, exactly as the primary gateway's models do.
-		generationConfig: { maxOutputTokens: args.maxTokens },
+		generationConfig: { maxOutputTokens: geminiRoom(args.maxTokens) },
 		...(args.tools?.length
 			? {
 					tools: [

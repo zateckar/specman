@@ -24,12 +24,15 @@ import {
 	UNCHECKED_CHAPTER,
 	type DraftState
 } from './llm/draft';
+import { DRAFT_BUDGET, DRAFT_RETRY_BUDGET } from './llm/budgets';
+import { ranOutOfRoom } from './llm/fallback';
 import { describeFailure } from './llm/failures';
 import { gateway } from './llm/gateway';
-import { createSlots } from './llm/parallel';
+import { longCalls } from './llm/parallel';
 import { describeProfile, toProfile } from './llm/profile';
 import { reconcileAssessment } from './llm/questions';
 import { toRequirementDraft } from './llm/requirements';
+import { stopMockup } from './mockups';
 import { commitDocument, nameDraftProposal, writeAndCommit } from './proposals';
 import { withRepo } from './git/repo';
 
@@ -48,21 +51,10 @@ import { withRepo } from './git/repo';
  * workspace offers to draft whatever is still unwritten.
  */
 
-/** A full chapter with its rules and decisions; the figure the interview uses. */
-const DRAFT_MAX_TOKENS = 16000;
-/** The second attempt, when the first ran out of room or wrote no chapter. */
-const RETRY_MAX_TOKENS = 24000;
 /** How long a deletion waits for a stopped draft before refusing. */
 const STOP_WAIT_MS = 70_000;
 /** Decisions from other chapters passed to each call, to keep parallel calls consistent. */
 const DECIDED_ELSEWHERE_LIMIT = 40;
-
-/**
- * Drafting calls at once across the whole installation, not per draft. Five
- * colleagues drafting would otherwise be fifteen long streams on a shared
- * gateway, and everyone's conversation would wait behind them.
- */
-const slots = createSlots(3);
 
 interface Job {
 	controller: AbortController;
@@ -176,14 +168,15 @@ async function draftChapter(project: Project, chapter: Chapter, job: Job): Promi
 	let ready: (DraftedChapter & { status: ChapterStatus; openQuestions: string[] }) | null = null;
 
 	try {
-		await slots.run(async () => {
+		// Shared with mock-ups: three long calls at a time across the installation.
+		await longCalls.run(async () => {
 			if (signal.aborted) return;
 			job.writing.add(chapter.key);
 			try {
 				let reply = await attempt(project, chapter, false, signal).catch((cause) => {
 					// Out of room is reported as an error, not as an empty reply; it gets
 					// the second attempt. Anything else was already retried by the client.
-					if (signal.aborted || !/ran out of room/i.test(String((cause as Error)?.message))) throw cause;
+					if (signal.aborted || !ranOutOfRoom(cause)) throw cause;
 					return null;
 				});
 				if (!reply && !signal.aborted) reply = await attempt(project, chapter, true, signal);
@@ -265,7 +258,7 @@ async function attempt(project: Project, chapter: Chapter, brief: boolean, signa
 	for await (const event of gateway.streamChat({
 		system,
 		messages: [{ role: 'user', content: draftRequest(chapter.title) }],
-		maxTokens: brief ? RETRY_MAX_TOKENS : DRAFT_MAX_TOKENS,
+		maxTokens: brief ? DRAFT_RETRY_BUDGET : DRAFT_BUDGET,
 		signal
 	})) {
 		if (event.type === 'text') parser.push(event.text);
@@ -406,6 +399,9 @@ export async function deleteDraft(project: Project, user: Pick<User, 'id' | 'is_
 	return withRepo(project.repo_path, async () => {
 		if (!deleteUntouchedDraft(project.id)) return 'touched';
 		outcomes.delete(project.id);
+		// Its row went with the application, and nothing would keep what it made;
+		// the call would otherwise run on for minutes. Only once the deletion stands.
+		stopMockup(project.id);
 		try {
 			// A page reading the history can hold a file open on Windows for a moment.
 			rmSync(project.repo_path, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 });

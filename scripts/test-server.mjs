@@ -76,6 +76,7 @@ const { completeLogin, OidcNameCollision } = await import('../src/lib/server/aut
 const auth = await import('../src/lib/server/auth/index.ts');
 const { GatewayProvider, ModelProvider, gateway } = await import('../src/lib/server/llm/gateway.ts');
 const { GeminiProvider } = await import('../src/lib/server/llm/gemini.ts');
+const budgets = await import('../src/lib/server/llm/budgets.ts');
 const loginPage = await import('../src/routes/login/+page.server.ts');
 const logout = await import('../src/routes/logout/+server.ts');
 const { verifyDocument } = await import('../src/lib/server/llm/verification.ts');
@@ -120,6 +121,8 @@ const approveForm = (project, reviewed = {}) => reviewPage.actions.approve({
     method: 'POST', body: new URLSearchParams(Object.entries(reviewed).map(([key, value]) => [key, String(value)]))
   })
 });
+/** What the colleague wrote, out of the state a chat request wraps around it. */
+const said = (req) => /THE COLLEAGUE'S MESSAGE\n\n([\s\S]*?)(?:\n\n---\n\n|$)/.exec(req.messages.at(-1).content)?.[1];
 const deferred = () => {
   let resolve;
   const promise = new Promise(done => { resolve = done; });
@@ -216,10 +219,26 @@ try {
   check('CRLF frames split at every byte still complete', (await readStream()).map((e) => e.type), ['text', 'done']);
   globalThis.fetch = async () => new Response(stopFrame);
   check('a successfully empty response is allowed', (await readStream()).map((e) => e.type), ['done']);
-  globalThis.fetch = async () => new Response(frame({ type: 'message_delta', delta: { stop_reason: 'end_turn' }, usage: { output_tokens: 4000 } }) + stopFrame);
+  globalThis.fetch = async () => new Response(frame({ type: 'message_delta', delta: { stop_reason: 'end_turn' }, usage: { output_tokens: budgets.DEFAULT_BUDGET } }) + stopFrame);
   await rejects('silence that spent the whole budget is not a clean answer', () => readStream(), /ran out of room/);
   globalThis.fetch = async () => new Response(textFrame('complete') + 'data: [DONE]\n\n');
   check('an explicit gateway DONE sentinel also completes', (await readStream()).map((e) => e.type), ['text', 'done']);
+
+  // As the live gateway streamed a call to read a chapter on 2026-10-03.
+  const sentBodies = [];
+  globalThis.fetch = async (_url, init) => {
+    sentBodies.push(JSON.parse(init.body));
+    return new Response(
+      frame({ type: 'content_block_start', index: 1, content_block: { type: 'tool_use', id: 'call-1', name: 'read_chapter', input: {} } }) +
+      frame({ type: 'content_block_delta', index: 1, delta: { type: 'input_json_delta', partial_json: '{"key": ' } }) +
+      frame({ type: 'content_block_delta', index: 1, delta: { type: 'input_json_delta', partial_json: '"security"}' } }) +
+      frame({ type: 'content_block_stop', index: 1 }) +
+      frame({ type: 'message_delta', delta: { stop_reason: 'tool_use' }, usage: { output_tokens: 78 } }) + stopFrame);
+  };
+  const toolEvents = [];
+  for await (const item of new GatewayProvider().streamChat({ ...request, tools: [{ name: 'read_chapter', description: 'd', input_schema: { type: 'object', properties: {}, required: [] } }] })) toolEvents.push(item);
+  check('a tool called mid-stream arrives whole, as its own event', toolEvents.filter((e) => e.type !== 'done'), [{ type: 'tool_call', id: 'call-1', name: 'read_chapter', input: { key: 'security' } }]);
+  check('and the tools are sent only when there are some', [sentBodies[0].tools?.[0]?.name, 'tools' in (await (async () => { await readStream().catch(() => {}); return sentBodies[1]; })())], ['read_chapter', false]);
 
   const project = fixtureProject('approval');
   store.updateChapterState(project.id, 'overview', { contentMd: 'Reviewed version A', status: 'complete' });
@@ -468,7 +487,7 @@ try {
   const finishSlow = deferred();
   gateway.callWithTools = async () => ({ calls: [], text: '', servedBy: 'fixture', attempts: 1 });
   gateway.streamChat = async function* (req) {
-    const slow = req.messages.at(-1).content === 'Slow answer';
+    const slow = said(req) === 'Slow answer';
     if (slow) { slowEntered.resolve(); await finishSlow.promise; }
     yield { type: 'text', text: slow
       ? `<subchapters>stale-section: Stale section</subchapters><chapter key="overview">Stale prose</chapter><requirement chapter="overview">Stale rule</requirement><decision chapter="overview">Stale decision</decision>Stale answer.`
@@ -494,6 +513,114 @@ try {
   store.withDocumentRevision(independent.id, independentVersion, () => store.updateChapterState(independent.id, 'overview', { contentMd: 'Independent write' }));
   check('conflicts in one application do not invalidate another', store.getChapter(independent.id, 'overview').content_md, 'Independent write');
 
+  // What the interviewer is shown, through the real endpoint.
+  const interviewed = fixtureProject('whole-document');
+  const [target, other] = store.projectChapters(interviewed.id).filter(c => c.key !== 'overview' && c.applicable !== 0 && !c.parent_key);
+  store.updateChapterState(interviewed.id, other.key, { contentMd: 'Managers see every booking, with its purpose.' });
+  const requests = [];
+  gateway.callWithTools = async () => ({ calls: [], text: '', servedBy: 'fixture', attempts: 1 });
+  gateway.streamChat = async function* (req) {
+    requests.push(req);
+    yield { type: 'text', text: `<chapter key="${target.key}">Version ${requests.length}</chapter>Noted.` };
+    yield { type: 'done', servedBy: 'fixture', outputTokens: 1 };
+  };
+  for (const message of ['First', 'Second']) {
+    await (await chat.POST(event({ projectId: interviewed.id, chapterKey: target.key, message }))).text();
+  }
+  check('the interviewer sees what another chapter says, so it can notice a contradiction',
+    requests[0].system.includes('Managers see every booking, with its purpose.'), true);
+  check('the system prompt is the same on the next turn, though the chapter and its status changed',
+    [requests[0].system === requests[1].system, store.getChapter(interviewed.id, target.key).content_md], [true, 'Version 2']);
+  check('the chapter as it reads now travels with the message',
+    [requests[1].messages.at(-1).content.includes('Version 1'), said(requests[1])], [true, 'Second']);
+  check('earlier turns are replayed as they were said', requests[1].messages.map(m => m.content).slice(0, 2), ['First', 'Noted.']);
+  check('and the transcript keeps only the colleague\'s words',
+    store.recentMessages(interviewed.id, target.key, 20).filter(m => m.role === 'user').map(m => m.content), ['First', 'Second']);
+  for (let i = 0; i < 10; i++) {
+    store.addMessage(interviewed.id, target.key, 'user', `Earlier ${i}`);
+    store.addMessage(interviewed.id, target.key, 'assistant', `Reply ${i}`);
+  }
+  await (await chat.POST(event({ projectId: interviewed.id, chapterKey: target.key, message: 'Third' }))).text();
+  check('a long conversation replays a window starting on a step, at least sixteen long',
+    [requests[2].messages.length, requests[2].messages[0].content], [17, 'Earlier 2']);
+  check('a reply that names no other chapter is not asked about', requests.length, 3);
+
+  // A reply that says it corrected another chapter and wrote no block for it.
+  const asked = [];
+  const claimTurn = async (repairText) => {
+    gateway.streamChat = async function* (req) {
+      const repairing = req.messages.at(-1).content.startsWith('FROM SPECMAN, NOT FROM THE COLLEAGUE');
+      asked.push(repairing ? req.messages.at(-1).content : 'turn');
+      yield { type: 'text', text: repairing ? repairText : `I corrected the ${other.title} chapter to match.` };
+      yield { type: 'done', servedBy: 'fixture', outputTokens: 1 };
+    };
+    return (await chat.POST(event({ projectId: interviewed.id, chapterKey: target.key, message: 'Managers see totals only.' }))).text();
+  };
+  const repaired = await claimTurn(`<chapter key="${other.key}">Managers see totals only.</chapter>`);
+  check('the server asks for the chapter a reply said it changed, by key',
+    [asked.length, asked[1]?.includes(`(key: ${other.key})`)], [2, true]);
+  check('and saves what comes back, as though the reply had carried it',
+    [store.getChapter(interviewed.id, other.key).content_md, repaired.includes(`event: chapter\ndata: {"key":"${other.key}"`)], ['Managers see totals only.', true]);
+  asked.length = 0;
+  await claimTurn('');
+  check('a reply that only mentioned the chapter changes nothing when asked', [asked.length, store.getChapter(interviewed.id, other.key).content_md], [2, 'Managers see totals only.']);
+  asked.length = 0;
+  await claimTurn(`<chapter key="${target.key}">Sneaked in.</chapter>`);
+  check('and the follow-up cannot write anything but the chapters it was asked for', store.getChapter(interviewed.id, target.key).content_md, 'Version 3');
+
+  // A long document: the assistant reads a chapter shown only in part, then writes.
+  const filler = (topic) => Array.from({ length: 60 }, (_, i) => `The ${topic} paragraph ${i} starts here. ${'More words that only the whole chapter carries. '.repeat(8)}`).join('\n\n');
+  const longDoc = fixtureProject('long-document');
+  const [asking, ...rest] = store.projectChapters(longDoc.id).filter(c => c.key !== 'overview' && c.applicable !== 0 && !c.parent_key);
+  for (const c of rest) store.updateChapterState(longDoc.id, c.key, { contentMd: `## About\n\n${filler(c.key)}` });
+  store.updateChapterState(longDoc.id, rest[0].key, { contentMd: `## About\n\n${filler(rest[0].key)}\n\n## Buried\n\nManagers see every purpose typed.` });
+  const longCalls = [];
+  gateway.callWithTools = async () => ({ calls: [], text: '', servedBy: 'fixture', attempts: 1 });
+  gateway.streamChat = async function* (req) {
+    longCalls.push(req);
+    if (longCalls.length === 1) {
+      yield { type: 'text', text: 'Let me check. ' };
+      yield { type: 'tool_call', id: 'r1', name: 'read_chapter', input: { key: rest[0].key } };
+    } else {
+      yield { type: 'text', text: `<chapter key="${asking.key}">Managers see totals.</chapter>That contradicts "${rest[0].title}"; I corrected it.` };
+      yield { type: 'text', text: `<section chapter="${rest[0].key}" heading="Buried">Managers see only totals.</section>` };
+    }
+    yield { type: 'done', servedBy: 'fixture', outputTokens: 1 };
+  };
+  const longEvents = await (await chat.POST(event({ projectId: longDoc.id, chapterKey: asking.key, message: 'Managers see totals only.' }))).text();
+  check('a long document is shown in part, and the assistant may read the rest',
+    [longCalls[0].system.includes('[outline]') || longCalls[0].system.includes('[rules only]'), longCalls[0].tools?.[0]?.name], [true, 'read_chapter']);
+  check('what it asked to read is sent back as the chapter as it stands, and the reply goes on',
+    [longCalls.length, longCalls[1].messages.at(-1).content[0].type, longCalls[1].messages.at(-1).content[0].content.includes('Managers see every purpose typed.'),
+      longCalls[1].messages.at(-2).content.map(b => b.type)], [2, 'tool_result', true, ['text', 'tool_use']]);
+  check('the chat says it is reading, by chapter', longEvents.includes(`event: activity\ndata: {"doing":"reading","chapter":"${rest[0].key}"}`), true);
+  check('a part written by heading lands there, and the rest of that chapter is kept',
+    [store.getChapter(longDoc.id, rest[0].key).content_md.endsWith('## Buried\n\nManagers see only totals.'), store.getChapter(longDoc.id, rest[0].key).content_md.includes('paragraph 59 starts here')], [true, true]);
+  check('the reply\'s words before and after the read reach the chat as one', longEvents.includes('Let me check.'), true);
+  check('and the transcript keeps the colleague\'s words, not the reading', store.recentMessages(longDoc.id, asking.key, 5).map(m => typeof m.content), ['string', 'string']);
+
+  // A model that only ever reads is stopped, and told so.
+  longCalls.length = 0;
+  gateway.streamChat = async function* (req) {
+    longCalls.push(req);
+    yield { type: 'tool_call', id: `r${longCalls.length}`, name: 'read_chapter', input: { key: rest[1].key } };
+    yield { type: 'done', servedBy: 'fixture', outputTokens: 1 };
+  };
+  const endless = await (await chat.POST(event({ projectId: longDoc.id, chapterKey: asking.key, message: 'Anything?' }))).text();
+  check('a reply that only reads is given three reads, and is told at the last one to write',
+    [longCalls.length, longCalls.at(-1).messages.at(-1).content[0].content.endsWith('Write your reply now, with what you have.)'),
+      longCalls.at(-2).messages.at(-1).content[0].content.includes('last reading')], [4, true, false]);
+  check('and if it reads again, its reply ends there and says nothing came back', endless.includes('sent nothing back'), true);
+
+  // A part with no heading named is not taken as the chapter's opening.
+  gateway.streamChat = async function* () {
+    yield { type: 'text', text: `<section chapter="${rest[1].key}">Replacement with no heading.</section>Done.` };
+    yield { type: 'done', servedBy: 'fixture', outputTokens: 1 };
+  };
+  const headless = await (await chat.POST(event({ projectId: longDoc.id, chapterKey: asking.key, message: 'x' }))).text();
+  check('a part that names no heading is not saved, and the colleague is told',
+    [store.getChapter(longDoc.id, rest[1].key).content_md.startsWith('## About'), headless.includes('could not be filed')], [true, true]);
+
   // A colleague's reply that writes nothing is not a change to the document.
   const quiet = fixtureProject('quiet-reply');
   const quietEntered = deferred();
@@ -502,7 +629,7 @@ try {
   store.withDocumentRevision(quiet.id, quietVersion, () => {});
   check('a transaction that writes nothing leaves the revision alone', store.documentRevision(quiet.id), quietVersion);
   gateway.streamChat = async function* (req) {
-    const slow = req.messages.at(-1).content === 'Slow answer';
+    const slow = said(req) === 'Slow answer';
     if (slow) { quietEntered.resolve(); await finishQuiet.promise; }
     yield { type: 'text', text: slow ? '<chapter key="overview">Slow but valid prose</chapter>Recorded.' : 'Just a question back?' };
     yield { type: 'done', servedBy: 'fixture', outputTokens: 1 };
@@ -589,7 +716,7 @@ try {
   store.addMessage(filing.id, untouched.key, 'assistant', 'Who may see the backups?');
   await turn('Recorded.', untouched.key, 'Only the fleet office');
   check('the question a clicked open question asked reaches the model',
-    [seenMessages.length, seenMessages[0].role, seenMessages[1].content, seenMessages[2].content],
+    [seenMessages.length, seenMessages[0].role, seenMessages[1].content, said({ messages: seenMessages })],
     [3, 'user', 'Who may see the backups?', 'Only the fleet office']);
 
   gateway.streamChat = async function* () { throw Object.assign(new Error('Gateway stream failed with 502'), { name: 'GatewayError' }); };
@@ -668,6 +795,19 @@ try {
       [asked[0].url.endsWith(':streamGenerateContent?alt=sse'), asked[0].headers['x-goog-api-key']], [true, 'gemini-fixture']);
     check('with the system prompt as an instruction', asked[0].body.systemInstruction, { parts: [{ text: 'Be brief.' }] });
 
+    asked.length = 0;
+    for await (const _ of new GeminiProvider().streamChat({
+      messages: [
+        { role: 'user', content: 'Managers see totals.' },
+        { role: 'assistant', content: [{ type: 'text', text: 'Let me check.' }, { type: 'tool_use', id: 'r1', name: 'read_chapter', input: { key: 'users' } }] },
+        { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'r1', content: 'Managers see every booking.' }] }
+      ],
+      tools: [{ name: 'read_chapter', description: 'd', input_schema: { type: 'object', properties: {}, required: [] } }]
+    })) { /* drained */ }
+    check('Gemini, asked part-way through a reply that read, is given what was read as text and no tools',
+      [asked[0].body.contents.map((c) => c.parts[0].text), 'tools' in asked[0].body],
+      [['Managers see totals.', 'Let me check.\n\n(read_chapter {"key":"users"})', 'Managers see every booking.'], false]);
+
     gemini = () => new Response(geminiChunk([{ text: 'Half a' }]));
     await rejects('a Gemini stream that never says how it finished is not complete', () => read(new GeminiProvider()), /before it was complete/);
     gemini = () => new Response(geminiChunk([{ text: 'Half a' }], { finishReason: 'MAX_TOKENS' }));
@@ -705,6 +845,43 @@ try {
     primary = () => new Response(textFrame('<chapter key="overview">Half') + frame({ type: 'error', error: { type: 'invalid_request_error' } }));
     await rejects('a primary that fails mid-answer is not answered again elsewhere', () => read(fresh()), /interrupted/);
     check('so Gemini is never asked to repeat it', asked.map((a) => a.to), ['primary']);
+
+    // The primary reasons until its budget is gone; Gemini's key is refused.
+    const { describeFailure } = await import('../src/lib/server/llm/failures.ts');
+    const noRoom = () => new Response(frame({ type: 'message_delta', delta: { stop_reason: 'max_tokens' } }) + stopFrame);
+    const refusedKey = () => new Response('{"error":{"code":401,"status":"UNAUTHENTICATED"}}', { status: 401 });
+    primary = noRoom;
+    gemini = refusedKey;
+    asked.length = 0;
+    const warned = [];
+    const realWarn = console.warn;
+    console.warn = (...parts) => { warned.push(parts.join(' ')); };
+    const outOfRoomModels = fresh();
+    let thrown;
+    try { await read(outOfRoomModels); } catch (cause) { thrown = cause; } finally { console.warn = realWarn; }
+    check('when the primary runs out of room and Gemini fails too, the caller is told it ran out of room',
+      [asked.map((a) => a.to), /ran out of room/.test(thrown?.message), describeFailure(thrown).startsWith('That was more than the assistant could write')],
+      [['primary', 'gemini'], true, true]);
+    check('and Gemini\'s failure still reaches the log', warned.some((line) => /Gemini failed too \(.*401.*\)/.test(line)), true);
+    asked.length = 0;
+    primary = () => new Response(textFrame('Smaller, from the primary') + stopFrame);
+    check('a primary that ran out of room is not rested: the next call asks it first',
+      [text(await read(outOfRoomModels)), asked.map((a) => a.to)], ['Smaller, from the primary', ['primary']]);
+
+    // Gemini asked first while a refusing primary rests: its running out of room
+    // is reported, though the primary failed after it.
+    const resting = fresh();
+    primary = () => new Response('{"error":"unauthorised"}', { status: 401 });
+    gemini = () => new Response(geminiChunk([{ text: 'Answered by Gemini' }], { finishReason: 'STOP' }));
+    await read(resting);
+    gemini = () => new Response(geminiChunk([], { finishReason: 'MAX_TOKENS' }));
+    asked.length = 0;
+    await rejects('with the primary resting, Gemini running out of room is reported over the refusal after it',
+      () => read(resting), /Gemini ran out of room/);
+    check('asked in that order', asked.map((a) => a.to), ['gemini', 'primary']);
+    gemini = refusedKey;
+    await rejects('when neither ran out of room, the last failure is reported, as before', () => read(fresh()), /Gemini stream failed with 401/);
+    gemini = () => new Response(geminiChunk([{ text: 'Answered by Gemini' }], { finishReason: 'STOP' }));
 
     const url = process.env.LLM_URL;
     delete process.env.LLM_URL;
@@ -1085,6 +1262,8 @@ try {
   const draftApi = await import('../src/routes/api/draft/+server.ts');
   const askApi = await import('../src/routes/api/ask/+server.ts');
   const { UNCHECKED_CHAPTER } = await import('../src/lib/server/llm/draft.ts');
+  const mockupApi = await import('../src/routes/api/mockup/+server.ts');
+  const mockups = await import('../src/lib/server/mockups.ts');
   const admin = store.getUser(1);
   database.prepare("INSERT INTO users (username, display_name) VALUES ('drafting-colleague', 'A colleague')").run();
   const colleague = database.prepare("SELECT * FROM users WHERE username = 'drafting-colleague'").get();
@@ -1173,6 +1352,7 @@ try {
     statusOf(await askApi.POST(event({ projectId: running.id, chapterKey: 'overview', question: 'Who?' })).catch((e) => e)), 409);
   check('a whole-document check is refused while drafting', statusOf(await verifyApi.POST(event({ projectId: running.id })).catch((e) => e)), 409);
   check('the diagram is refused while drafting', statusOf(await architectureApi.POST(event({ projectId: running.id })).catch((e) => e)), 409);
+  check('a mock-up is refused while drafting', statusOf(await mockupApi.POST(event({ projectId: running.id })).catch((e) => e)), 409);
   check('approving is refused while drafting', (await approveForm(running)).status, 409);
   check('a second run is refused while one is going', statusOf(await draftApi.POST(event({ projectId: running.id })).catch((e) => e)), 409);
   stub.hold.resolve();
@@ -1212,6 +1392,8 @@ try {
   await verifyApi.POST(event({ projectId: finished.id }));
   await askApi.POST(event({ projectId: finished.id, chapterKey: 'overview', question: 'Who books the cars?' }));
   check('a whole-document check and an open question asked leave the mark', isAiDraft(finished), true);
+  store.saveMockup(finished.id, '<!DOCTYPE html><html><body>Mock</body></html>', store.getProject(finished.id).document_revision);
+  check('so does a mock-up kept of it', isAiDraft(finished), true);
 
   // Anything of a person's ends it, without any of these paths clearing a flag.
   const answered = await drafted('Draft answered');
@@ -1278,7 +1460,7 @@ try {
   stub.fail.clear();
   stub.noDecision.clear();
   check('an empty reply is asked for once more, with more room and briefly',
-    stub.calls.filter((c) => c.key === 'data').map((c) => [c.brief, c.maxTokens]), [[false, 16000], [true, 24000]]);
+    stub.calls.filter((c) => c.key === 'data').map((c) => [c.brief, c.maxTokens]), [[false, budgets.DRAFT_BUDGET], [true, budgets.DRAFT_RETRY_BUDGET]]);
   check('and the second answer is kept', store.getChapter(rough.id, 'data').content_md.includes('Drafted'), true);
   check('a chapter whose reply recorded no decision still has one to check',
     store.projectDecisions(rough.id).filter((d) => d.chapter_key === 'licenses').map((d) => [d.statement, d.status]),
@@ -1306,6 +1488,7 @@ try {
     check('and its folder is gone', existsSync(finished.repo_path), false);
     check('with everything stored against it',
       database.prepare('SELECT COUNT(*) AS n FROM decisions WHERE project_id = ?').get(finished.id).n, 0);
+    check('its mock-up included', store.latestMockup(finished.id), undefined);
     await rejects('a writer queued behind the deletion does not make its history again',
       () => proposals.commitDocument(finished, 'Late check'), (cause) => cause.name === 'ApplicationDeleted');
     check('so no folder came back', existsSync(finished.repo_path), false);
@@ -1321,6 +1504,200 @@ try {
   stub.hold = null;
   await new Promise((r) => setTimeout(r, 50));
   check('nothing it was still doing brought the folder back', existsSync(midway.repo_path), false);
+
+  // A mock-up being made of a draft that is deleted is stopped, once the deletion stands.
+  const pictured = await drafted('Draft with a mock-up');
+  const draftingStream = gateway.streamChat;
+  gateway.streamChat = async function* (req) {
+    await new Promise((resolve, reject) => req.signal?.addEventListener('abort', () => reject(req.signal.reason), { once: true }));
+    yield done;
+  };
+  await mockupApi.POST(event({ projectId: pictured.id }));
+  check('a mock-up is being made of a draft', mockups.isMakingMockup(pictured.id), true);
+  check('which can still be deleted', await drafting.deleteDraft(store.getProject(pictured.id), admin), 'deleted');
+  await until(() => !mockups.isMakingMockup(pictured.id));
+  check('and the mock-up being made of it stops', mockups.isMakingMockup(pictured.id), false);
+  gateway.streamChat = draftingStream;
+  }
+
+  {
+  console.log('\n--- making a mock-up ---');
+  const mockupApi = await import('../src/routes/api/mockup/+server.ts');
+  const mockups = await import('../src/lib/server/mockups.ts');
+  const viewRoute = await import('../src/routes/projects/[id]/mockup/view/+server.ts');
+  const downloadRoute = await import('../src/routes/projects/[id]/mockup/download/+server.ts');
+  const mockupPage = await import('../src/routes/projects/[id]/mockup/+page.server.ts');
+  const { MOCKUP_POLICY } = await import('../src/lib/server/llm/mockup.ts');
+  const { GatewayError } = await import('../src/lib/server/llm/gateway.ts');
+  const admin = store.getUser(1);
+  const done = { type: 'done', servedBy: 'fixture', outputTokens: 10 };
+  const page = (body) => `<!DOCTYPE html>\n<html lang="en">\n<head><style>main{padding:1em}</style></head>\n<body><main>${body}</main></body>\n</html>`;
+  const fromOutside = (body) => page(body).replace('<head>', '<head><script src="https://cdn.tailwindcss.com"></script>');
+
+  // A model that decides the screens, then writes a page in two parts and can be
+  // held between them. A reply is a string, or an error to throw.
+  const decided = '<screens>\n1. Bookings: this week\'s bookings, one row each.\n</screens>';
+  const stub = { replies: [], screens: [], calls: [], screensCalls: [], hold: null, halfway: null, deciding: null, decidingReached: null };
+  gateway.streamChat = async function* (req) {
+    if (req.system.includes('<screens>')) {
+      stub.screensCalls.push({ maxTokens: req.maxTokens, document: req.messages[0].content });
+      const reply = stub.screens.length > 0 ? stub.screens.shift() : decided;
+      if (stub.deciding) {
+        stub.decidingReached?.resolve();
+        await stub.deciding.promise;
+      }
+      if (reply instanceof Error) throw reply;
+      yield { type: 'thinking', text: 'Which screens…' };
+      yield { type: 'text', text: reply };
+      yield done;
+      return;
+    }
+    if (!req.system.includes('clickable mock-up')) { yield done; return; }
+    stub.calls.push({
+      brief: req.system.includes('COULD NOT BE USED'),
+      planned: req.system.includes('already decided'),
+      maxTokens: req.maxTokens,
+      document: req.messages[0].content
+    });
+    const reply = stub.replies.shift() ?? page('Default');
+    if (reply instanceof Error) throw reply;
+    yield { type: 'thinking', text: 'Which screens…' };
+    const half = Math.floor(reply.length / 2);
+    yield { type: 'text', text: reply.slice(0, half) };
+    if (stub.hold) {
+      stub.halfway?.resolve();
+      await new Promise((resolve, reject) => {
+        stub.hold.promise.then(resolve);
+        req.signal?.addEventListener('abort', () => reject(req.signal.reason), { once: true });
+      });
+    }
+    yield { type: 'text', text: reply.slice(half) };
+    yield done;
+  };
+  const made = async (id) => {
+    for (let i = 0; i < 3000 && mockups.isMakingMockup(id); i++) await new Promise((r) => setTimeout(r, 10));
+    return mockups.mockupView({ id });
+  };
+  const post = (projectId) => mockupApi.POST(event({ projectId })).catch((thrown) => thrown);
+  const statusOf = (answered) => answered?.status;
+  const routeEvent = (project, headers = {}) => ({ params: { id: String(project.id) }, locals: { user: admin },
+    request: new Request('https://fixture.invalid/mockup', { headers }) });
+
+  const sketched = fixtureProject('mockup-project');
+  stub.calls = [];
+  check('nothing written is refused before any call', [statusOf(await post(sketched.id)), stub.calls.length], [422, 0]);
+  check('the page loads with nothing made and nothing running',
+    (await mockupPage.load({ params: { id: String(sketched.id) }, locals: { user: admin } })).view,
+    { running: false, phase: null, written: 0, retrying: false, problem: null, made: null });
+  check('the view says none has been made, in its frame', [(await viewRoute.GET(routeEvent(sketched, { 'sec-fetch-dest': 'iframe' }))).status], [404]);
+
+  store.updateChapterState(sketched.id, 'overview', { contentMd: 'Employees book pool cars by the day.' });
+  const before = store.getProject(sketched.id).document_revision;
+  stub.deciding = deferred();
+  stub.decidingReached = deferred();
+  stub.hold = deferred();
+  stub.halfway = deferred();
+  const started = await post(sketched.id);
+  check('a mock-up is started and the request returns at once', [started.status, (await started.json()).running], [202, true]);
+  await stub.decidingReached.promise;
+  check('it first decides the screens, and says so', mockups.mockupView({ id: sketched.id }).phase, 'planning');
+  stub.deciding.resolve();
+  stub.deciding = null;
+  await stub.halfway.promise;
+  const midway = mockups.mockupView({ id: sketched.id });
+  check('its progress is the page written so far', [midway.phase, midway.written > 0], ['writing', true]);
+  check('asked again meanwhile, it is followed rather than doubled', [(await post(sketched.id)).status, stub.calls.length], [202, 1]);
+  stub.hold.resolve();
+  stub.hold = null;
+  const first = await made(sketched.id);
+  check('the screens were decided from the document, with room to think',
+    [stub.screensCalls.length, stub.screensCalls[0].document.includes('Employees book pool cars'), stub.screensCalls[0].maxTokens], [1, true, budgets.SCREENS_BUDGET]);
+  check('the page call was given the document and the screens, with room to think',
+    [stub.calls[0].document.includes('Employees book pool cars'), stub.calls[0].document.includes('1. Bookings'), stub.calls[0].planned, stub.calls[0].maxTokens],
+    [true, true, true, budgets.MOCKUP_BUDGET]);
+  check('the mock-up is kept, from the document as it was read', [!!first.made, store.latestMockup(sketched.id).document_revision], [true, before]);
+  check('keeping it is not a write to the document', store.getProject(sketched.id).document_revision, before);
+  const stored = store.latestMockup(sketched.id).html;
+  check('it is kept with its note and the file\'s own policy',
+    [stored.startsWith('<!DOCTYPE html>\n<!--'), stored.includes('http-equiv="Content-Security-Policy"'), stored.includes('<main>Default</main>')], [true, true, true]);
+
+  const shown = await viewRoute.GET(routeEvent(sketched, { 'sec-fetch-dest': 'iframe' }));
+  check('its frame is answered with the page and the policy',
+    [shown.status, await shown.text(), shown.headers.get('content-security-policy'), shown.headers.get('x-frame-options')],
+    [200, stored, MOCKUP_POLICY, 'SAMEORIGIN']);
+  check('so is a browser that does not say where it will be shown', (await viewRoute.GET(routeEvent(sketched))).status, 200);
+  const ownTab = await viewRoute.GET(routeEvent(sketched, { 'sec-fetch-dest': 'document' }));
+  check('but not a tab of its own, where only the header would hold the sandbox',
+    [ownTab.status, (await ownTab.text()).includes(stored)], [403, false]);
+  const downloaded = await downloadRoute.GET(routeEvent(sketched));
+  check('the download is one file named for the application, with the same policy',
+    [downloaded.headers.get('content-disposition'), downloaded.headers.get('content-security-policy'), await downloaded.text()],
+    ['attachment; filename="mockup-project-mock-up.html"', MOCKUP_POLICY, stored]);
+  check('a download with nothing made says so', await downloadRoute.GET(routeEvent(fixtureProject('mockup-none'))).catch((e) => e.status), 404);
+
+  store.updateChapterState(sketched.id, 'overview', { contentMd: 'Employees book pool cars by the hour.' });
+  check('the document changed since it was made', mockups.mockupView({ id: sketched.id }).made.stale, true);
+
+  stub.calls = [];
+  stub.replies = ['I could not make it this time.', page('Second')];
+  await post(sketched.id);
+  const retried = await made(sketched.id);
+  check('a reply with no page is asked for once more, smaller', stub.calls.map((c) => c.brief), [false, true]);
+  check('and the second is kept, made from the changed document',
+    [store.latestMockup(sketched.id).html.includes('<main>Second</main>'), retried.made.stale], [true, false]);
+
+  stub.calls = [];
+  stub.replies = [fromOutside('Outside'), fromOutside('Outside again')];
+  await post(sketched.id);
+  const outside = await made(sketched.id);
+  check('a page that loads from outside is asked for once more', stub.calls.map((c) => c.brief), [false, true]);
+  check('and when the second does too, the fuller first is kept, said to be incomplete',
+    [store.latestMockup(sketched.id).html.includes('<main>Outside</main>'), outside.made.incomplete], [true, true]);
+
+  stub.calls = [];
+  stub.screens = [new GatewayError('The gateway ran out of room before completing its response.'), '  \n'];
+  stub.replies = [page('Undecided'), page('Undecided again')];
+  await post(sketched.id);
+  const undecided = await made(sketched.id);
+  await post(sketched.id);
+  await made(sketched.id);
+  check('when deciding the screens runs out of room or decides nothing, the page call decides them',
+    [stub.calls.map((c) => c.planned), stub.calls.some((c) => c.document.includes('already decided'))], [[false, false], false]);
+  check('and the page is still made', [undecided.problem, store.latestMockup(sketched.id).html.includes('<main>Undecided again</main>')], [null, true]);
+
+  const keptBefore = store.latestMockup(sketched.id).html;
+  stub.calls = [];
+  stub.replies = [new GatewayError('Gateway stream failed with 502')];
+  await post(sketched.id);
+  const failed = await made(sketched.id);
+  check('a failed call is said in words, and not tried again here',
+    [failed.problem?.startsWith('The mock-up could not be made.'), stub.calls.length], [true, 1]);
+  check('and the last mock-up stays', store.latestMockup(sketched.id).html, keptBefore);
+
+  stub.calls = [];
+  stub.screens = [new GatewayError('Gateway stream failed with 502')];
+  await post(sketched.id);
+  const unreachable = await made(sketched.id);
+  check('a failure deciding the screens is said in words, and no page is asked for',
+    [unreachable.problem?.startsWith('The mock-up could not be made.'), stub.calls.length], [true, 0]);
+  check('and the last mock-up stays, again', store.latestMockup(sketched.id).html, keptBefore);
+
+  stub.replies = [new GatewayError('The gateway ran out of room before completing its response.'), new GatewayError('The gateway ran out of room before completing its response.')];
+  await post(sketched.id);
+  const tooBig = await made(sketched.id);
+  check('running out of room twice says so, without the advice to ask for less',
+    [/more than the assistant could write/.test(tooBig.problem), /one part at a time/.test(tooBig.problem)], [true, false]);
+
+  stub.hold = deferred();
+  stub.halfway = deferred();
+  await post(sketched.id);
+  await stub.halfway.promise;
+  await (await mockupApi.DELETE({ url: new URL(`https://fixture.invalid/api/mockup?project=${sketched.id}`), locals: { user: admin } })).json();
+  const stopped = await made(sketched.id);
+  check('one being made can be stopped, and says so', [stopped.running, stopped.problem], [false, 'Stopped before it was finished.']);
+  check('and keeps the last mock-up', store.latestMockup(sketched.id).html, keptBefore);
+  stub.hold = null;
+  gateway.streamChat = realStream;
   }
 } finally {
   globalThis.fetch = realFetch;

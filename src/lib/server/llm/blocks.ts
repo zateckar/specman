@@ -5,6 +5,7 @@
  * never see as raw text:
  *
  *   <chapter key="security">        the rewritten chapter
+ *   <section chapter="data" heading="Cars">  one part of a long chapter, rewritten
  *   <options>                       answers offered for its question
  *   <requirement scope="now">       something that must always be true
  *
@@ -19,6 +20,7 @@
 
 export type BlockTag =
 	| 'chapter'
+	| 'section'
 	| 'options'
 	| 'requirement'
 	| 'decision'
@@ -34,7 +36,7 @@ export interface ParsedBlock {
 }
 
 // All distinct words, so ordinary alternation is unambiguous.
-const TAGS = 'chapter|options|requirement|decision|finding|subchapters|element|relation';
+const TAGS = 'chapter|section|options|requirement|decision|finding|subchapters|element|relation';
 // Either quote, or none. The models write `key='x'` often enough that refusing it
 // printed the raw tag and the whole chapter into the chat, and saved nothing —
 // and `key=security` did exactly the same.

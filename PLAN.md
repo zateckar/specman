@@ -198,6 +198,41 @@ held the deletion for minutes, only to return the moment they got one, so the wa
 and refused a deletion with nothing left to do. A queue that cannot be left makes "stop" mean
 "stop eventually". (From drafting a whole document, 2026-10-03.)
 
+**A sandbox takes away more than the attacker's tools.** The mock-up's frame is given an
+origin of its own so its script cannot act as Specman — and with it, `localStorage` and
+`document.cookie` throw, which the model's scripts touch as the page starts. One throw there
+and the whole mock-up is dead, for the most ordinary of pages. Whatever a restriction removes,
+ask what harmless code was using it. (From the review of the mock-up plan, 2026-10-03.)
+
+**A lesson paid for once is paid again unless it is read.** The diagram had already found that
+asking for the parts and their connections in one call spent the whole budget on reasoning
+and returned nothing. The mock-up was built as one call anyway, deciding the screens and
+writing the page, and on the live gateway it reasoned for five minutes until 32 000 tokens
+were gone. Split in two, the deciding took forty seconds — and the page call still reasoned
+until its budget was gone, until it was told how big the page should be. Asked for a compact
+page, it was made at the first attempt in four and a half minutes. When a call has to decide
+something large and then write something long, make deciding its own call, and say how long
+the writing should be. (2026-10-03.)
+
+**Measure before optimising for the cache.** Asked whether the client used the KV cache the
+way agent frameworks do, the log was first taught to say how much of each prompt the cache
+served. The interview prompt turned out to be three thousand tokens, and a turn's time nearly
+all reasoning: laying it out for the cache alone would have bought a fraction of a second.
+What the measuring found instead was a model told to keep chapters consistent that could see
+only their titles — a contradiction planted in a scripted interview went unremarked. Giving
+it the document is what made the layout matter. And one more run of the same script found a
+reply claiming to have corrected three chapters while writing none, which no amount of
+prompt wording reaches; the server now asks for what a reply names. Run the real thing more
+than once: the first good result was one draw. (2026-10-03.)
+
+**Filler finds the failure filler cannot judge.** The long-document test was seeded with
+generated sentences. Edited by section, the chapter changed a few lines a turn; the turn it
+fell under the threshold and was rewritten whole, it shrank from 5 500 characters to 1 400.
+Every fact survived — the model had thrown out the filler, which is fair — but the same
+instruction applied to a colleague's real paragraphs would have done the same to them. A test
+document that is easy to condense measures the mechanism, not the content; read what went,
+not how much. (2026-10-03.)
+
 **Slow and silent feel the same.** A turn streamed text for its whole length, and the user
 saw an empty bubble for most of it, because the model writes the chapter first and the reply
 last. Nothing was slow that had not been slow before; it was only invisible. Say what is
@@ -277,7 +312,37 @@ first folder under `openspec/changes/`:
   presence: a restart ends it, and the workspace then offers to draft the rest rather than
   starting again at boot, where a chapter that fails every time would fail on every restart.
   A second process neither sees a running draft nor refuses a turn beside it. At most three
-  drafting calls run at once across the installation, queued in arrival order.
+  long calls — drafted chapters and mock-ups together — run at once across the installation,
+  queued in arrival order (`longCalls` in `llm/parallel.ts`).
+- **A mock-up can still reach out a little.** It runs sandboxed, with a policy that lets it load,
+  fetch and send nothing, in the frame and in the downloaded file. A sandboxed frame can
+  still navigate itself, and link hints and WebRTC are governed by no policy, so a script could
+  carry something out — its own markup, made from a document its readers can already see. It
+  holds no cookie or session of Specman's, and the page says not to type anything real into
+  it. Its address is not answered as a page of its own, where the sandbox would rest on the
+  header alone.
+- **More room is a longer wait when a model will not stop thinking.** Every budget is at least
+  twice the most its kind has been seen to use, and all of them are in `llm/budgets.ts`. A call
+  that reasons without end fails only once its room is spent. At the hundred or so tokens a
+  second the gateway writes, that is about five minutes for a turn or a drafted chapter
+  rather than two and a half, and ten for a mock-up's page. A call that finishes is no slower.
+- **A long document is seen through outlines and reads.** Past 48 000 characters the chapters
+  that bear least on the one under discussion are shown as outlines, then rules, then titles,
+  and the model must choose to read what it needs. It did, live, on a 190 000-character
+  document — but a contradiction in a chapter it does not think to read is not seen, and
+  relatedness is a word count, not understanding. Every rule stays visible until the last
+  step, which is the backstop: write what must hold as a rule.
+- **A chapter under 3 000 characters is still rewritten whole**, and a whole rewrite is where
+  the model condenses what nobody discussed. Review shows it; nothing stops it.
+- **A claimed change is caught by its title.** The follow-up that asks for a chapter a reply
+  said it changed looks for the chapter's title in the reply. A reply that names it in other
+  words — a translated title, "the roles chapter" — is not followed up, and a reply that only
+  mentions a chapter costs one more short call. Nothing in the follow-up can write any chapter
+  but the ones named.
+- **A mock-up being made lives in this process.** Like a draft, a restart ends it; nothing is
+  stored until the end, so the last mock-up stays, and the page that was following it says it
+  stopped. It is not part of the document, the review or the handoff, and only the latest is
+  kept.
 - **How an account signs in is recorded, not inferred.** `users.created_via` exists because
   the people page derived it from the password and company-account columns, and an account
   the gateway signs in has neither — so it reported everybody in a proxied installation as
@@ -302,7 +367,9 @@ first folder under `openspec/changes/`:
   credential, and the session its own fourteen days.
 - **Gemini is asked only before anything was passed on.** A primary that fails part-way
   through a reply fails the turn, because the half already parsed cannot be unparsed; the next
-  call goes to Gemini first. A primary that is merely slow, rather than silent, is waited for.
+  call goes to Gemini first, unless the primary only ran out of room. A primary that is merely
+  slow, rather than silent, is waited for. When both fail, running out of room is what the
+  caller hears, and the other failure — an unusable Gemini key, say — is only in the log.
 - **The chapter shown while it is written is not the chapter saved.** It is the raw block as it
   streams; the saved text is normalised — its heading tidied — and replaces it when the turn
   records it. A turn that fails puts the stored chapter back only when the page refreshes at

@@ -17,6 +17,7 @@ here or anywhere else in this repository.
 ## Source
 
 - `src/lib/server/env.ts`
+- `src/lib/server/llm/budgets.ts`
 - `src/lib/server/llm/gateway.ts`
 - `src/lib/server/llm/gemini.ts`
 - `src/lib/server/llm/gemini-format.ts`
@@ -56,7 +57,8 @@ as failures, and SHALL emit done only after message_stop or the explicit DONE se
 
 ### Requirement: Gemini answers when the primary gateway cannot
 A model call SHALL go to the primary gateway when it is configured, and to Gemini when it is
-not, or when the primary fails before any of its answer has been passed on.
+not, or when the primary fails before any of its answer has been passed on; and when both
+fail, the caller SHALL be told of a failure to fit the answer in its room ahead of any other.
 
 #### Scenario: Only Gemini is configured
 - **WHEN** `LLM_URL`, `LLM_API_KEY` or `LLM_MODEL` is unset and `GEMINI_API_KEY` is set
@@ -79,6 +81,21 @@ not, or when the primary fails before any of its answer has been passed on.
 - **THEN** Gemini is asked first for the next two minutes, and the primary only if Gemini
   fails too, because each call of a turn waiting through the same failure made the fallback
   slower than the outage
+
+#### Scenario: The primary ran out of room
+- **WHEN** the primary failed because the answer did not fit in the room it was given
+- **THEN** Gemini is asked for this call, and the primary is not passed over for the calls
+  after it, because it answered and only the request was too big for it
+
+#### Scenario: Both fail, one of them for room
+- **WHEN** one provider ran out of room and the other failed for a reason of its own, such as a
+  key it refused
+- **THEN** the caller is told the call ran out of room, and the other failure is logged.
+  Running out of room is the failure a caller can act on: a drafted chapter is asked for again
+  with more room, and a mock-up asks for a smaller page. With an unusable Gemini key, every
+  such failure was reported as Gemini's, "the assistant cannot be reached", and neither retry
+  ever ran (found live on 2026-10-03)
+- **AND** when neither ran out of room, the last failure is the one reported
 
 #### Scenario: Neither is configured
 - **WHEN** no provider is set up
@@ -107,6 +124,13 @@ finished, and failed when it ran out of budget.
 #### Scenario: Gemini's reasoning
 - **WHEN** it returns thought summaries
 - **THEN** they are never the answer, as with the primary's thinking
+
+#### Scenario: A budget beyond what Gemini will write
+- **WHEN** a call asks for more room than Gemini's models can write, 65 536 tokens
+- **THEN** Gemini is asked for its most, and running out is judged against that, because
+  Google refuses such a request outright, and the fallback would fail every call that asked
+  for more. No budget asks for more today, so the fallback is given the same room as the
+  primary
 
 ### Requirement: Bearer authentication
 The client SHALL authenticate with an `Authorization: Bearer` header to the primary gateway.
@@ -190,7 +214,24 @@ reasoning model emits them and no caller wants them in the document.
 
 ### Requirement: A call's budget covers its reasoning
 Every call SHALL be given a `max_tokens` large enough for the model's reasoning as well as
-its answer, because a model that thinks before it writes spends the same budget on both.
+its answer, at least twice the most a call of its kind has been seen to use, because a model
+that thinks before it writes spends the same budget on both.
+
+#### Scenario: Room to spare
+- **WHEN** a call reads a whole chapter or document
+- **THEN** it is given at least 16 000 tokens, and at least twice the most its kind has used:
+  a turn or a drafted chapter 32 000, where one used 14 261; a mock-up's page 64 000, where a
+  compact one used 25 168. Room unused costs nothing, because a call stops when its answer is
+  done; a longer document, or a model that deliberates more, still fits
+- **AND** the price is waiting: a call that reasons without end fails only once its room is
+  spent, so twice the room is twice the wait before a retry, and that is accepted for answers
+  that fit
+
+#### Scenario: How much the gateway accepts
+- **WHEN** a budget is chosen
+- **THEN** it is ours to choose, because the primary gateway accepted every figure up to a
+  million without complaint, and room beyond 32 000 is real: given 64 000, one answer ran to
+  35 728 tokens and finished (measured on 2026-10-03)
 
 #### Scenario: A call returns nothing
 - **WHEN** the result is empty and the output-token count sits exactly on the ceiling
@@ -230,3 +271,55 @@ an administrator.
 - **THEN** it is refused before any gateway call is made, because one request spends up to
   twenty calls against a quota the whole company shares, and names the gateway while doing
   it
+
+### Requirement: Every call says what it cost
+Each completed call SHALL log its output tokens, the size of its prompt and how much of the
+prompt the gateway's cache supplied.
+
+#### Scenario: A prompt the gateway has seen the start of
+- **WHEN** a call's prompt begins as an earlier one did
+- **THEN** the log line gives the cached part and its share of the prompt, counting it in the
+  prompt, because the gateway reports only the uncached rest as input and a layout that
+  defeats the cache cannot otherwise be seen
+
+#### Scenario: Where the figures come from
+- **WHEN** a streamed call ends
+- **THEN** the counts are taken from its final usage, because the gateway reports zeros at
+  the start of the stream
+
+#### Scenario: How much the cache is worth
+- **WHEN** the layout of a prompt is argued about
+- **THEN** the measurement of 2026-10-03 is the guide: steps of 768 tokens, served only as far
+  as the prompt starts the same; at two to nine thousand tokens a warm prompt reached its first
+  word about 0.4 seconds sooner, at 38 000 tokens 1.8 seconds sooner; a conversation turn
+  spends most of its time reasoning, at about 100 tokens a second
+
+### Requirement: A streamed reply may call a tool with a short argument
+`streamChat` SHALL accept tools, SHALL report a call the model makes as an event once its
+arguments are complete, and SHALL accept conversations that carry calls and their results; a
+tool offered this way SHALL take identifiers only, never prose.
+
+#### Scenario: The model asks to read a chapter
+- **WHEN** the model calls a tool while it streams
+- **THEN** the call arrives as one event with its arguments put together, after any text
+  before it, and the stream ends; the caller answers and asks again, and the gateway serves
+  that request from its cache (measured 2026-10-03: 6 144 of 6 347 prompt tokens, under a
+  second)
+
+#### Scenario: Arguments that do not parse
+- **WHEN** a call's arguments are not an object
+- **THEN** they are read as empty, and the tool answers that it was not told what to do,
+  rather than the turn failing
+
+#### Scenario: A call counts as an answer begun
+- **WHEN** a call has been passed on and the stream then fails
+- **THEN** it is not asked again elsewhere, as text already passed on is not
+
+#### Scenario: No tools
+- **WHEN** a request offers none
+- **THEN** none are sent, so every other call is the request it was
+
+#### Scenario: Gemini answers instead
+- **WHEN** the fallback is asked part-way through a reply that has read
+- **THEN** it is given the conversation as text — a call as a line saying so, a result as
+  itself — and no tools, so it answers with what was read

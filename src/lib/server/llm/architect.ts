@@ -1,5 +1,6 @@
 import { gateway } from './gateway';
 import { ChapterStreamParser } from './blocks';
+import { DIAGRAM_BUDGET } from './budgets';
 import {
 	buildModel,
 	toElement,
@@ -167,7 +168,7 @@ async function collect<T>(
 		// the entire allowance deliberating and returned zero characters of text —
 		// not truncated output, no output. This ceiling is the working room the
 		// reasoning needs, not the size of the answer, which is a few hundred bytes.
-		maxTokens: 12000,
+		maxTokens: DIAGRAM_BUDGET,
 		signal
 	})) {
 		if (event.type === 'text') text += event.text;

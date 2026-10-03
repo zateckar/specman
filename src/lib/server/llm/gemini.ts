@@ -1,7 +1,8 @@
 import { config } from '../env';
-import { ending, geminiBody, geminiModelPath, geminiRetryable, readGeminiPayload } from './gemini-format';
+import { DEFAULT_BUDGET } from './budgets';
+import { ending, geminiBody, geminiModelPath, geminiRetryable, geminiRoom, readGeminiPayload } from './gemini-format';
 import { GatewayError, MAX_ATTEMPTS, backoffMs, eventPayloads, sleep, withinIdleLimit } from './transport';
-import type { LlmProvider, StreamEvent, StreamRequest, ToolRequest, ToolResponse } from './types';
+import { textOf, type LlmProvider, type StreamEvent, type StreamRequest, type ToolRequest, type ToolResponse } from './types';
 
 /**
  * Client for Google's Gemini API, the fallback behind the primary gateway.
@@ -43,8 +44,13 @@ export class GeminiProvider implements LlmProvider {
 	readonly id = 'gemini';
 
 	async *streamChat(req: StreamRequest): AsyncIterable<StreamEvent> {
-		const maxTokens = req.maxTokens ?? 4000;
-		const body = geminiBody({ system: req.system, messages: req.messages, maxTokens });
+		// Brought within Gemini's ceiling here too: running out is judged against
+		// the room it was given, not the room the caller asked for.
+		const maxTokens = geminiRoom(req.maxTokens ?? DEFAULT_BUDGET);
+		// No tools here: Gemini is asked only when the gateway fails, and is given
+		// any chapter already read as text in the conversation instead.
+		const messages = req.messages.map((m) => ({ role: m.role, content: textOf(m.content) }));
+		const body = geminiBody({ system: req.system, messages, maxTokens });
 
 		for (let attempt = 1; ; attempt++) {
 			let wrote = false;
@@ -124,10 +130,10 @@ export class GeminiProvider implements LlmProvider {
 	}
 
 	async callWithTools(req: ToolRequest): Promise<ToolResponse> {
-		const maxTokens = Math.max(req.maxTokens ?? MIN_TOOL_MAX_TOKENS, MIN_TOOL_MAX_TOKENS);
+		const maxTokens = geminiRoom(Math.max(req.maxTokens ?? MIN_TOOL_MAX_TOKENS, MIN_TOOL_MAX_TOKENS));
 		const body = geminiBody({
 			system: req.system,
-			messages: req.messages,
+			messages: req.messages.map((m) => ({ role: m.role, content: textOf(m.content) })),
 			maxTokens,
 			tools: req.tools,
 			forceTool: req.forceTool

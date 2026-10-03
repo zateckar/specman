@@ -11,8 +11,10 @@ import {
 	getProject,
 	getRequirement,
 	projectChapters,
+	messageCount,
+	messagesFrom,
 	projectDecisions,
-	recentMessages,
+	projectRequirements,
 	saveDecision,
 	saveRequirement,
 	setChapterApplicable,
@@ -20,6 +22,7 @@ import {
 	withChapterUnchanged,
 	withDocumentRevision
 } from '$lib/server/db';
+import { TURN_BUDGET } from '$lib/server/llm/budgets';
 import { describeFailure } from '$lib/server/llm/failures';
 import { attributeDecision, effectiveStatus, toDecisionDraft, unconfirmed } from '$lib/server/llm/decisions';
 import { sameStatement, toRequirementDraft } from '$lib/server/llm/requirements';
@@ -32,6 +35,20 @@ import {
 	normalizeChapterMarkdown,
 	toChatMessages
 } from '$lib/server/llm/agent';
+import {
+	ACTIVE_LIMIT,
+	READ_ROUNDS,
+	READ_TOOL,
+	buildTurnState,
+	documentContext,
+	historyWindowStart,
+	mergeSection,
+	readChapter,
+	repairRequest,
+	unwrittenMentions,
+	withLastTurn
+} from '$lib/server/llm/context';
+import { textOf, type ChatMessage } from '$lib/server/llm/types';
 import { parseOptions, reconcileAssessment } from '$lib/server/llm/questions';
 import { presence } from '$lib/server/llm/presence';
 import { TurnProgress } from '$lib/server/llm/progress';
@@ -40,9 +57,6 @@ import { commitDocument } from '$lib/server/proposals';
 import { isDrafting, STILL_DRAFTING } from '$lib/server/drafting';
 import type { Chapter } from '$lib/server/db/types';
 import type { RequestHandler } from './$types';
-
-/** See the comment where it is used. */
-const TURN_MAX_TOKENS = 16000;
 
 /** Comfortably inside the idle limit of any proxy likely to sit in front. */
 const HEARTBEAT_MS = 15_000;
@@ -101,9 +115,12 @@ export const POST: RequestHandler = async ({ request, locals }) => {
 
 	const chapters = projectChapters(project.id);
 	const active = chapterKey ? (getChapter(project.id, chapterKey) ?? null) : null;
-	const activeRequirements = active ? chapterRequirements(project.id, active.key) : [];
+	const requirements = projectRequirements(project.id);
+	const activeRequirements = active ? requirements.filter((r) => r.chapter_key === active.key) : [];
 
-	const history = recentMessages(project.id, chapterKey, 16).map((m) => ({
+	// A window whose start moves in steps, not with every turn. See `llm/context.ts`.
+	const start = historyWindowStart(messageCount(project.id, chapterKey));
+	const history = messagesFrom(project.id, chapterKey, start).map((m) => ({
 		role: m.role,
 		content: m.content
 	}));
@@ -150,7 +167,7 @@ export const POST: RequestHandler = async ({ request, locals }) => {
 			// the chapter comes first and the reply last. See `llm/progress.ts`.
 			const progress = new TurnProgress();
 			const chapterFor = (attrs: Record<string, string>) =>
-				draftTarget((attrs.key ?? '').trim(), chapters, active)?.key ?? null;
+				draftTarget((attrs.key ?? attrs.chapter ?? '').trim(), chapters, active)?.key ?? null;
 			const report = (replied: boolean) => {
 				const update = progress.observe(parser.writing, parser.blocks, replied, chapterFor);
 				if (update.activity) send('activity', update.activity);
@@ -158,32 +175,86 @@ export const POST: RequestHandler = async ({ request, locals }) => {
 			};
 
 			try {
+				// As stored, and as the completeness check reads it. Only the request
+				// carries the chapter's state, wrapped around the last turn — which may
+				// hold an earlier message a failed turn left unanswered.
 				const conversation = toChatMessages(history, message);
+				const lastSaid = textOf(conversation.at(-1)?.content ?? message);
+				const rest = documentContext(chapters, requirements, active);
+				const system = buildSystemPrompt(project, chapters, active, requirements, rest);
+				// Reading is offered only when something is shown in part: with the
+				// whole document in view a read is a round trip that learns nothing.
+				const reading =
+					[...rest.shown.values()].some((shown) => shown !== 'full') ||
+					(active?.content_md.length ?? 0) > ACTIVE_LIMIT;
+				const tools = reading ? [READ_TOOL] : undefined;
+				// The request as it grows: each round of reading adds the call and its answer.
+				const sent: ChatMessage[] = withLastTurn(
+					conversation,
+					buildTurnState({ chapters, active, activeRequirements, message: lastSaid })
+				);
 
-				for await (const event of gateway.streamChat({
-					system: buildSystemPrompt(
-						project,
-						chapters,
-						active,
-						activeRequirements
-					),
-					messages: conversation,
-					// One reply carries the whole chapter rewritten, its requirements and
-					// decisions, and the model's reasoning before any of it — all from this
-					// one budget. At 6000 a chapter of a few thousand words could not be
-					// written at all, and every retry failed the same way.
-					maxTokens: TURN_MAX_TOKENS
-				})) {
-					if (event.type === 'text') {
-						const visible = parser.push(event.text);
-						if (visible) {
-							reply += visible;
-							send('text', { delta: visible });
+				// One reply, which may stop to read a chapter and then go on. Each stop
+				// is a new request whose start the gateway has just seen, so it is
+				// served from the cache. The last read a turn may make says so, and a
+				// call after it ends the reply with whatever it has written.
+				for (let round = 0; round <= READ_ROUNDS; round++) {
+					let said = '';
+					const calls: Array<{ id: string; name: string; input: Record<string, unknown> }> = [];
+					for await (const event of gateway.streamChat({
+						system,
+						// A copy: the request is what was asked, not what it later grew into.
+						messages: [...sent],
+						tools,
+						// One reply carries the chapter or its changed sections, its
+						// requirements and decisions, and the model's reasoning before any
+						// of it — all from this one budget. See `llm/budgets.ts`.
+						maxTokens: TURN_BUDGET
+					})) {
+						if (event.type === 'text') {
+							said += event.text;
+							const visible = parser.push(event.text);
+							if (visible) {
+								reply += visible;
+								send('text', { delta: visible });
+							}
+							report(visible.trim().length > 0);
+						} else if (event.type === 'tool_call') {
+							calls.push({ id: event.id, name: event.name, input: event.input });
 						}
-						report(visible.trim().length > 0);
+						// `thinking` events are intentionally dropped — reasoning output is
+						// never shown to the user, and never stored in the transcript.
 					}
-					// `thinking` events are intentionally dropped — reasoning output is
-					// never shown to the user, and never stored in the transcript.
+					if (calls.length === 0) break;
+					if (round === READ_ROUNDS) {
+						console.warn(`[chat] the assistant was still reading after ${READ_ROUNDS} rounds; its reply ends here`);
+						break;
+					}
+
+					const lastRead = round === READ_ROUNDS - 1;
+					const answers = calls.map((call) => {
+						if (call.name !== READ_TOOL.name) return { call, text: `There is no tool called ${call.name}.` };
+						const read = readChapter(call.input, chapters, requirements);
+						send('activity', progress.announce('reading', read.chapter?.key ?? null));
+						console.info(`[chat] the assistant read ${read.chapter?.key ?? `nothing (${JSON.stringify(call.input)})`}`);
+						return {
+							call,
+							text: lastRead ? `${read.text}\n\n(That was the last reading this turn. Write your reply now, with what you have.)` : read.text
+						};
+					});
+					sent.push(
+						{
+							role: 'assistant',
+							content: [
+								...(said.trim() ? [{ type: 'text' as const, text: said }] : []),
+								...calls.map(({ id, name, input }) => ({ type: 'tool_use' as const, id, name, input }))
+							]
+						},
+						{
+							role: 'user',
+							content: answers.map(({ call, text }) => ({ type: 'tool_result' as const, tool_use_id: call.id, content: text }))
+						}
+					);
 				}
 
 				const tail = parser.end();
@@ -193,12 +264,68 @@ export const POST: RequestHandler = async ({ request, locals }) => {
 				}
 				report(tail.trim().length > 0);
 
+				// --- A reply that names another chapter it did not write may be saying
+				//     it changed one, which nothing has. Asked once, for the blocks only.
+				const written = [
+					...parser.drafts.keys(),
+					...parser.blocksOf('section').map((block) => block.attrs.chapter ?? block.attrs.key ?? '')
+				]
+					.map((k) => draftTarget(k, chapters, active)?.key)
+					.filter((k): k is string => Boolean(k));
+				const named = unwrittenMentions(reply, chapters, written, active?.key ?? null);
+				if (named.length > 0) {
+					send('activity', { doing: 'writing', chapter: named[0].key });
+					const repair = new ChapterStreamParser();
+					try {
+						for await (const event of gateway.streamChat({
+							system,
+							messages: [
+								...sent,
+								{ role: 'assistant', content: reply.trim() || '(blocks only)' },
+								{ role: 'user', content: repairRequest(named) }
+							],
+							// Offered only because a request that read must still describe the
+							// tool; a call to it here is not answered.
+							tools,
+							maxTokens: TURN_BUDGET
+						})) {
+							if (event.type === 'text') repair.push(event.text);
+						}
+						repair.end();
+					} catch (cause) {
+						console.warn('[chat] could not ask for the chapters a reply named:', cause);
+					}
+					const got: string[] = [];
+					const asked = (key: string) => {
+						const target = draftTarget(key, chapters, null);
+						return target && named.includes(target) ? target : null;
+					};
+					for (const [key, markdown] of repair.drafts) {
+						const target = asked(key);
+						if (target && !parser.drafts.has(target.key)) {
+							parser.drafts.set(target.key, markdown);
+							got.push(target.key);
+						}
+					}
+					for (const block of repair.blocksOf('section')) {
+						const target = asked(block.attrs.chapter ?? block.attrs.key ?? '');
+						if (target) {
+							parser.blocks.push(block);
+							if (!got.includes(target.key)) got.push(target.key);
+						}
+					}
+					console.info(
+						`[chat] reply named ${named.map((c) => c.key).join(', ')} without writing it;` +
+							` asked again, ${got.length ? `got ${got.join(', ')}` : 'got nothing'}`
+					);
+				}
+
 				// Answers the agent offered for the question it just asked. Stored with
 				// the message so they survive a reload, not just this stream.
 				const options = parseOptions(parser.optionsBlock);
 				const writes =
 					parser.drafts.size > 0 ||
-					(['subchapters', 'requirement', 'decision'] as const).some((tag) => parser.blocksOf(tag).length > 0);
+					(['section', 'subchapters', 'requirement', 'decision'] as const).some((tag) => parser.blocksOf(tag).length > 0);
 
 				// A gateway that answers successfully with nothing at all used to end
 				// the turn as though it had worked: no reply, no error, and the
@@ -266,6 +393,28 @@ export const POST: RequestHandler = async ({ request, locals }) => {
 							}
 							if (moved.parentMd !== null) send('chapter', { key, markdown: moved.parentMd });
 						}
+					}
+
+					// --- Parts of long chapters, each put in by its heading, in code. After
+					//     the whole chapters, so a part lands in what this reply wrote.
+					for (const block of parser.blocksOf('section')) {
+						const target = draftTarget((block.attrs.chapter ?? block.attrs.key ?? '').trim(), current, active);
+						// A part with no heading attribute at all is not the text before the
+						// first heading by default: read that way, a forgotten attribute
+						// would replace the chapter's opening with whatever part was meant.
+						const heading = block.attrs.heading ?? /^#{1,6}\s+(.+)$/m.exec(block.body.split('\n')[0] ?? '')?.[1];
+						if (!target || heading === undefined) {
+							console.warn(`[chat] section for "${block.attrs.chapter ?? ''}" headed "${heading ?? '(none)'}" — not saved`);
+							unfiled = true;
+							continue;
+						}
+						const before = getChapter(project.id, target.key)?.content_md ?? '';
+						const merged = mergeSection(before, heading, block.body, block.attrs.action === 'remove');
+						if (merged.outcome === 'unchanged') continue;
+						updateChapterState(project.id, target.key, { contentMd: merged.markdown });
+						reopen(target);
+						if (!touched.includes(target.key)) touched.push(target.key);
+						send('chapter', { key: target.key, markdown: merged.markdown });
 					}
 
 					// --- Requirements the agent settled this turn. After the chapters, so a

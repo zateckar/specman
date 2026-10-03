@@ -25,6 +25,8 @@ export function describeActivity(activity: Activity | null, title: string | null
 			const count = words > 0 ? ` — ${words} word${words === 1 ? '' : 's'} so far` : '';
 			return title ? `Writing “${title}”${count}…` : `Writing the chapter${count}…`;
 		}
+		case 'reading':
+			return title ? `Reading “${title}”…` : 'Reading the document…';
 		case 'noting':
 			return 'Noting what was settled…';
 		case 'replying':

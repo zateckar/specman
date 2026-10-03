@@ -78,8 +78,30 @@ import {
 import { renderMarkdown, safeUrl } from '../src/lib/safe-markdown.ts';
 import { createSink, sseFrame } from '../src/lib/server/llm/sink.ts';
 import { attemptAddress, readForwardedIdentity } from '../src/lib/server/llm/forwarded.ts';
-import { ending, geminiBody, geminiModelPath, geminiRetryable, readGeminiPayload } from '../src/lib/server/llm/gemini-format.ts';
-import { ModelRouting, PRIMARY_REST_MS, mayAskNext } from '../src/lib/server/llm/fallback.ts';
+import { ending, GEMINI_MAX_OUTPUT_TOKENS, geminiBody, geminiModelPath, geminiRetryable, geminiRoom, readGeminiPayload } from '../src/lib/server/llm/gemini-format.ts';
+import { ModelRouting, PRIMARY_REST_MS, failureToReport, mayAskNext, ranOutOfRoom } from '../src/lib/server/llm/fallback.ts';
+import * as budgets from '../src/lib/server/llm/budgets.ts';
+import { describeUsage, toolInput } from '../src/lib/server/llm/transport.ts';
+import { textOf } from '../src/lib/server/llm/types.ts';
+import {
+	ACTIVE_LIMIT,
+	HISTORY_KEEP,
+	HISTORY_STEP,
+	LONG_CHAPTER,
+	READ_TOOL,
+	buildTurnState,
+	chapterParts,
+	documentContext,
+	historyWindowStart,
+	mergeSection,
+	outlineOf,
+	readChapter,
+	relatedness,
+	sameHeading,
+	repairRequest,
+	unwrittenMentions,
+	withLastTurn
+} from '../src/lib/server/llm/context.ts';
 import { DRAFT_EVERY_MS, TurnProgress } from '../src/lib/server/llm/progress.ts';
 import { describeActivity, wordCount } from '../src/lib/activity.ts';
 import { safeReturnPath } from '../src/lib/server/llm/return-path.ts';
@@ -98,6 +120,30 @@ import {
 	isUntouchedDraft,
 	UNCHECKED_CHAPTER
 } from '../src/lib/server/llm/draft.ts';
+import {
+	betterMockup,
+	buildMockupPrompt,
+	buildScreensPrompt,
+	DOCUMENT_PROSE_LIMIT,
+	extractMockup,
+	extractScreens,
+	forTheFrame,
+	loadsFromOutside,
+	MOCKUP_FILE_POLICY,
+	MOCKUP_POLICY,
+	MOCKUP_SANDBOX,
+	mockupDocument,
+	mockupFileName,
+	mockupHeaders,
+	mockupRequest,
+	prepareMockup,
+	PROSE_LIMIT,
+	RULES_PER_CHAPTER,
+	SCREENS_LIMIT,
+	screensRequest,
+	worthAnotherTry
+} from '../src/lib/server/llm/mockup.ts';
+import { longCalls } from '../src/lib/server/llm/parallel.ts';
 
 let pass = 0;
 let fail = 0;
@@ -2379,6 +2425,9 @@ console.log('\n--- asking Gemini ---');
 	check('the assistant speaks as the model', body.contents.map((turn) => turn.role), ['user', 'model', 'user']);
 	check('the whole budget is passed on', body.generationConfig, { maxOutputTokens: 16000 });
 	check('a prose call carries no tools', [body.tools, body.toolConfig], [undefined, undefined]);
+	check('a budget beyond what Gemini will write is brought within it, rather than refused',
+		[geminiBody({ messages: [], maxTokens: 1_000_000 }).generationConfig.maxOutputTokens, geminiRoom(GEMINI_MAX_OUTPUT_TOKENS), geminiRoom(64_000)],
+		[GEMINI_MAX_OUTPUT_TOKENS, GEMINI_MAX_OUTPUT_TOKENS, 64_000]);
 
 	const schema = { type: 'object', properties: { status: { type: 'string', enum: ['done'] } }, required: ['status'] };
 	const forced = geminiBody({
@@ -2452,6 +2501,228 @@ console.log('\n--- which model answers ---');
 	check('a call that failed before passing anything on goes elsewhere', mayAskNext(false, false), true);
 	check('one that already passed text on does not — it would be repeated', mayAskNext(true, false), false);
 	check('nor one the caller gave up on', mayAskNext(false, true), false);
+
+	const primaryNoRoom = new Error('The gateway ran out of room before completing its response.');
+	const geminiNoRoom = new Error('Gemini ran out of room before completing its response.');
+	const refused = new Error('Gemini stream failed with 401');
+	const outage = new Error('Gateway stream failed with 502');
+	check('running out of room is read from either provider\'s words, and nothing else',
+		[ranOutOfRoom(primaryNoRoom), ranOutOfRoom(geminiNoRoom), ranOutOfRoom(refused), ranOutOfRoom(undefined), ranOutOfRoom('ran out of room')],
+		[true, true, false, false, false]);
+
+	const roomy = new ModelRouting(() => now);
+	roomy.failed('primary', primaryNoRoom);
+	check('a primary that ran out of room is not rested — it answered; the request was too big', roomy.order(true, true)[0], 'primary');
+	roomy.failed('primary', outage);
+	check('one that is down is', roomy.order(true, true)[0], 'fallback');
+
+	check('when both fail, the primary running out of room is reported over Gemini refusing its key',
+		failureToReport([primaryNoRoom, refused]), primaryNoRoom);
+	check('Gemini running out of room is reported over a primary asked after it', failureToReport([geminiNoRoom, outage]), geminiNoRoom);
+	check('when both ran out, the first', failureToReport([primaryNoRoom, geminiNoRoom]), primaryNoRoom);
+	check('when neither did, the last, as before', failureToReport([outage, refused]), refused);
+	check('read through whatever each failure is recorded as',
+		failureToReport([{ route: 'primary', cause: primaryNoRoom }, { route: 'fallback', cause: refused }], (f) => f.cause).route, 'primary');
+}
+
+console.log('\n--- how much room each call is given ---');
+
+{
+	const all = Object.entries(budgets);
+	check('no call that reads a chapter or a document has less than 16 000',
+		all.filter(([, room]) => room < 16_000).map(([name]) => name), []);
+	// The most each kind has been seen to use, on the live gateway.
+	const measured = { TURN_BUDGET: 14_261, DRAFT_BUDGET: 14_261, SCREENS_BUDGET: 4_606, MOCKUP_BUDGET: 25_168 };
+	check('each is at least twice the most its kind has been seen to use',
+		Object.entries(measured).filter(([name, used]) => budgets[name] < 2 * used).map(([name]) => name), []);
+	check('asked again, a draft is given more room than the first time', budgets.DRAFT_RETRY_BUDGET > budgets.DRAFT_BUDGET, true);
+	check('and none asks for more than Gemini can write, so the fallback is given the same room',
+		all.filter(([, room]) => room > GEMINI_MAX_OUTPUT_TOKENS).map(([name]) => name), []);
+
+	// As the live gateway reported a repeated prompt on 2026-10-03.
+	check('the log says how much of a prompt came from the cache, counting the cached part in the prompt',
+		describeUsage({ input_tokens: 220, output_tokens: 1832, cache_read_input_tokens: 38400 }),
+		'1832 output tokens; prompt 38620, 38400 of it cached (99%)');
+	check('and a cold one as none of it', describeUsage({ input_tokens: 38620, output_tokens: 2000 }), '2000 output tokens; prompt 38620, 0 of it cached (0%)');
+	check('a backend that reports no prompt says only what it wrote', [describeUsage(undefined, 96), describeUsage({ output_tokens: 5 })], ['96 output tokens', '5 output tokens']);
+}
+
+console.log('\n--- what the interviewer is shown ---');
+
+{
+	const chapter = (key, title, content_md = '', extra = {}) => ({
+		key, title, content_md, status: content_md ? 'in_progress' : 'empty', open_questions: [], applicable: 1,
+		parent_key: '', purpose: '', questions: [], criteria: [], goal: '', is_dynamic: 0, ...extra
+	});
+	const rule = (ref, chapter_key, statement, source = 'user') => ({ ref, chapter_key, statement, scope: 'now', source });
+	const chapters = [
+		chapter('overview', 'Overview', 'Pool cars for the plant.'),
+		chapter('users-and-roles', 'Users and roles', 'Managers see every booking, with its purpose.'),
+		chapter('data', 'Data', 'Bookings keep who, which car and the day.', { open_questions: ['How long are bookings kept?'] }),
+		chapter('integrations', 'Integrations', 'Nothing yet.', { applicable: 0 }),
+		chapter('reporting', 'Reporting')
+	];
+	const rules = [rule('REQ-001', 'users-and-roles', 'A manager sees only their own team.'), rule('REQ-002', 'data', 'A booking names one car.')];
+
+	const { text: rest, shown } = documentContext(chapters, rules, chapters[2]);
+	check('the rest of the document carries the other chapters\' prose, so a contradiction can be seen',
+		rest.includes('Managers see every booking, with its purpose.'), true);
+	check('and their rules', rest.includes('- REQ-001 [now] A manager sees only their own team.'), true);
+	check('but not the chapter under discussion, which comes with the message', [rest.includes('Bookings keep who'), rest.includes('REQ-002')], [false, false]);
+	check('nor a chapter the triage set aside', rest.includes('Integrations'), false);
+	check('in document order, an empty chapter said to be empty',
+		[rest.indexOf('## Overview') < rest.indexOf('## Users and roles'), rest.includes('## Reporting (key: reporting)\n(nothing written yet)')], [true, true]);
+	check('a document that fits is shown whole', [...shown.values()].every((s) => s === 'full'), true);
+	check('nothing at all when there is no other chapter', documentContext([chapters[2]], rules, chapters[2]).text, '');
+	check('the whole-document conversation sees every chapter', documentContext(chapters, rules, null).text.includes('Bookings keep who'), true);
+
+	// A long document: each chapter far longer than the room, and one rule each.
+	const paragraph = (topic, i) => `The ${topic} part ${i} begins here. ${'It goes on with detail nobody needs in an outline. '.repeat(12)}`;
+	const body = (topic) => `## About ${topic}\n\n${Array.from({ length: 12 }, (_, i) => paragraph(topic, i)).join('\n\n')}`;
+	const big = [
+		chapter('overview', 'Overview', body('the plant')),
+		chapter('users-and-roles', 'Users and roles', body('managers and bookings'), { purpose: 'Who uses the application and what each may see.' }),
+		chapter('data', 'Information held', body('bookings and cars'), { purpose: 'What the application keeps about bookings, cars and managers.' }),
+		chapter('printing', 'Printing', body('paper'), { purpose: 'What is printed.' }),
+		chapter('archive', 'Archiving', body('old paper'), { purpose: 'What is archived.' })
+	];
+	const bigRules = big.map((c, i) => rule(`REQ-0${i + 10}`, c.key, `A rule of ${c.title}.`));
+	const roomy = documentContext(big, bigRules, big[2]);
+	check('a long document is shown whole while it fits', [...roomy.shown.values()].every((s) => s === 'full'), true);
+	const tight = documentContext(big, bigRules, big[2], 9000);
+	check('past its room, it fits', tight.text.length <= 9000, true);
+	check('the least related chapters lose detail first, the Overview last',
+		[tight.shown.get('printing') !== 'full', tight.shown.get('archive') !== 'full', tight.shown.get('overview')], [true, true, 'full']);
+	check('every chapter is still named, and every rule still there',
+		[big.filter((c) => c.key !== 'data').every((c) => tight.text.includes(`(key: ${c.key})`)), ['REQ-010', 'REQ-011', 'REQ-013', 'REQ-014'].every((ref) => tight.text.includes(ref))], [true, true]);
+	check('a chapter shown in part says how', /\[(outline|rules only|title only)\]/.test(tight.text), true);
+	const squeezed = documentContext(big, bigRules, big[2], 400);
+	check('and with almost no room, chapters fall to their titles rather than being dropped',
+		[squeezed.shown.get('printing'), squeezed.text.includes('## Printing (key: printing) [title only]')], ['title', true]);
+	check('related by what the chapter under discussion is for, and its family above all',
+		[relatedness(big[2], big[1]) > relatedness(big[2], big[3]), relatedness(big[2], big[0]), relatedness(big[2], chapter('x', 'X', '', { parent_key: 'data' })) > 1000], [true, Infinity, true]);
+
+	check('an outline keeps the headings and the first sentence of each paragraph',
+		outlineOf('## Cars\n\nEach car has a plate. It also has a size.\n\nRetired cars stay listed.\n\n- plate\n- size\n- fuel'),
+		'## Cars\nEach car has a plate. …\nRetired cars stay listed.\n- plate (… 2 more)');
+	check('and leaves out code', outlineOf('Before.\n\n```\n## not a heading\n\nstill code\n```\n\nAfter.'), 'Before.\nAfter.');
+
+	const read = readChapter({ key: 'users-and-roles' }, big, bigRules);
+	check('a chapter read is the whole of it, with its rules', [read.chapter?.key, read.text.includes('part 11 begins'), read.text.includes('REQ-011')], ['users-and-roles', true, true]);
+	check('or one part of it, by heading', readChapter({ key: 'printing', heading: 'about paper' }, big, bigRules).text.startsWith('## Printing (key: printing) — About paper\nThe paper part 0'), true);
+	check('by title as well as by key', readChapter({ key: 'Users and Roles' }, big, bigRules).chapter?.key, 'users-and-roles');
+	check('a key that is not there says which are',
+		[readChapter({ key: 'nope' }, big, bigRules).chapter, readChapter({ key: 'nope' }, big, bigRules).text.includes('overview, users-and-roles')], [null, true]);
+	check('a heading that is not there says which are', readChapter({ key: 'printing', heading: 'Ink' }, big, bigRules).text.includes('Its headings are: About paper'), true);
+	check('the read tool asks for a key and nothing long', [READ_TOOL.name, READ_TOOL.input_schema.required], ['read_chapter', ['key']]);
+
+	const state = buildTurnState({ chapters, active: chapters[2], activeRequirements: [rules[1]], message: '  Managers only see totals.  ' });
+	const at = (text) => state.indexOf(text);
+	check('the turn carries the chapter as it reads now, its rules and what is open',
+		[state.includes('Bookings keep who'), state.includes('REQ-002'), state.includes('How long are bookings kept?'), state.includes('is currently "in_progress"')],
+		[true, true, true, true]);
+	check('the colleague\'s message after the state, and the checklist last of all',
+		[at('WHERE THIS CHAPTER STANDS NOW') < at('Managers only see totals.'), at('Managers only see totals.') < at('CHECK ALL OF THIS')], [true, true]);
+	check('the checklist asks for a contradiction with another chapter to be corrected in the same reply, and said',
+		[state.includes('contradicts another chapter'), state.includes('correct\n   that chapter in the same reply'), state.includes('what it said before')], [true, true, true]);
+	check('the company standards note only when one applies',
+		[state.includes('[company standard]'), buildTurnState({ chapters, active: chapters[2], activeRequirements: [rule('REQ-009', 'data', 'Logs kept a year.', 'standard')], message: 'x' }).includes('do not interview the user about them')],
+		[false, true]);
+	const whole = buildTurnState({ chapters, active: null, activeRequirements: [], message: 'What is missing?' });
+	check('the whole-document conversation gets where things stand, and no chapter checklist',
+		[whole.includes('> [') , whole.includes('CHECK ALL'), whole.endsWith('What is missing?')], [false, false, true]);
+
+	// As the live gateway replied once on 2026-10-03, with no block at all.
+	const claimed = 'I changed "Users and roles", which said managers see every booking, and tightened Reporting.';
+	check('a reply naming chapters it did not write is noticed, by title, ignoring case',
+		unwrittenMentions(claimed.toLowerCase(), chapters, [], 'data').map((c) => c.key), ['users-and-roles', 'reporting']);
+	check('a chapter it did write is not', unwrittenMentions(claimed, chapters, ['users-and-roles'], 'data').map((c) => c.key), ['reporting']);
+	check('nor the chapter under discussion, a set-aside one, or a reply naming none',
+		[unwrittenMentions('Data is fine. Integrations too.', chapters, [], 'data').length, unwrittenMentions('All recorded.', chapters, [], 'data').length], [0, 0]);
+	const repair = repairRequest([chapters[1]]);
+	check('the follow-up names the chapter by key, asks for blocks only, and allows nothing',
+		[repair.includes('(key: users-and-roles)'), repair.includes('nothing else: no reply'), repair.includes('send nothing at all')], [true, true, true]);
+
+	const conversation = [{ role: 'user', content: 'Earlier.' }, { role: 'assistant', content: 'Asked.' }, { role: 'user', content: 'Answer.' }];
+	const sent = withLastTurn(conversation, 'WRAPPED');
+	check('only the last turn of the request is wrapped', sent.map((m) => m.content), ['Earlier.', 'Asked.', 'WRAPPED']);
+	check('and what is stored is left as it was said', conversation[2].content, 'Answer.');
+	check('a conversation ending with the assistant gets the wrapped turn added',
+		withLastTurn([{ role: 'user', content: 'a' }, { role: 'assistant', content: 'b' }], 'W').map((m) => m.role), ['user', 'assistant', 'user']);
+
+	check('the window keeps everything until it passes sixteen', [0, 5, 16].map((n) => historyWindowStart(n)), [0, 0, 0]);
+	check('then starts on a multiple of eight, keeping sixteen to twenty-three',
+		[17, 23, 24, 25, 31, 32, 40].map((n) => historyWindowStart(n)), [0, 0, 8, 8, 8, 16, 24]);
+	const starts = Array.from({ length: 40 }, (_, turn) => historyWindowStart(16 + 2 * turn));
+	check('so its start stays put for four turns at a time, not moving every turn',
+		starts.slice(0, 12), [0, 0, 0, 0, 8, 8, 8, 8, 16, 16, 16, 16]);
+	// A long chapter, edited a part at a time.
+	const longText = `Intro line.\n\n## Cars\n\nEach car has a plate.\n\n### Detail\n\nDeep.\n\n## Bookings\n\nA booking names a car.   \nKept as typed.\n\n## Returns\n\nMileage noted.`;
+	check('a chapter is cut at its shallowest headings, deeper ones staying inside',
+		[chapterParts(longText).sections.map((s) => s.heading), chapterParts(longText).sections[0].body.includes('### Detail'), chapterParts(longText).preamble], [['Cars', 'Bookings', 'Returns'], true, 'Intro line.']);
+	const replaced = mergeSection(longText, 'cars', 'Each car has a plate and a size.');
+	check('a part is replaced by its heading, as a reader would match it',
+		[replaced.outcome, replaced.markdown.includes('## Cars\n\nEach car has a plate and a size.\n\n## Bookings'), replaced.markdown.includes('Deep.')], ['replaced', true, false]);
+	check('and every other part is kept exactly as written, trailing spaces and all',
+		replaced.markdown.includes('A booking names a car.   \nKept as typed.') && replaced.markdown.startsWith('Intro line.\n\n## Cars'), true);
+	check('a new heading is added at the end, at the chapter\'s level',
+		[mergeSection(longText, 'Damage', 'Reported at the desk.').outcome, mergeSection(longText, 'Damage', 'Reported at the desk.').markdown.endsWith('Mileage noted.\n\n## Damage\n\nReported at the desk.')], ['added', true]);
+	check('the text before the first heading is the part with no heading',
+		mergeSection(longText, '', 'New intro.').markdown.startsWith('New intro.\n\n## Cars'), true);
+	check('a part can be removed, and removing one that is not there changes nothing',
+		[mergeSection(longText, 'Bookings', '', true).markdown.includes('Bookings'), mergeSection(longText, 'Ink', '', true).outcome], [false, 'unchanged']);
+	check('an empty part erases nothing', mergeSection(longText, 'Cars', '   ').outcome, 'unchanged');
+	check('a part that repeats its own heading has it taken off', mergeSection(longText, 'Returns', '## Returns\n\nMileage and lateness noted.').markdown.endsWith('## Returns\n\nMileage and lateness noted.'), true);
+	check('numbering, emphasis and end punctuation do not stop a heading matching',
+		[sameHeading('2. **Bookings**:', 'bookings'), sameHeading('Bookings', 'Booking')], [true, false]);
+	check('a chapter with no headings divides at level two when one is added',
+		mergeSection('Just prose.', 'Cars', 'Plates.').markdown, 'Just prose.\n\n## Cars\n\nPlates.');
+	check('a heading inside a code example is not a part', chapterParts('Text.\n\n```\n## Not one\n```\n\n## Real\n\nYes.').sections.map((s) => s.heading), ['Real']);
+
+	const longChapter = chapter('data', 'Data', `Intro.\n\n## Cars\n\n${'Car detail. '.repeat(400)}\n\n## Bookings\n\n${'Booking detail. '.repeat(200)}`);
+	const longState = buildTurnState({ chapters, active: longChapter, activeRequirements: [], message: 'Cars also have a colour.' });
+	check('a long chapter is asked for the parts that change, not rewritten whole',
+		[longChapter.content_md.length > LONG_CHAPTER, longState.includes('do NOT rewrite it whole'), longState.includes('<section chapter="data" heading="Cars">'), longState.includes('- Bookings')],
+		[true, true, true, true]);
+	check('a short one is still rewritten whole', [state.includes('<chapter key="data"> block carrying the whole chapter'), state.includes('<section chapter="data"')], [true, false]);
+	const unheaded = buildTurnState({ chapters, active: chapter('data', 'Data', 'Prose. '.repeat(1200)), activeRequirements: [], message: 'x' });
+	check('a long chapter with no headings is rewritten once, under headings', unheaded.includes('organise it\n   under ## headings'), true);
+	const huge = chapter('data', 'Data', `## Cars\n\n${'First sentence here. And then much more. '.repeat(1200)}`);
+	const hugeState = buildTurnState({ chapters, active: huge, activeRequirements: [], message: 'x' });
+	check('a chapter too long to show is shown as its outline, to be read a part at a time',
+		[huge.content_md.length > ACTIVE_LIMIT, hugeState.length < 8000, hugeState.includes('read_chapter, key "data"')], [true, true, true]);
+
+	check('and never replays fewer than sixteen or more than twenty-three',
+		Array.from({ length: 200 }, (_, n) => n - historyWindowStart(n)).every((kept, n) => kept === n || (kept >= HISTORY_KEEP && kept < HISTORY_KEEP + HISTORY_STEP)), true);
+}
+
+console.log('\n--- reading a chapter, writing a part of one ---');
+
+{
+	const parser = new ChapterStreamParser();
+	const visible = parser.push('<section chapter="data" heading="Cars">Plates and sizes.</section>Recorded.');
+	parser.end();
+	check('a section block is taken out of the chat and kept as a block, not as the whole chapter',
+		[visible.trim(), parser.blocksOf('section')[0]?.attrs, parser.blocksOf('section')[0]?.body, parser.drafts.size],
+		['Recorded.', { chapter: 'data', heading: 'Cars' }, 'Plates and sizes.', 0]);
+
+	const progress = new TurnProgress(() => 0);
+	const writingPart = progress.observe({ index: 0, tag: 'section', attrs: { chapter: 'data' }, body: 'Plates' }, [], false, (a) => a.chapter);
+	check('a part being written is said to be written, but not shown as the chapter',
+		[writingPart.activity, writingPart.drafts.length], [{ doing: 'writing', chapter: 'data' }, 0]);
+	check('reading is said in the same terms', progress.announce('reading', 'security'), { doing: 'reading', chapter: 'security' });
+	check('and once the model writes again, the chat stops saying it reads',
+		progress.observe(null, [], false, () => null).activity, { doing: 'thinking', chapter: null });
+	check('the chat names the chapter being read', [describeActivity({ doing: 'reading', chapter: 'security' }, 'Security'), describeActivity({ doing: 'reading', chapter: null }, null)],
+		['Reading “Security”…', 'Reading the document…']);
+
+	check('a streamed tool call\'s arguments are put together, and nonsense is an empty call',
+		[toolInput('{"key": "security"}'), toolInput(''), toolInput('{"key": "sec'), toolInput('[1]')], [{ key: 'security' }, {}, {}, {}]);
+	check('a turn that read is plain text for a model that cannot take tool calls',
+		textOf([{ type: 'text', text: 'Let me check.' }, { type: 'tool_use', id: 't1', name: 'read_chapter', input: { key: 'security' } }]),
+		'Let me check.\n\n(read_chapter {"key":"security"})');
+	check('and what it read is the text it was given', textOf([{ type: 'tool_result', tool_use_id: 't1', content: '## Security\nKept a year.' }]), '## Security\nKept a year.');
+	check('a plain turn stays as it is', textOf('Hello.'), 'Hello.');
 }
 
 console.log('\n--- showing the writing as it happens ---');
@@ -2610,6 +2881,170 @@ console.log('\n--- drafting a whole document ---');
 		{ tag: 'decision', attrs: { source: 'agent' }, body: 'Choice' });
 	check('options and section plans are not the draft\'s to write',
 		[asDraftBlock({ tag: 'options', attrs: {}, body: 'A' }), asDraftBlock({ tag: 'subchapters', attrs: {}, body: 'a: A' })], [null, null]);
+}
+
+/* --- the mock-up ------------------------------------------------------------- */
+
+{
+	const chapter = (key, content_md, extra = {}) => ({ key, title: key[0].toUpperCase() + key.slice(1), applicable: 1, parent_key: '', content_md, ...extra });
+	const project = { name: 'Pool cars', description: 'Book a pool car for a day.' };
+	const rule = (chapter_key, statement, scope = 'now') => ({ chapter_key, statement, scope });
+
+	check('nothing written is nothing to make a mock-up from',
+		mockupDocument(project, [chapter('overview', '  '), chapter('users', '')], [rule('overview', 'A rule')]), '');
+	check('prose only in a set-aside chapter is still nothing',
+		mockupDocument(project, [chapter('overview', ''), chapter('telemetry', 'Counted.', { applicable: 0 })], []), '');
+
+	const document = mockupDocument(project, [
+		chapter('overview', 'Employees book cars.'),
+		chapter('functionality', 'What it does.'),
+		chapter('booking', 'Pick a car and a day.', { parent_key: 'functionality' }),
+		chapter('telemetry', 'Counted.', { applicable: 0 }),
+		chapter('licenses', '')
+	], [
+		rule('booking', 'Two people never book the same car on the same day.'),
+		rule('booking', 'Cars can be booked a year ahead.', 'later'),
+		rule('booking', 'No electric cars.', 'out'),
+		rule('telemetry', 'Every click is counted.')
+	]);
+	check('the document is given in the order given, sections under their chapter',
+		['# Pool cars', 'Book a pool car', '## Overview', '## Functionality', '### Booking'].map((s) => document.indexOf(s)).every((at, i, all) => at >= 0 && (i === 0 || at > all[i - 1])), true);
+	check('with the rules for the first version', document.includes('- Two people never book the same car on the same day.'), true);
+	check('and none for later or out of scope', [document.includes('a year ahead'), document.includes('electric')], [false, false]);
+	check('a set-aside chapter is left out, and its rules with it', [document.includes('Telemetry'), document.includes('Every click')], [false, false]);
+	check('an empty chapter adds no heading', document.includes('Licenses'), false);
+
+	const long = mockupDocument(project, [chapter('overview', 'word '.repeat(2000))], []);
+	check('long prose is clipped at a word, and says so',
+		[long.length < PROSE_LIMIT + 200, long.trimEnd().endsWith('word […]')], [true, true]);
+	const sprawling = mockupDocument(project,
+		Array.from({ length: 40 }, (_, i) => chapter(`chapter-${i}`, 'word '.repeat(2000))), []);
+	check('a document of many chapters shares the prose out, every chapter still there',
+		[sprawling.length < DOCUMENT_PROSE_LIMIT * 1.2, (sprawling.match(/^## /gm) ?? []).length], [true, 40]);
+	const many = mockupDocument(project, [chapter('overview', 'Text.')],
+		Array.from({ length: RULES_PER_CHAPTER + 5 }, (_, i) => rule('overview', `Rule ${i}.`)));
+	check('at most so many rules a chapter', (many.match(/^- Rule/gm) ?? []).length, RULES_PER_CHAPTER);
+
+	const prompt = buildMockupPrompt();
+	check('the prompt asks for one self-contained page with nothing from outside',
+		[prompt.includes('<!DOCTYPE html>'), /no external script/i.test(prompt), /no build step/i.test(prompt), /no code fence/i.test(prompt)],
+		[true, true, true, true]);
+	check('in the document\'s language, with a switcher for different users',
+		[/language the document is written in/.test(prompt), /viewing as/i.test(prompt)], [true, true]);
+	check('and keeping changes in memory, not in storage the sandbox takes away', /do not use localStorage/i.test(prompt), true);
+	check('and compact from the first attempt, with the reason', /around 20 to 30 KB/.test(prompt) && /does not finish/.test(prompt), true);
+	check('the second attempt asks for something smaller and self-contained',
+		[buildMockupPrompt(true).includes('COULD NOT BE USED'), prompt.includes('COULD NOT BE USED')], [true, false]);
+	check('the request carries the document', mockupRequest('# Pool cars').startsWith('# Pool cars'), true);
+
+	const deciding = buildScreensPrompt();
+	check('the first call decides the screens, as a short list between tags and no page',
+		[deciding.includes('<screens>'), /at most six/.test(deciding), /no\s+HTML/.test(deciding), /language the\s+document is written in/.test(deciding)],
+		[true, true, true, true]);
+	check('and is given the document', screensRequest('# Pool cars').startsWith('# Pool cars'), true);
+	check('the screens are read from between the tags, without the talk around them',
+		extractScreens('Here they are.\n<screens>\n1. Bookings\n2. Cars\n</screens>\nDone.'), '1. Bookings\n2. Cars');
+	check('a list without its tags is still the list', extractScreens('1. Bookings\n2. Cars\n'), '1. Bookings\n2. Cars');
+	check('a list whose closing tag never came runs to the end', extractScreens('<screens>\n1. Bookings'), '1. Bookings');
+	check('a reply with nothing in it decides nothing', [extractScreens('  \n'), extractScreens('<screens>\n</screens>')], [null, null]);
+	check('a long list is clipped', extractScreens('word '.repeat(SCREENS_LIMIT)).length <= SCREENS_LIMIT + 4, true);
+
+	const planned = buildMockupPrompt(false, true);
+	check('given the screens, the page call is told they are decided and to write at once',
+		[/already decided/.test(planned), /Start\s+writing it at once/.test(planned), /already decided/.test(prompt), /at once/.test(prompt)],
+		[true, true, false, false]);
+	check('and is still asked for the document\'s language and a whole page',
+		[/language the document is written in/.test(planned), planned.includes('<!DOCTYPE html>')], [true, true]);
+	const withScreens = mockupRequest('# Pool cars', '1. Bookings');
+	check('the page call is given the screens after the document',
+		[withScreens.startsWith('# Pool cars'), withScreens.indexOf('1. Bookings') > withScreens.indexOf('# Pool cars')], [true, true]);
+	check('and without them is asked as before', mockupRequest('# Pool cars', null), mockupRequest('# Pool cars'));
+
+	const page = '<!DOCTYPE html>\n<html lang="en">\n<head><style>body{margin:0}</style></head>\n<body><main>Hi</main><script>1</script></body>\n</html>';
+	check('a bare page is the page', extractMockup(page), page);
+	check('a code fence and talk around it are dropped',
+		extractMockup(`Here is your mock-up:\n\n\`\`\`html\n${page}\n\`\`\`\n\nEnjoy!`), page);
+	check('a doctype mentioned in a sentence first is not the start',
+		extractMockup(`I will begin with <!DOCTYPE html> and inline CSS.\n\`\`\`html\n${page}\n\`\`\``), page);
+	check('a page with no doctype starts at its opening tag',
+		extractMockup('Sure.\n<html><body>Hi</body></html>\nDone.'), '<html><body>Hi</body></html>');
+	check('a page with no closing tag ends at the fence',
+		extractMockup('```html\n<!doctype html>\n<body>Hi\n```\nThat is all.'), '<!doctype html>\n<body>Hi');
+	check('or after its body, so talk after it is not shown as page text',
+		extractMockup('<!doctype html>\n<body>Hi</body>\nI hope this helps!'), '<!doctype html>\n<body>Hi</body>\n</html>');
+	check('no page in the reply is none', extractMockup('I could not make one.'), null);
+	check('markup with no body is not a page', extractMockup('<!DOCTYPE html><html><head></head></html>'), null);
+	check('Windows line endings are read the same', extractMockup(page.replace(/\n/g, '\r\n')), page);
+
+	const outside = '<!DOCTYPE html><html><head>' +
+		'<script src="https://cdn.tailwindcss.com"></script>' +
+		'<link rel="stylesheet" href="//fonts.example.com/inter.css">' +
+		'<link rel="preconnect" href="https://fonts.example.com">' +
+		'<link rel="icon" href="https://example.com/favicon.ico">' +
+		'<style>@import url("https://example.com/base.css");</style>' +
+		'<script src="data:text/javascript,1"></script>' +
+		'<script src=app.js></script>' +
+		'</head><body><img src="https://example.com/car.png"></body></html>';
+	check('scripts and stylesheets from outside the file are found, wherever they come from',
+		loadsFromOutside(outside), ['https://cdn.tailwindcss.com', 'app.js', 'https://example.com/base.css']);
+	check('a typeface from outside is not counted: the page falls back to the system\'s',
+		loadsFromOutside('<link href="https://fonts.googleapis.com/css2?family=Inter" rel="stylesheet">'), []);
+	check('a page that carries everything loads nothing from outside', loadsFromOutside(page), []);
+	check('the retry is spent on no page, or a page that loads from outside',
+		[worthAnotherTry(null), worthAnotherTry(outside), worthAnotherTry(page)], [true, true, false]);
+	const smaller = '<!DOCTYPE html><html><body>Smaller</body></html>';
+	const alsoOutside = '<!DOCTYPE html><html><head><script src="https://cdn.example.com/x.js"></script></head><body>Second</body></html>';
+	check('of two attempts, the second when the first had no page or it loads less from outside',
+		[betterMockup(null, smaller), betterMockup(outside, smaller), betterMockup(outside, null)], [smaller, smaller, outside]);
+	check('and the fuller first one when the second is no better',
+		[betterMockup(outside, outside.replace('Hi', 'Again')), betterMockup(alsoOutside, outside)], [outside, alsoOutside]);
+
+	const kept = prepareMockup(page, { name: 'Pool --> cars <script>', madeOn: '2026-10-03' });
+	check('the doctype stays first, the note right after it', kept.startsWith('<!DOCTYPE html>\n<!--'), true);
+	check('the note says what the file is, and when', [kept.includes('A mock-up of "Pool - cars script"'), kept.includes('2026-10-03'), /design document, not\s+this page, is what to build from/.test(kept)], [true, true, true]);
+	check('nothing in the name ends the note early', (kept.match(/-->/g) ?? []).length, 1);
+	const head = kept.slice(kept.indexOf('<head>'), kept.indexOf('</head>'));
+	check('the head starts with the encoding, the file\'s policy, a viewport and the stand-ins',
+		[head.indexOf('<meta charset="utf-8">') > 0, head.includes(`content="${MOCKUP_FILE_POLICY}"`), head.includes('name="viewport"'), head.includes('window.alert = ')], [true, true, true, true]);
+	check('ahead of anything of the page\'s own', head.indexOf('window.alert') < head.indexOf('<style>body{margin:0}'), true);
+	check('the page itself follows unchanged', kept.endsWith('<style>body{margin:0}</style></head>\n<body><main>Hi</main><script>1</script></body>\n</html>'), true);
+	check('a page with its own viewport keeps it, and gets no second',
+		(prepareMockup('<!DOCTYPE html><html><head><meta name="viewport" content="width=device-width"></head><body></body></html>', { name: 'A', madeOn: 'x' })
+			.match(/name="viewport"/g) ?? []).length, 1);
+	const bare = prepareMockup('<body>Hi</body>', { name: 'A', madeOn: 'x' });
+	check('a page with no doctype or head is given both, never quirks mode',
+		[bare.startsWith('<!DOCTYPE html>\n<!--'), /<head>\n<meta charset="utf-8">/.test(bare), bare.endsWith('<body>Hi</body>')], [true, true, true]);
+	const noHead = prepareMockup('<!doctype html><html lang="cs"><body>Ahoj</body></html>', { name: 'A', madeOn: 'x' });
+	check('a page with no head gets one inside its html element', /<html lang="cs">\n<head>\n<meta charset/.test(noHead), true);
+	check('a header element is not mistaken for the head',
+		prepareMockup('<!doctype html><html><body><header>Top</header></body></html>', { name: 'A', madeOn: 'x' }).indexOf('<header>Top</header>') >
+		prepareMockup('<!doctype html><html><body><header>Top</header></body></html>', { name: 'A', madeOn: 'x' }).indexOf('<meta charset'), true);
+
+	check('the sandbox never gives the page Specman\'s origin, the top window, popups, dialogs or downloads',
+		['allow-same-origin', 'allow-top-navigation', 'allow-popups', 'allow-modals', 'allow-downloads'].some((flag) => MOCKUP_SANDBOX.includes(flag)), false);
+	check('the file carries the same limits, without what has no effect inside a page',
+		[MOCKUP_POLICY.includes(MOCKUP_FILE_POLICY), /sandbox|frame-ancestors/.test(MOCKUP_FILE_POLICY), MOCKUP_FILE_POLICY.includes(`connect-src 'none'`)], [true, false, true]);
+	check('it is answered to its frame, and to a browser that does not say, but not as a page of its own',
+		[forTheFrame('iframe'), forTheFrame(null), forTheFrame('document'), forTheFrame('embed')], [true, true, false, false]);
+	const gates = Array.from({ length: 4 }, () => {
+		let open;
+		const shut = new Promise((resolve) => (open = resolve));
+		return { open, shut };
+	});
+	const held = gates.map((gate) => longCalls.run(() => gate.shut));
+	check('mock-ups and drafted chapters share three places across the installation', [longCalls.busy, longCalls.waiting], [3, 1]);
+	gates.forEach((gate) => gate.open());
+	await Promise.all(held);
+	const directives = new Map(MOCKUP_POLICY.split(';').map((d) => d.trim().split(/\s+/)).map(([name, ...values]) => [name, values.join(' ')]));
+	check('the policy sandboxes it, as the frame does', directives.get('sandbox'), MOCKUP_SANDBOX);
+	check('and allows nothing but itself: no fetch, no form, no other source',
+		[directives.get('default-src'), directives.get('connect-src'), directives.get('form-action'), directives.get('base-uri'), directives.get('script-src')],
+		["'none'", "'none'", "'none'", "'none'", "'unsafe-inline'"]);
+	check('and only Specman may frame it', [directives.get('frame-ancestors'), mockupHeaders()['x-frame-options']], ["'self'", 'SAMEORIGIN']);
+	check('every response carrying it sends the policy, and is never cached',
+		[mockupHeaders()['content-security-policy'], mockupHeaders()['cache-control'], mockupHeaders()['x-content-type-options']], [MOCKUP_POLICY, 'no-store', 'nosniff']);
+	check('the file is named for the application', [mockupFileName('pool-cars'), mockupFileName('"; x'), mockupFileName('')],
+		['pool-cars-mock-up.html', 'x-mock-up.html', 'application-mock-up.html']);
 }
 
 console.log(`\n${pass} passed, ${fail} failed`);

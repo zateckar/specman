@@ -38,9 +38,11 @@ with its prose, its rules and its decisions, without asking the user anything.
   application is
 
 #### Scenario: Several drafts at once
-- **WHEN** more than one application is being drafted
-- **THEN** no more than three drafting calls run at a time across the whole installation,
-  because the gateway is shared and a draft must not starve everyone's conversations
+- **WHEN** more than one application is being drafted, or a mock-up is being made beside a
+  draft
+- **THEN** no more than three of these long calls run at a time across the whole
+  installation, drafted chapters and mock-ups together, because the gateway is shared and a
+  draft must not starve everyone's conversations
 
 #### Scenario: A chapter the triage set aside
 - **WHEN** the triage answers set a chapter aside
@@ -177,8 +179,8 @@ the chapters being written, and count those done.
 
 ### Requirement: Nothing that reads the document as finished runs beside a draft
 While a draft is being written, the server SHALL refuse a whole-document check, drawing the
-diagram and approving the proposal, each before doing any work, with a sentence saying to try
-once the draft has finished.
+diagram, making a mock-up and approving the proposal, each before doing any work, with a
+sentence saying to try once the draft has finished.
 
 #### Scenario: Checking the whole document mid-draft
 - **WHEN** a check is asked for while chapters are still being written
@@ -190,10 +192,15 @@ once the draft has finished.
 - **THEN** it is refused, because the picture of half a document would be kept as the
   application's diagram
 
+#### Scenario: Making a mock-up mid-draft
+- **WHEN** a mock-up is asked for while chapters are still being written
+- **THEN** it is refused, because a mock-up of half a document would be kept as the
+  application's, and would say it was made from a document that has since changed
+
 #### Scenario: Approving mid-draft
 - **WHEN** the proposal is approved while chapters are still being written
 - **THEN** it is refused, because it would approve half a document; the workspace hides the way
-  to the review and the diagram until the draft finishes
+  to the review, the diagram and the mock-up until the draft finishes
 
 ### Requirement: An untouched draft is marked
 An application drafted by the assistant into which no person has put anything SHALL be
@@ -221,8 +228,8 @@ the document rather than stored.
   proposals and the approval journal
 
 #### Scenario: Looking is not touching
-- **WHEN** someone opens it, checks the whole document, draws the diagram, reads the handoff,
-  or clicks an open question
+- **WHEN** someone opens it, checks the whole document, draws the diagram, makes a mock-up,
+  reads the handoff, or clicks an open question
 - **THEN** the mark stays, because none of these puts a person's choice into the document
 
 #### Scenario: Anything else writes the document

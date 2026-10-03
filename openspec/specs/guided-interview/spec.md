@@ -8,9 +8,21 @@ records what was settled. Everything structured the assistant produces rides the
 rather than a tool argument, because truncation inside a tool call is a hard 400 with no
 usable content.
 
+The assistant sees the rest of the document on every turn, so an answer can be checked against
+what other chapters say; with only their titles it could not, and a contradiction went
+unnoticed. A long document is shown in as much detail as fits, the chapters that bear least on
+this one in outline, and any chapter can be read in full during the reply; a long chapter is
+written back a part at a time, so what nobody discussed is not rewritten. What stays the same
+while a chapter is discussed comes first in the prompt and what changes comes last, with the
+colleague's message, because the gateway's cache serves a prompt only as far as it starts the
+same as before. The designs and measurements are in
+`openspec/changes/archive/2026-10-03-let-the-interviewer-read-the-whole-document/` and
+`openspec/changes/archive/2026-10-03-keep-long-chapters-and-documents-within-reach/`.
+
 ## Source
 
 - `src/lib/server/llm/agent.ts`
+- `src/lib/server/llm/context.ts`
 - `src/lib/server/llm/blocks.ts`
 - `src/lib/server/llm/sink.ts`
 - `src/lib/server/llm/presence.ts`
@@ -478,3 +490,158 @@ conversation pane, and offer to go through it.
 - **WHEN** someone has confirmed any of a drafted chapter's assumptions
 - **THEN** the pane no longer says nothing in it has been checked, because that is no longer
   true
+
+### Requirement: The interviewer reads the whole document
+A conversation turn SHALL show the model every other chapter that applies, with its rules, in
+as much detail as its room allows, and SHALL let the model read any chapter in full during its
+reply, so that what the colleague says can be checked against what the document already says
+however long the document grows.
+
+#### Scenario: An answer contradicts another chapter
+- **WHEN** the colleague says something in one chapter that another chapter says differently
+- **THEN** the assistant corrects the other chapter in the same reply and says which chapter
+  it changed and what it said before, because with only the other chapters' titles it wrote
+  the new answer down and left the contradiction for nobody to find (seen on 2026-10-03:
+  missed on the old prompt, corrected in seven of eight replies on the new one); and it does
+  not merely offer to, because an offer depends on a later turn that may never come
+
+#### Scenario: It cannot tell which is meant
+- **WHEN** it is unclear whether the colleague means to change the other chapter
+- **THEN** the assistant asks instead of changing it
+
+#### Scenario: A document that fits
+- **WHEN** the rest of the document fits in 48 000 characters, about 12 000 tokens
+- **THEN** every chapter is shown whole and no reading is offered, because a read would be a
+  round trip that learns nothing
+
+#### Scenario: A long document
+- **WHEN** it does not fit
+- **THEN** the chapters that bear least on the one under discussion are shown in less detail
+  first — as an outline of their headings and the first sentence of each paragraph, then as
+  their rules alone, then as their title — and the Overview and the chapter's own parent,
+  sub-chapters and siblings keep their detail until the rest is down to rules; every chapter
+  stays named and every rule stays until the last step, rather than the end of each long
+  chapter being cut off unseen, as an equal share did
+
+#### Scenario: Which chapters bear on this one
+- **WHEN** relatedness is decided
+- **THEN** it is read from what the chapter under discussion is for — its title, goal, purpose
+  and questions — and not from what it says now, so the choice does not move from turn to turn
+  and the system prompt stays one the gateway's cache can serve
+
+#### Scenario: A chapter shown only in part matters
+- **WHEN** the model needs what an outline leaves out
+- **THEN** it calls `read_chapter` with the chapter's key, or a key and one heading, and is
+  given the chapter as it stands; the chat says which chapter is being read. Live on
+  2026-10-03, with a document of 190 000 characters, the model read Users and roles, found a
+  contradiction buried mid-paragraph, and corrected that part
+
+#### Scenario: Reading does not go on for ever
+- **WHEN** a reply keeps reading
+- **THEN** it may read in three rounds, the third saying it was the last, and a call after it
+  ends the reply with what it has written
+
+#### Scenario: A set-aside chapter
+- **WHEN** the triage set a chapter aside
+- **THEN** it is not shown, because it is not part of what will be built
+
+### Requirement: What changes each turn comes last
+The system prompt SHALL hold only what stays the same from turn to turn within a chapter, and
+the chapter's current state and the closing checklist SHALL travel with the colleague's
+message in the last turn of the request.
+
+#### Scenario: The next answer in the same chapter
+- **WHEN** the colleague answers again and no other chapter has changed
+- **THEN** the system prompt is the same, character for character, as on the turn before,
+  because the gateway's cache serves a prompt only as far as it starts the same as an earlier
+  one, and with the rest of the document in it a prompt that changed near its start was read
+  afresh every turn
+
+#### Scenario: What is stored
+- **WHEN** the turn is saved
+- **THEN** the transcript keeps the colleague's own words, not the state wrapped around them,
+  so earlier turns are replayed as they were said and the state is never repeated
+
+#### Scenario: The checklist
+- **WHEN** the request is built
+- **THEN** the checklist comes after the colleague's message, the last thing the model reads,
+  because it is the rule the model is most likely to drop
+
+### Requirement: A change a reply claims is a change it made
+When a reply names another chapter by title without writing it, the server SHALL ask the
+model once more, for that chapter's block and nothing else, and SHALL save what comes back as
+though the reply had carried it.
+
+#### Scenario: The reply says it corrected a chapter and wrote nothing
+- **WHEN** a reply says "I changed Users and roles" and carries no block for it
+- **THEN** the server asks for the chapter by key and saves it, because seen on the live
+  gateway on 2026-10-03 a reply said it had changed three chapters, wrote none of them, and
+  the colleague was told their document said something it did not
+
+#### Scenario: The reply only mentioned the chapter
+- **WHEN** the follow-up sends nothing back
+- **THEN** nothing changes, because naming a chapter is not always claiming to have changed it
+
+#### Scenario: What the follow-up may write
+- **WHEN** it sends a block for a chapter it was not asked about
+- **THEN** that block is ignored, so the follow-up cannot reach past what the reply named
+
+#### Scenario: The follow-up fails
+- **WHEN** the extra call fails
+- **THEN** the turn goes on and is saved as it was, and the failure goes to the log
+
+### Requirement: The conversation window moves in steps
+A conversation turn SHALL replay at least the last sixteen messages of its chapter, starting
+at a multiple of eight.
+
+#### Scenario: A long conversation
+- **WHEN** a chapter's conversation grows past sixteen messages
+- **THEN** the start of the replayed window stays where it is for four turns at a time, rather
+  than moving with every turn and changing the start of everything after the system prompt
+
+### Requirement: A long chapter is written a part at a time
+When the chapter under discussion is longer than 3 000 characters and has headings, the
+assistant SHALL be asked to write only the parts that change, as section blocks, and the
+server SHALL put each into the chapter by its heading, leaving every other part exactly as it
+was.
+
+#### Scenario: An answer changes one part
+- **WHEN** the reply carries `<section chapter="data" heading="Cars">` with new text
+- **THEN** that part is replaced, and every other line of the chapter is kept as written, so
+  the change a reviewer sees is the change that was made; live on 2026-10-03 such turns
+  changed a few lines each, where a whole rewrite of the same chapter cut it from 5 500
+  characters to 1 400
+
+#### Scenario: A part that is not there yet
+- **WHEN** the heading matches none of the chapter's parts
+- **THEN** it is added at the end, at the chapter's heading level
+
+#### Scenario: How headings match
+- **WHEN** the heading differs from the chapter's only in case, emphasis, numbering or a final
+  colon
+- **THEN** it is the same part
+
+#### Scenario: A part with no heading named
+- **WHEN** a section block has no heading attribute and its text does not begin with one
+- **THEN** nothing is saved and the colleague is told part of the answer was not filed,
+  because taken as the text before the first heading it would replace the chapter's opening
+
+#### Scenario: An empty part
+- **WHEN** a section block is empty
+- **THEN** nothing changes, as with an empty chapter block; a part is removed only when the
+  block says `action="remove"`
+
+#### Scenario: A long chapter with no headings
+- **WHEN** the chapter is long and has no headings
+- **THEN** it is rewritten whole once, organised under headings, so later answers can change
+  one part at a time
+
+#### Scenario: A chapter too long to show
+- **WHEN** the chapter under discussion is longer than 40 000 characters
+- **THEN** it is shown as its outline and its parts, and the model reads the part it changes
+  before writing it
+
+#### Scenario: A short chapter
+- **WHEN** the chapter is shorter than that
+- **THEN** it is rewritten whole as before, because a short rewrite is quick and its changes
+  are easy to see in review

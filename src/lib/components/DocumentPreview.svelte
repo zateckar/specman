@@ -67,7 +67,7 @@
 		/** Chapters the assistant's draft is writing now. Nothing of them is shown until saved. */
 		draftingKeys?: string[];
 		/**
-		 * A draft is running. The review and the diagram wait for it: either would
+		 * A draft is running. The review, the diagram and the mock-up wait for it: any would
 		 * take half a document for the whole.
 		 */
 		drafting?: boolean;
@@ -171,7 +171,10 @@
 	{#if decisionError}<p class="decision-error" role="alert">{decisionError}</p>{/if}
 	<header>
 		<h2>{projectName}</h2>
-		{#if !drafting}<a class="handoff" href="/projects/{projectId}/diagram">Diagram</a>{/if}
+		{#if !drafting}
+			<a class="handoff" href="/projects/{projectId}/diagram">Diagram</a>
+			<a class="handoff" href="/projects/{projectId}/mockup">Mock-up</a>
+		{/if}
 		<a class="handoff" href="/projects/{projectId}/export">For a developer</a>
 		{#if drafting}
 			<span class="clean">Review once the draft is finished</span>

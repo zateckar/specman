@@ -1,5 +1,6 @@
 import { gateway } from './gateway';
 import { ChapterStreamParser } from './blocks';
+import { CHECK_BUDGET } from './budgets';
 import { mapWithLimit } from './parallel';
 import { mergeIssues, toIssue, type Issue } from './issues';
 import { unconfirmed } from './decisions';
@@ -46,9 +47,8 @@ async function collectFindings(system: string, prompt: string): Promise<Issue[]>
 		system,
 		messages: [{ role: 'user', content: prompt }],
 		// Reasoning and output consume the same budget, and a chapter check reads the
-		// whole chapter and its conversation before it writes a word. 3000 is the size
-		// that returned nothing for the diagram; this is the size that worked there.
-		maxTokens: 12000
+		// whole chapter and its conversation before it writes a word. See `budgets.ts`.
+		maxTokens: CHECK_BUDGET
 	})) {
 		if (event.type === 'text') text += event.text;
 	}

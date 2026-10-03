@@ -1,7 +1,8 @@
 import { config } from '../env';
-import { mayAskNext, ModelRouting, type Route } from './fallback';
+import { DEFAULT_BUDGET } from './budgets';
+import { failureToReport, mayAskNext, ModelRouting, type Route } from './fallback';
 import { GeminiProvider } from './gemini';
-import { GatewayError, MAX_ATTEMPTS, Stalled, backoffMs, sleep, withinIdleLimit } from './transport';
+import { GatewayError, MAX_ATTEMPTS, Stalled, backoffMs, describeUsage, sleep, toolInput, withinIdleLimit, type Usage } from './transport';
 import type {
 	LlmProvider,
 	StreamEvent,
@@ -95,7 +96,7 @@ interface AnthropicResponse {
 	model?: string;
 	content?: AnthropicContentBlock[];
 	stop_reason?: string;
-	usage?: { output_tokens?: number };
+	usage?: Usage;
 }
 
 async function postJson(body: unknown, signal?: AbortSignal): Promise<Response> {
@@ -134,9 +135,10 @@ export class GatewayProvider implements LlmProvider {
 	async *streamChat(req: StreamRequest): AsyncIterable<StreamEvent> {
 		const body = {
 			model: req.model ?? config.proseModel,
-			max_tokens: req.maxTokens ?? 4000,
+			max_tokens: req.maxTokens ?? DEFAULT_BUDGET,
 			stream: true,
 			...(req.system ? { system: req.system } : {}),
+			...(req.tools?.length ? { tools: req.tools } : {}),
 			messages: req.messages
 		};
 
@@ -148,7 +150,7 @@ export class GatewayProvider implements LlmProvider {
 			let wrote = false;
 			try {
 				for await (const event of this.streamOnce(body, req.signal, attempt)) {
-					if (event.type === 'text') wrote = true;
+					if (event.type === 'text' || event.type === 'tool_call') wrote = true;
 					yield event;
 				}
 				return;
@@ -216,8 +218,11 @@ export class GatewayProvider implements LlmProvider {
 
 		let servedBy = body.model;
 		let outputTokens = 0;
+		let usage: Usage | undefined;
 		let completed = false;
 		let wrote = false;
+		/** Tool calls being streamed, by block index; their arguments arrive in pieces. */
+		const calls = new Map<number, { id: string; name: string; json: string }>();
 
 		const reader = response.body.getReader();
 		const decoder = new TextDecoder();
@@ -261,6 +266,9 @@ export class GatewayProvider implements LlmProvider {
 							completed = true;
 						} else if (event.type === 'message_start' && event.message?.model) {
 							servedBy = event.message.model;
+						} else if (event.type === 'content_block_start' && event.content_block?.type === 'tool_use') {
+							const block = event.content_block;
+							calls.set(Number(event.index), { id: String(block.id ?? ''), name: String(block.name ?? ''), json: '' });
 						} else if (event.type === 'content_block_delta') {
 							const delta = event.delta ?? {};
 							if (delta.type === 'text_delta' && delta.text) {
@@ -269,12 +277,22 @@ export class GatewayProvider implements LlmProvider {
 							} else if (delta.type === 'thinking_delta' && delta.thinking) {
 								// Reasoning-model output — never surfaced to the user.
 								yield { type: 'thinking', text: delta.thinking };
+							} else if (delta.type === 'input_json_delta') {
+								const call = calls.get(Number(event.index));
+								if (call) call.json += String(delta.partial_json ?? '');
 							}
+						} else if (event.type === 'content_block_stop' && calls.has(Number(event.index))) {
+							const call = calls.get(Number(event.index))!;
+							calls.delete(Number(event.index));
+							wrote = true;
+							yield { type: 'tool_call', id: call.id, name: call.name, input: toolInput(call.json) };
 						} else if (event.type === 'message_delta') {
 							if (event.delta?.stop_reason === 'max_tokens') {
 								throw new GatewayError('The gateway ran out of room before completing its response.', 200, payload, false);
 							}
 							outputTokens = event.usage?.output_tokens ?? outputTokens;
+							// The final count, cache included; `message_start` reports zeros.
+							if (event.usage) usage = event.usage;
 						}
 					}
 				}
@@ -293,7 +311,7 @@ export class GatewayProvider implements LlmProvider {
 		if (!wrote && outputTokens > 0 && outputTokens >= body.max_tokens) {
 			throw new GatewayError('The gateway ran out of room before completing its response.', 200, '', false);
 		}
-		console.info(`[llm] stream served by ${servedBy} (${outputTokens} output tokens)`);
+		console.info(`[llm] stream served by ${servedBy} (${describeUsage(usage, outputTokens)})`);
 		yield { type: 'done', servedBy, outputTokens };
 	}
 
@@ -388,7 +406,7 @@ export class GatewayProvider implements LlmProvider {
 				continue;
 			}
 
-			console.info(`[llm] tool call served by ${servedBy} on attempt ${attempt}`);
+			console.info(`[llm] tool call served by ${servedBy} on attempt ${attempt} (${describeUsage(json.usage)})`);
 			return { calls, text, servedBy, attempts: attempt };
 		}
 
@@ -437,19 +455,23 @@ export class ModelProvider implements LlmProvider {
 
 	async *streamChat(req: StreamRequest): AsyncIterable<StreamEvent> {
 		const order = this.order();
+		const failures: Failure[] = [];
 		for (const [index, route] of order.entries()) {
 			let passedOn = false;
 			try {
 				for await (const event of this.provider(route).streamChat(req)) {
-					if (event.type === 'text') passedOn = true;
+					if (event.type === 'text' || event.type === 'tool_call') passedOn = true;
 					yield event;
 				}
 				this.routing.succeeded(route);
 				return;
 			} catch (cause) {
-				if (!req.signal?.aborted) this.routing.failed(route);
+				this.failedOn(route, cause, failures, req.signal);
 				const next = order[index + 1];
-				if (!next || !mayAskNext(passedOn, Boolean(req.signal?.aborted))) throw cause;
+				if (!next || !mayAskNext(passedOn, Boolean(req.signal?.aborted))) {
+					// Part-way through an answer, or given up on, this failure is the one.
+					throw passedOn || req.signal?.aborted ? cause : reported(failures);
+				}
 				console.warn(`[llm] ${label(route)} failed (${describe(cause)}); asking ${label(next)} instead`);
 			}
 		}
@@ -457,20 +479,47 @@ export class ModelProvider implements LlmProvider {
 
 	async callWithTools(req: ToolRequest): Promise<ToolResponse> {
 		const order = this.order();
+		const failures: Failure[] = [];
 		for (const [index, route] of order.entries()) {
 			try {
 				const result = await this.provider(route).callWithTools(req);
 				this.routing.succeeded(route);
 				return result;
 			} catch (cause) {
-				if (!req.signal?.aborted) this.routing.failed(route);
+				this.failedOn(route, cause, failures, req.signal);
 				const next = order[index + 1];
-				if (!next || !mayAskNext(false, Boolean(req.signal?.aborted))) throw cause;
+				if (!next || !mayAskNext(false, Boolean(req.signal?.aborted))) {
+					throw req.signal?.aborted ? cause : reported(failures);
+				}
 				console.warn(`[llm] ${label(route)} failed (${describe(cause)}); asking ${label(next)} instead`);
 			}
 		}
 		throw new NoModelConfigured();
 	}
+
+	private failedOn(route: Route, cause: unknown, failures: Failure[], signal?: AbortSignal): void {
+		failures.push({ route, cause });
+		if (!signal?.aborted) this.routing.failed(route, cause);
+	}
+}
+
+interface Failure {
+	route: Route;
+	cause: unknown;
+}
+
+/**
+ * The failure to throw when every provider failed. Each but the last was logged
+ * as the next was asked; the last is logged here when it is not the one thrown,
+ * because an unusable Gemini key must still reach whoever reads the log.
+ */
+function reported(failures: Failure[]): unknown {
+	const chosen = failureToReport(failures, (failure) => failure.cause);
+	const last = failures[failures.length - 1];
+	if (last !== chosen) {
+		console.warn(`[llm] ${label(last.route)} failed too (${describe(last.cause)}); reporting that ${label(chosen.route)} ran out of room`);
+	}
+	return chosen.cause;
 }
 
 export const gateway = new ModelProvider(

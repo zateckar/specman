@@ -13,7 +13,7 @@
  * Deliberately free of imports so `npm test` can load it directly.
  */
 
-export type Doing = 'thinking' | 'writing' | 'noting' | 'replying';
+export type Doing = 'thinking' | 'reading' | 'writing' | 'noting' | 'replying';
 
 /** The block being written, as `ChapterStreamParser.writing` reports it. */
 export interface OpenBlock {
@@ -47,6 +47,17 @@ export class TurnProgress {
 	}
 
 	/**
+	 * Something the turn does between the model's words, such as reading a
+	 * chapter, in the same terms — so the next chunk is compared with it and the
+	 * chat does not go on saying "reading" once the model is writing again.
+	 */
+	announce(doing: Doing, chapter: string | null): { doing: Doing; chapter: string | null } {
+		this.doing = doing;
+		this.chapter = chapter;
+		return { doing, chapter };
+	}
+
+	/**
 	 * Called after every chunk with the block now open, every block closed so
 	 * far, and whether any of the reply itself was passed on in this chunk.
 	 *
@@ -71,7 +82,9 @@ export class TurnProgress {
 
 		let doing: Doing;
 		let chapter: string | null = null;
-		if (open?.tag === 'chapter') {
+		if (open?.tag === 'chapter' || open?.tag === 'section') {
+			// A section is shown as writing, but not passed on as the chapter: it is
+			// one part of it, and the document would show that part as the whole.
 			doing = 'writing';
 			chapter = chapterKey(open.attrs);
 		} else if (open?.tag === 'requirement' || open?.tag === 'decision') {

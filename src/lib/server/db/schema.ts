@@ -160,6 +160,16 @@ CREATE TABLE IF NOT EXISTS architectures (
   created_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
+-- The latest mock-up of each application: one page the assistant made from the
+-- document. Not part of the document, so not in its repository; replaced by each
+-- one that succeeds. The revision it was made from says whether it is out of date.
+CREATE TABLE IF NOT EXISTS mockups (
+  project_id        INTEGER PRIMARY KEY REFERENCES projects(id) ON DELETE CASCADE,
+  html              TEXT NOT NULL,
+  document_revision INTEGER NOT NULL,
+  created_at        TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
 -- The result of a whole-document check. One row per run; the latest is shown.
 -- Kept rather than recomputed because the check costs several gateway calls.
 CREATE TABLE IF NOT EXISTS verifications (

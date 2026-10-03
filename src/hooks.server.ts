@@ -85,9 +85,11 @@ export const handle: Handle = async ({ event, resolve }) => {
 
 	const response = await resolve(event);
 	// Nothing here is meant to be shown inside another site's page, where a
-	// click on "That's right" could be someone else's click.
+	// click on "That's right" could be someone else's click. The one exception is
+	// the mock-up, which Specman's own page shows: a response may keep framing by
+	// this site, and nothing wider.
 	try {
-		response.headers.set('x-frame-options', 'DENY');
+		if (response.headers.get('x-frame-options') !== 'SAMEORIGIN') response.headers.set('x-frame-options', 'DENY');
 		if (!response.headers.has('content-security-policy')) {
 			response.headers.set('content-security-policy', "frame-ancestors 'none'");
 		}

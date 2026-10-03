@@ -356,6 +356,12 @@ origin, and SHALL tell browsers not to show its pages inside another site's.
 - **THEN** it says it may not be framed, so a click on "That's right" cannot be someone else's
   click on an invisible copy
 
+#### Scenario: The mock-up's own frame
+- **WHEN** a mock-up is served to be shown inside its page
+- **THEN** it says only Specman may frame it, and every other response still says nobody may.
+  The rule is kept by leaving alone a response that has already said this site may frame it,
+  and replacing anything else, not by a list of addresses
+
 ### Requirement: Errors are explained in words
 A page that cannot be shown SHALL say why in plain words and offer the way back, and SHALL
 NOT show a status code or the developer's message.

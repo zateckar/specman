@@ -69,6 +69,42 @@ export function backoffMs(attempt: number): number {
 
 export const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
+/** Token counts as the Anthropic-shaped API reports them. */
+export interface Usage {
+	input_tokens?: number;
+	output_tokens?: number;
+	cache_read_input_tokens?: number;
+	cache_creation_input_tokens?: number;
+}
+
+/**
+ * What a call cost, for the log: its output, and how much of its prompt the
+ * gateway's prefix cache supplied. `input_tokens` counts only what was not
+ * cached, so the prompt is the three added together. The cache serves a prompt
+ * only as far as it starts the same as an earlier one, which is decided by how
+ * the prompt is laid out; without this line nobody can see whether it does.
+ */
+export function describeUsage(usage: Usage | undefined, outputTokens = usage?.output_tokens ?? 0): string {
+	const cached = usage?.cache_read_input_tokens ?? 0;
+	const prompt = (usage?.input_tokens ?? 0) + cached + (usage?.cache_creation_input_tokens ?? 0);
+	if (prompt === 0) return `${outputTokens} output tokens`;
+	return `${outputTokens} output tokens; prompt ${prompt}, ${cached} of it cached (${Math.round((100 * cached) / prompt)}%)`;
+}
+
+/**
+ * A streamed tool call's arguments, put together. Arguments that do not parse
+ * are an empty object rather than a failed turn: the tool then answers that it
+ * was not told what to do, and the model can ask again.
+ */
+export function toolInput(json: string): Record<string, unknown> {
+	try {
+		const value = JSON.parse(json.trim() || '{}');
+		return value && typeof value === 'object' && !Array.isArray(value) ? value : {};
+	} catch {
+		return {};
+	}
+}
+
 /**
  * The `data:` payloads of a server-sent event stream, in order.
  *
