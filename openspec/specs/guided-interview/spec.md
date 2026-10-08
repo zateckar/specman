@@ -445,6 +445,13 @@ the user presses Send.
 - **THEN** the user is told how to allow it, and silence on its own is not reported as an
   error
 
+#### Scenario: Listening is refused although the microphone is allowed
+- **WHEN** the browser refuses to listen and the page is not on https, the server's
+  Permissions-Policy forbids the microphone, or the permission is already granted
+- **THEN** the user is told that cause instead of being told to allow the microphone, because
+  the browser reports all of these with the same code and the advice to allow it sent a user
+  whose microphone was allowed looking for a setting that was not there
+
 ### Requirement: A chapter is opened deliberately
 An untouched chapter SHALL offer an explicit way to start it.
 

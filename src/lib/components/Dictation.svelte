@@ -4,9 +4,11 @@
 		SPOKEN_LANGUAGES,
 		defaultSpokenLanguage,
 		describeDictationError,
+		isRefusal,
 		joinDictation,
 		spokenText,
-		type HeardSegment
+		type HeardSegment,
+		type RefusalContext
 	} from '$lib/dictation';
 
 	/**
@@ -138,6 +140,13 @@
 		r.onerror = (event) => {
 			const message = describeDictationError(event.error);
 			if (message) status = message;
+			// "Blocked" is only the likeliest reading of a refusal. Find out which it
+			// was, and replace the line unless something else has been said since.
+			if (isRefusal(event.error)) {
+				void refusalContext().then((context) => {
+					if (!destroyed && status === message) status = describeDictationError(event.error, context);
+				});
+			}
 		};
 		r.onend = () => {
 			if (recognition !== r) return;
@@ -159,6 +168,21 @@
 		status = local
 			? `Listening in ${languageLabel} — transcribed on this computer.`
 			: `Listening in ${languageLabel} — your browser sends the recording to its online speech service to transcribe it.`;
+	}
+
+	async function refusalContext(): Promise<RefusalContext> {
+		const policy = (document as unknown as { featurePolicy?: { allowsFeature(name: string): boolean } }).featurePolicy;
+		let permission: string | null = null;
+		try {
+			permission = (await navigator.permissions.query({ name: 'microphone' as PermissionName })).state;
+		} catch {
+			// Not every browser will say.
+		}
+		return {
+			secure: typeof window.isSecureContext === 'boolean' ? window.isSecureContext : null,
+			policyAllows: policy ? policy.allowsFeature('microphone') : null,
+			permission
+		};
 	}
 
 	/** Stop listening and keep what was heard. */

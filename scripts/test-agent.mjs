@@ -359,6 +359,13 @@ check('a British browser starts in English', defaultSpokenLanguage(['en-GB']), '
 check('an unknown language falls back to the first offered', defaultSpokenLanguage(['ja-JP']), 'cs-CZ');
 check('silence is not an error', describeDictationError('no-speech'), '');
 check('a blocked microphone says how to fix it', describeDictationError('not-allowed').includes('Allow it'), true);
+const refused = { secure: true, policyAllows: true, permission: 'denied' };
+check('a refused permission still says how to allow it', describeDictationError('not-allowed', refused).includes('Allow it'), true);
+check('a page not on https is not blamed on the permission', describeDictationError('not-allowed', { ...refused, permission: 'granted', secure: false }).includes('https'), true);
+check('a server forbidding the microphone is named', describeDictationError('not-allowed', { ...refused, permission: 'granted', policyAllows: false }).includes('server'), true);
+check('an allowed microphone is not called blocked', describeDictationError('not-allowed', { ...refused, permission: 'granted' }).includes('speech service'), true);
+check('a refused speech service is not called a blocked microphone', describeDictationError('service-not-allowed', { secure: true, policyAllows: null, permission: null }).includes('speech service'), true);
+check('a refusal the browser cannot explain keeps the usual advice', describeDictationError('not-allowed', { secure: null, policyAllows: null, permission: null }).includes('Allow it'), true);
 
 console.log('\n--- answers offered alongside a question ---');
 

@@ -52,8 +52,38 @@ export function defaultSpokenLanguage(preferred: readonly string[]): string {
 	return SPOKEN_LANGUAGES[0].tag;
 }
 
+/**
+ * What the page can find out about why listening was refused. The browser gives
+ * one code, `not-allowed`, whether the user said no, the page is not secure, or
+ * the server forbade the microphone — and only the first is fixed in the
+ * browser's settings. Each is null when the browser cannot say.
+ */
+export interface RefusalContext {
+	/** Served over https or from this computer; anything else never gets a microphone. */
+	secure: boolean | null;
+	/** Whether the page's Permissions-Policy lets it use the microphone at all. */
+	policyAllows: boolean | null;
+	/** The browser's answer for this site's microphone: granted, denied or prompt. */
+	permission: string | null;
+}
+
+export function isRefusal(code: string): boolean {
+	return code === 'not-allowed' || code === 'service-not-allowed';
+}
+
 /** A recognition error, said the way the user can act on it. Empty to say nothing. */
-export function describeDictationError(code: string): string {
+export function describeDictationError(code: string, context?: RefusalContext): string {
+	if (isRefusal(code) && context) {
+		if (context.secure === false) {
+			return 'This page is not on a secure (https) address, and browsers only let a secure page use the microphone. Whoever runs Specman can change that; you can type your answer meanwhile.';
+		}
+		if (context.policyAllows === false) {
+			return 'The server this page comes through does not let it use the microphone. Whoever runs Specman can change that; you can type your answer meanwhile.';
+		}
+		if (context.permission === 'granted' || code === 'service-not-allowed') {
+			return "The microphone is allowed, but the browser's speech service refused to listen — it may be switched off on this computer. You can type your answer instead.";
+		}
+	}
 	switch (code) {
 		case 'not-allowed':
 		case 'service-not-allowed':
